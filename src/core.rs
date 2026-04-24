@@ -1,17 +1,17 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use rand::Rng;
 use thiserror::Error;
+
+use crate::models::Message;
 
 type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-}
+const EMBEDDING_DIMENSION: usize = 1536;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -109,51 +109,133 @@ pub trait CoreMemoryStore: Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct DummyEmbeddingProvider;
+pub struct RandomEmbeddingProvider;
 
 #[async_trait]
-impl EmbeddingProvider for DummyEmbeddingProvider {
+impl EmbeddingProvider for RandomEmbeddingProvider {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts.iter().map(|_| vec![0.0; 1536]).collect())
+        let mut rng = rand::rng();
+        let embeddings = texts
+            .iter()
+            .map(|_| {
+                (0..EMBEDDING_DIMENSION)
+                    .map(|_| rng.random::<f32>())
+                    .collect::<Vec<f32>>()
+            })
+            .collect();
+
+        Ok(embeddings)
     }
 }
 
+#[derive(Debug, Clone)]
+struct StoredVector {
+    message_id: String,
+    text: String,
+    embedding: Vec<f32>,
+}
+
 #[derive(Debug, Default)]
-pub struct DummyVectorStore;
+pub struct InMemoryVectorStore {
+    memories: Mutex<HashMap<String, Vec<StoredVector>>>,
+}
 
 #[async_trait]
-impl VectorStore for DummyVectorStore {
+impl VectorStore for InMemoryVectorStore {
     async fn insert(
         &self,
-        _session_id: &str,
-        _text: &str,
-        _embedding: Vec<f32>,
-        _message_id: &str,
+        session_id: &str,
+        text: &str,
+        embedding: Vec<f32>,
+        message_id: &str,
     ) -> Result<(), StoreError> {
+        let mut memories = self
+            .memories
+            .lock()
+            .map_err(|error| StoreError::Message(error.to_string()))?;
+
+        let session_memories = memories.entry(session_id.to_string()).or_default();
+
+        if let Some(existing) = session_memories
+            .iter_mut()
+            .find(|entry| entry.message_id == message_id)
+        {
+            existing.text = text.to_string();
+            existing.embedding = embedding;
+            return Ok(());
+        }
+
+        session_memories.push(StoredVector {
+            message_id: message_id.to_string(),
+            text: text.to_string(),
+            embedding,
+        });
+
         Ok(())
     }
 
     async fn search(
         &self,
-        _session_id: &str,
-        _query_embedding: &[f32],
-        _top_k: usize,
+        session_id: &str,
+        query_embedding: &[f32],
+        top_k: usize,
     ) -> Result<Vec<SearchResult>, StoreError> {
-        Ok(Vec::new())
+        let memories = self
+            .memories
+            .lock()
+            .map_err(|error| StoreError::Message(error.to_string()))?;
+
+        let mut results = memories
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| SearchResult {
+                text: entry.text,
+                score: cosine_similarity(query_embedding, &entry.embedding),
+            })
+            .collect::<Vec<_>>();
+
+        results.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
+        results.truncate(top_k);
+
+        Ok(results)
     }
 
-    async fn delete_session(&self, _session_id: &str) -> Result<(), StoreError> {
+    async fn delete_session(&self, session_id: &str) -> Result<(), StoreError> {
+        let mut memories = self
+            .memories
+            .lock()
+            .map_err(|error| StoreError::Message(error.to_string()))?;
+
+        memories.remove(session_id);
         Ok(())
     }
 }
 
 #[derive(Debug, Default)]
-pub struct DummyShortTermMemory {
+pub struct InMemoryStore {
     messages: Mutex<HashMap<String, Vec<Message>>>,
 }
 
+impl InMemoryStore {
+    fn clone_messages(&self, session_id: &str) -> Result<Vec<Message>, MemoryError> {
+        let messages = self
+            .messages
+            .lock()
+            .map_err(|error| MemoryError::Message(error.to_string()))?;
+
+        Ok(messages.get(session_id).cloned().unwrap_or_default())
+    }
+}
+
 #[async_trait]
-impl ShortTermMemory for DummyShortTermMemory {
+impl ShortTermMemory for InMemoryStore {
     async fn add_message(&self, session_id: &str, msg: Message) -> Result<(), MemoryError> {
         let mut messages = self
             .messages
@@ -172,15 +254,10 @@ impl ShortTermMemory for DummyShortTermMemory {
         session_id: &str,
         count: usize,
     ) -> Result<Vec<Message>, MemoryError> {
-        let messages = self
-            .messages
-            .lock()
-            .map_err(|error| MemoryError::Message(error.to_string()))?;
+        let messages = self.clone_messages(session_id)?;
+        let start = messages.len().saturating_sub(count);
 
-        let session_messages = messages.get(session_id).cloned().unwrap_or_default();
-        let start = session_messages.len().saturating_sub(count);
-
-        Ok(session_messages[start..].to_vec())
+        Ok(messages[start..].to_vec())
     }
 
     async fn trim(&self, session_id: &str, max_count: usize) -> Result<(), MemoryError> {
@@ -191,8 +268,8 @@ impl ShortTermMemory for DummyShortTermMemory {
 
         if let Some(session_messages) = messages.get_mut(session_id) {
             if session_messages.len() > max_count {
-                let start = session_messages.len() - max_count;
-                session_messages.drain(0..start);
+                let remove_count = session_messages.len() - max_count;
+                session_messages.drain(0..remove_count);
             }
         }
 
@@ -205,22 +282,14 @@ impl ShortTermMemory for DummyShortTermMemory {
         max_tokens: usize,
         token_counter: &dyn TokenCounter,
     ) -> Result<Vec<Message>, MemoryError> {
-        let recent = self.get_recent(session_id, usize::MAX).await?;
-        let mut total_tokens = 0;
-        let mut trimmed = Vec::new();
+        let mut messages = self.clone_messages(session_id)?;
 
-        for message in recent.into_iter().rev() {
-            let message_tokens = token_counter.count_tokens(&message.content);
-            if total_tokens + message_tokens > max_tokens {
-                break;
-            }
-
-            total_tokens += message_tokens;
-            trimmed.push(message);
+        while total_tokens(&messages, token_counter) > max_tokens && !messages.is_empty() {
+            let remove_count = removable_prefix_len(&messages);
+            messages.drain(0..remove_count);
         }
 
-        trimmed.reverse();
-        Ok(trimmed)
+        Ok(messages)
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), MemoryError> {
@@ -244,12 +313,12 @@ impl TokenCounter for DummyTokenCounter {
 }
 
 #[derive(Debug, Default)]
-pub struct DummyCoreMemoryStore {
+pub struct InMemoryCoreMemoryStore {
     facts: Mutex<HashMap<String, Vec<String>>>,
 }
 
 #[async_trait]
-impl CoreMemoryStore for DummyCoreMemoryStore {
+impl CoreMemoryStore for InMemoryCoreMemoryStore {
     async fn add_fact(&self, session_id: &str, fact: &str) -> Result<(), MemoryError> {
         let mut facts = self
             .facts
@@ -273,29 +342,83 @@ impl CoreMemoryStore for DummyCoreMemoryStore {
     }
 }
 
+fn total_tokens(messages: &[Message], token_counter: &dyn TokenCounter) -> usize {
+    messages
+        .iter()
+        .map(|message| token_counter.count_tokens(&message.content))
+        .sum()
+}
+
+fn removable_prefix_len(messages: &[Message]) -> usize {
+    if messages.len() >= 2 && messages[0].role == "user" && messages[1].role == "assistant" {
+        2
+    } else {
+        1
+    }
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+
+    let dot_product = left
+        .iter()
+        .zip(right.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+
+    if left_norm == 0.0 || right_norm == 0.0 {
+        if left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left == right)
+        {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        dot_product / (left_norm * right_norm)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{EmbeddingStatus, Message};
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            id: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: None,
+            embedding_status: Some(EmbeddingStatus::Pending),
+        }
+    }
 
     #[tokio::test]
-    async fn dummy_embedding_provider_returns_zero_vectors() {
-        let provider = DummyEmbeddingProvider::default();
+    async fn random_embedding_provider_returns_expected_shape() {
+        let provider = RandomEmbeddingProvider::default();
         let inputs = vec!["hello".to_string(), "world".to_string()];
 
         let embeddings = provider.embed(&inputs).await.unwrap();
 
         assert_eq!(embeddings.len(), 2);
         assert!(embeddings.iter().all(|embedding| embedding.len() == 1536));
-        assert!(
-            embeddings
+        assert!(embeddings.iter().all(|embedding| {
+            embedding
                 .iter()
-                .all(|embedding| embedding.iter().all(|value| *value == 0.0))
-        );
+                .all(|value| value.is_finite() && *value >= 0.0 && *value < 1.0)
+        }));
     }
 
     #[tokio::test]
-    async fn dummy_vector_store_supports_insert_search_and_delete() {
-        let store = DummyVectorStore::default();
+    async fn in_memory_vector_store_supports_insert_search_and_delete() {
+        let store = InMemoryVectorStore::default();
 
         store
             .insert("session-1", "hello", vec![0.0; 1536], "message-1")
@@ -303,39 +426,132 @@ mod tests {
             .unwrap();
 
         let results = store.search("session-1", &[0.0; 1536], 5).await.unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "hello");
 
         store.delete_session("session-1").await.unwrap();
+
+        let results = store.search("session-1", &[0.0; 1536], 5).await.unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]
-    async fn dummy_short_term_memory_supports_basic_operations() {
-        let store = DummyShortTermMemory::default();
-        let token_counter = DummyTokenCounter;
-        let message = Message {
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        };
+    async fn in_memory_store_adds_messages_and_returns_recent_slice() {
+        let store = InMemoryStore::default();
 
         store
-            .add_message("session-1", message.clone())
+            .add_message("session-1", message("user", "first"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "second"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("user", "third"))
             .await
             .unwrap();
 
+        let recent = store.get_recent("session-1", 2).await.unwrap();
+
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].content, "second");
+        assert_eq!(recent[1].content, "third");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_trim_keeps_latest_messages() {
+        let store = InMemoryStore::default();
+
+        store
+            .add_message("session-1", message("user", "first"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "second"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("user", "third"))
+            .await
+            .unwrap();
+
+        store.trim("session-1", 2).await.unwrap();
+
         let recent = store.get_recent("session-1", 10).await.unwrap();
-        assert_eq!(recent, vec![message.clone()]);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].content, "second");
+        assert_eq!(recent[1].content, "third");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_trim_to_token_budget_preserves_pairs() {
+        let store = InMemoryStore::default();
+        let token_counter = DummyTokenCounter;
+
+        store
+            .add_message("session-1", message("user", "aaa"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "bbb"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("user", "cc"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "dd"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("user", "eee"))
+            .await
+            .unwrap();
 
         let trimmed = store
-            .trim_to_token_budget("session-1", 5, &token_counter)
+            .trim_to_token_budget("session-1", 7, &token_counter)
             .await
             .unwrap();
-        assert_eq!(trimmed, vec![message.clone()]);
 
-        store.trim("session-1", 0).await.unwrap();
-        let recent = store.get_recent("session-1", 10).await.unwrap();
-        assert!(recent.is_empty());
+        assert_eq!(trimmed.len(), 3);
+        assert_eq!(trimmed[0].role, "user");
+        assert_eq!(trimmed[0].content, "cc");
+        assert_eq!(trimmed[1].role, "assistant");
+        assert_eq!(trimmed[1].content, "dd");
+        assert_eq!(trimmed[2].role, "user");
+        assert_eq!(trimmed[2].content, "eee");
+    }
 
-        store.delete_session("session-1").await.unwrap();
+    #[tokio::test]
+    async fn in_memory_store_never_orphans_assistant_message_when_budget_is_tight() {
+        let store = InMemoryStore::default();
+        let token_counter = DummyTokenCounter;
+
+        store
+            .add_message("session-1", message("user", "aa"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "bb"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("user", "cccccc"))
+            .await
+            .unwrap();
+        store
+            .add_message("session-1", message("assistant", "d"))
+            .await
+            .unwrap();
+
+        let trimmed = store
+            .trim_to_token_budget("session-1", 1, &token_counter)
+            .await
+            .unwrap();
+
+        assert!(trimmed.is_empty());
     }
 
     #[test]
@@ -347,16 +563,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dummy_core_memory_store_adds_and_reads_facts() {
-        let store = DummyCoreMemoryStore::default();
+    async fn in_memory_core_memory_store_adds_and_isolates_facts_by_session() {
+        let store = InMemoryCoreMemoryStore::default();
 
         store
             .add_fact("session-1", "User name is Alex")
             .await
             .unwrap();
+        store
+            .add_fact("session-2", "User prefers light mode")
+            .await
+            .unwrap();
 
-        let facts = store.get_facts("session-1").await.unwrap();
-        assert_eq!(facts, vec!["User name is Alex".to_string()]);
+        let facts_session_1 = store.get_facts("session-1").await.unwrap();
+        let facts_session_2 = store.get_facts("session-2").await.unwrap();
+
+        assert_eq!(facts_session_1, vec!["User name is Alex".to_string()]);
+        assert_eq!(facts_session_2, vec!["User prefers light mode".to_string()]);
     }
 
     #[test]
