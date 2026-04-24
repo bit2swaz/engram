@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{
+        Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     routing::{get, post},
 };
@@ -35,10 +38,48 @@ struct AddMessageRequest {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ContextResponse {
+    context: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ContextQueryParams {
+    max_tokens: Option<usize>,
+    similarity_threshold: Option<f32>,
+    long_term_top_k: Option<usize>,
+}
+
+#[derive(Debug)]
+struct ResolvedContextQueryParams {
+    max_tokens: usize,
+    similarity_threshold: f32,
+    long_term_top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchRequest {
+    query: String,
+    top_k: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResultResponse {
+    text: String,
+    score: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    results: Vec<SearchResultResponse>,
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions/{session_id}/messages", post(add_message))
+        .route("/sessions/{session_id}/context", get(get_context))
+        .route("/sessions/{session_id}/search", post(search_session))
         .route("/health", get(health_check))
         .with_state(state)
 }
@@ -75,6 +116,100 @@ async fn add_message(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_context(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    query: Result<Query<ContextQueryParams>, QueryRejection>,
+) -> Result<Json<ContextResponse>, (StatusCode, String)> {
+    let params = parse_context_query(query)?;
+    let context = state
+        .context_assembler
+        .assemble_context(
+            &session_id,
+            params.max_tokens,
+            params.similarity_threshold,
+            params.long_term_top_k,
+        )
+        .await
+        .map_err(internal_server_error)?;
+
+    Ok(Json(ContextResponse { context }))
+}
+
+async fn search_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    payload: Result<Json<SearchRequest>, JsonRejection>,
+) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let payload = parse_search_request(payload)?;
+    let query = payload.query;
+
+    let embeddings = state
+        .embedding_provider
+        .embed(std::slice::from_ref(&query))
+        .await
+        .map_err(internal_server_error)?;
+    let query_embedding = embeddings
+        .first()
+        .ok_or_else(|| internal_server_error("embedding provider returned no embeddings"))?;
+
+    let results = state
+        .vector_store
+        .search(&session_id, query_embedding, payload.top_k)
+        .await
+        .map_err(internal_server_error)?
+        .into_iter()
+        .map(|result| SearchResultResponse {
+            text: result.text,
+            score: result.score,
+        })
+        .collect();
+
+    Ok(Json(SearchResponse { results }))
+}
+
+fn parse_context_query(
+    query: Result<Query<ContextQueryParams>, QueryRejection>,
+) -> Result<ResolvedContextQueryParams, (StatusCode, String)> {
+    let Query(query) = query.map_err(|rejection| {
+        bad_request(format!("invalid context query parameters: {rejection}"))
+    })?;
+
+    Ok(ResolvedContextQueryParams {
+        max_tokens: query.max_tokens.unwrap_or(8_000),
+        similarity_threshold: query.similarity_threshold.unwrap_or(0.7),
+        long_term_top_k: query.long_term_top_k.unwrap_or(10),
+    })
+}
+
+fn parse_search_request(
+    payload: Result<Json<SearchRequest>, JsonRejection>,
+) -> Result<SearchRequest, (StatusCode, String)> {
+    let Json(payload) = payload
+        .map_err(|rejection| bad_request(format!("invalid search request body: {rejection}")))?;
+
+    if payload.query.trim().is_empty() {
+        return Err(bad_request("query must not be empty"));
+    }
+
+    if payload.top_k == 0 {
+        return Err(bad_request("top_k must be greater than 0"));
+    }
+
+    Ok(payload)
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, message.into())
+}
+
+fn internal_server_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("internal server error: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -95,6 +230,23 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct CreateSessionResponse {
         session_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ContextResponse {
+        context: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct SearchResultResponse {
+        text: String,
+        score: f32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SearchResponse {
+        results: Vec<SearchResultResponse>,
     }
 
     fn build_test_state() -> Arc<AppState> {
@@ -212,5 +364,160 @@ mod tests {
             .await;
 
         response.assert_status_unprocessable_entity();
+    }
+
+    #[tokio::test]
+    async fn context_route_returns_assembled_context_with_default_parameters() {
+        let state = build_test_state();
+        let server = TestServer::new(build_router(state.clone())).unwrap();
+
+        let session = server.post("/sessions").await;
+        session.assert_status_ok();
+        let session_body: CreateSessionResponse = session.json();
+        let session_id = session_body.session_id;
+
+        state
+            .core_memory_store
+            .add_fact(&session_id, "User likes Rust")
+            .await
+            .unwrap();
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": "Tell me about Rust async"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "assistant",
+                "content": "Rust async uses futures and executors"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let response = server.get(&format!("/sessions/{session_id}/context")).await;
+
+        response.assert_status_ok();
+
+        let body: ContextResponse = response.json();
+        assert!(body.context.contains("User likes Rust"));
+        assert!(body.context.contains("Tell me about Rust async"));
+        assert!(
+            body.context
+                .contains("Rust async uses futures and executors")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_route_with_max_tokens_one_returns_non_empty_context() {
+        let state = build_test_state();
+        let server = TestServer::new(build_router(state.clone())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        state
+            .core_memory_store
+            .add_fact(&session_id, "Pinned fact")
+            .await
+            .unwrap();
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": "Hello"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let response = server
+            .get(&format!("/sessions/{session_id}/context?max_tokens=1"))
+            .await;
+
+        response.assert_status_ok();
+
+        let body: ContextResponse = response.json();
+        assert!(!body.context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_route_for_missing_session_returns_empty_or_minimal_context() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server.get(&format!("/sessions/{session_id}/context")).await;
+
+        response.assert_status_ok();
+
+        let body: ContextResponse = response.json();
+        assert!(body.context.is_empty() || body.context.contains("Core memories:"));
+    }
+
+    #[tokio::test]
+    async fn context_route_with_invalid_query_parameter_returns_bad_request() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .get(&format!(
+                "/sessions/{session_id}/context?max_tokens=invalid"
+            ))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_route_returns_empty_results_when_session_has_no_memories() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .post(&format!("/sessions/{session_id}/search"))
+            .json(&json!({
+                "query": "rust async",
+                "top_k": 5
+            }))
+            .await;
+
+        response.assert_status_ok();
+
+        let body: SearchResponse = response.json();
+        assert!(body.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_route_with_missing_query_returns_bad_request() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .post(&format!("/sessions/{session_id}/search"))
+            .json(&json!({
+                "top_k": 5
+            }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_route_with_zero_top_k_returns_bad_request() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .post(&format!("/sessions/{session_id}/search"))
+            .json(&json!({
+                "query": "rust async",
+                "top_k": 0
+            }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
     }
 }
