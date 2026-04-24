@@ -1,3 +1,4 @@
+use std::env;
 use std::sync::Arc;
 
 use engram::assembler::ContextAssembler;
@@ -6,6 +7,10 @@ use engram::core::{
     RandomEmbeddingProvider,
 };
 use engram::server::{AppState, build_router};
+
+fn bind_address() -> String {
+    env::var("ENGRAM_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string())
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -32,7 +37,7 @@ async fn main() -> std::io::Result<()> {
     });
 
     let router = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    let listener = tokio::net::TcpListener::bind(bind_address()).await?;
 
     axum::serve(listener, router).await
 }
