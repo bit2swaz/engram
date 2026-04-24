@@ -106,6 +106,10 @@ pub trait CoreMemoryStore: Send + Sync {
     async fn add_fact(&self, session_id: &str, fact: &str) -> Result<(), MemoryError>;
 
     async fn get_facts(&self, session_id: &str) -> Result<Vec<String>, MemoryError>;
+
+    async fn delete_session(&self, _session_id: &str) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -339,6 +343,16 @@ impl CoreMemoryStore for InMemoryCoreMemoryStore {
             .map_err(|error| MemoryError::Message(error.to_string()))?;
 
         Ok(facts.get(session_id).cloned().unwrap_or_default())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), MemoryError> {
+        let mut facts = self
+            .facts
+            .lock()
+            .map_err(|error| MemoryError::Message(error.to_string()))?;
+
+        facts.remove(session_id);
+        Ok(())
     }
 }
 
@@ -580,6 +594,21 @@ mod tests {
 
         assert_eq!(facts_session_1, vec!["User name is Alex".to_string()]);
         assert_eq!(facts_session_2, vec!["User prefers light mode".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_core_memory_store_delete_session_removes_facts() {
+        let store = InMemoryCoreMemoryStore::default();
+
+        store
+            .add_fact("session-1", "User prefers dark mode")
+            .await
+            .unwrap();
+
+        store.delete_session("session-1").await.unwrap();
+
+        let facts = store.get_facts("session-1").await.unwrap();
+        assert!(facts.is_empty());
     }
 
     #[test]

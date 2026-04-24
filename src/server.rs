@@ -7,7 +7,7 @@ use axum::{
         rejection::{JsonRejection, QueryRejection},
     },
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,11 @@ struct SearchRequest {
     top_k: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct CoreMemoryRequest {
+    fact: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SearchResultResponse {
     text: String,
@@ -77,9 +82,11 @@ struct SearchResponse {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/sessions", post(create_session))
+        .route("/sessions/{session_id}", delete(delete_session))
         .route("/sessions/{session_id}/messages", post(add_message))
         .route("/sessions/{session_id}/context", get(get_context))
         .route("/sessions/{session_id}/search", post(search_session))
+        .route("/sessions/{session_id}/core-memory", put(put_core_memory))
         .route("/health", get(health_check))
         .with_state(state)
 }
@@ -122,6 +129,11 @@ async fn get_context(
     query: Result<Query<ContextQueryParams>, QueryRejection>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let params = parse_context_query(query)?;
+
+    if !session_exists(&state, &session_id).await? {
+        return Err(not_found(format!("session not found: {session_id}")));
+    }
+
     let context = state
         .context_assembler
         .assemble_context(
@@ -168,6 +180,33 @@ async fn search_session(
     Ok(Json(SearchResponse { results }))
 }
 
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> StatusCode {
+    let _ = state.short_term_memory.delete_session(&session_id).await;
+    let _ = state.vector_store.delete_session(&session_id).await;
+    let _ = state.core_memory_store.delete_session(&session_id).await;
+
+    StatusCode::NO_CONTENT
+}
+
+async fn put_core_memory(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    payload: Result<Json<CoreMemoryRequest>, JsonRejection>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let payload = parse_core_memory_request(payload)?;
+
+    state
+        .core_memory_store
+        .add_fact(&session_id, &payload.fact)
+        .await
+        .map_err(internal_server_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn parse_context_query(
     query: Result<Query<ContextQueryParams>, QueryRejection>,
 ) -> Result<ResolvedContextQueryParams, (StatusCode, String)> {
@@ -199,8 +238,41 @@ fn parse_search_request(
     Ok(payload)
 }
 
+fn parse_core_memory_request(
+    payload: Result<Json<CoreMemoryRequest>, JsonRejection>,
+) -> Result<CoreMemoryRequest, (StatusCode, String)> {
+    let Json(payload) = payload.map_err(|rejection| {
+        bad_request(format!("invalid core memory request body: {rejection}"))
+    })?;
+
+    if payload.fact.trim().is_empty() {
+        return Err(bad_request("fact must not be empty"));
+    }
+
+    Ok(payload)
+}
+
+async fn session_exists(state: &AppState, session_id: &str) -> Result<bool, (StatusCode, String)> {
+    let messages = state
+        .short_term_memory
+        .get_recent(session_id, 1)
+        .await
+        .map_err(internal_server_error)?;
+    let facts = state
+        .core_memory_store
+        .get_facts(session_id)
+        .await
+        .map_err(internal_server_error)?;
+
+    Ok(!messages.is_empty() || !facts.is_empty())
+}
+
 fn bad_request(message: impl Into<String>) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, message.into())
+}
+
+fn not_found(message: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, message.into())
 }
 
 fn internal_server_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -445,16 +517,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_route_for_missing_session_returns_empty_or_minimal_context() {
+    async fn context_route_for_missing_session_returns_not_found() {
         let server = TestServer::new(build_router(build_test_state())).unwrap();
         let session_id = Uuid::new_v4().to_string();
 
         let response = server.get(&format!("/sessions/{session_id}/context")).await;
 
-        response.assert_status_ok();
-
-        let body: ContextResponse = response.json();
-        assert!(body.context.is_empty() || body.context.contains("Core memories:"));
+        response.assert_status(StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -516,6 +585,107 @@ mod tests {
                 "query": "rust async",
                 "top_k": 0
             }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_messages_and_core_memory_and_context_returns_not_found() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+
+        let session = server.post("/sessions").await;
+        session.assert_status_ok();
+        let session_body: CreateSessionResponse = session.json();
+        let session_id = session_body.session_id;
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": "Remember this"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .put(&format!("/sessions/{session_id}/core-memory"))
+            .json(&json!({
+                "fact": "User prefers dark mode"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .delete(&format!("/sessions/{session_id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .get(&format!("/sessions/{session_id}/context"))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_session_is_idempotent() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        server
+            .delete(&format!("/sessions/{session_id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .delete(&format!("/sessions/{session_id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn put_core_memory_adds_fact_and_context_includes_it() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        server
+            .put(&format!("/sessions/{session_id}/core-memory"))
+            .json(&json!({
+                "fact": "User prefers dark mode"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let response = server.get(&format!("/sessions/{session_id}/context")).await;
+        response.assert_status_ok();
+
+        let body: ContextResponse = response.json();
+        assert!(body.context.contains("User prefers dark mode"));
+    }
+
+    #[tokio::test]
+    async fn put_core_memory_with_empty_fact_returns_bad_request() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .put(&format!("/sessions/{session_id}/core-memory"))
+            .json(&json!({
+                "fact": "   "
+            }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_core_memory_without_fact_returns_bad_request() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .put(&format!("/sessions/{session_id}/core-memory"))
+            .json(&json!({}))
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
