@@ -11,11 +11,13 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::assembler::ContextAssembler;
 use crate::core::{CoreMemoryStore, EmbeddingProvider, ShortTermMemory, TokenCounter, VectorStore};
-use crate::models::Message;
+use crate::models::{EmbeddingStatus, Message};
+use crate::worker::EmbeddingJob;
 
 pub struct AppState {
     pub short_term_memory: Arc<dyn ShortTermMemory>,
@@ -24,6 +26,7 @@ pub struct AppState {
     pub token_counter: Arc<dyn TokenCounter>,
     pub core_memory_store: Arc<dyn CoreMemoryStore>,
     pub context_assembler: Arc<ContextAssembler>,
+    pub embedding_job_sender: mpsc::Sender<EmbeddingJob>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,20 +108,29 @@ async fn add_message(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Json(payload): Json<AddMessageRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, String)> {
+    let message_id = payload.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let content = payload.content;
     let message = Message {
-        id: Some(payload.id.unwrap_or_else(|| Uuid::new_v4().to_string())),
+        id: Some(message_id.clone()),
         role: payload.role,
-        content: payload.content,
+        content: content.clone(),
         timestamp: Some(Utc::now()),
-        embedding_status: None,
+        embedding_status: Some(EmbeddingStatus::Pending),
     };
 
     state
         .short_term_memory
         .add_message(&session_id, message)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_server_error)?;
+
+    state
+        .embedding_job_sender
+        .try_send(EmbeddingJob::new(&session_id, &message_id, content))
+        .map_err(|error| {
+            service_unavailable(format!("embedding queue unavailable: {error}"))
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -282,6 +294,10 @@ fn internal_server_error(error: impl std::fmt::Display) -> (StatusCode, String) 
     )
 }
 
+fn service_unavailable(message: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::SERVICE_UNAVAILABLE, message.into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -298,6 +314,9 @@ mod tests {
         InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
         RandomEmbeddingProvider,
     };
+    use crate::models::EmbeddingStatus;
+    use crate::worker::{EmbeddingJob, embedding_job_channel};
+    use tokio::sync::mpsc;
 
     #[derive(Debug, Deserialize)]
     struct CreateSessionResponse {
@@ -322,6 +341,13 @@ mod tests {
     }
 
     fn build_test_state() -> Arc<AppState> {
+        let (embedding_job_sender, mut receiver) = embedding_job_channel(16);
+        tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+
+        build_test_state_with_sender(embedding_job_sender)
+    }
+
+    fn build_test_state_with_sender(embedding_job_sender: mpsc::Sender<EmbeddingJob>) -> Arc<AppState> {
         let short_term_memory = Arc::new(InMemoryStore::default());
         let vector_store = Arc::new(InMemoryVectorStore::default());
         let embedding_provider = Arc::new(RandomEmbeddingProvider);
@@ -342,6 +368,7 @@ mod tests {
             token_counter,
             core_memory_store,
             context_assembler,
+            embedding_job_sender,
         })
     }
 
@@ -390,7 +417,10 @@ mod tests {
         assert_eq!(stored.role, "user");
         assert_eq!(stored.content, "Hello");
         assert!(stored.timestamp.is_some());
-        assert!(stored.embedding_status.is_none());
+        assert!(matches!(
+            stored.embedding_status,
+            Some(EmbeddingStatus::Pending)
+        ));
         assert!(Uuid::parse_str(stored.id.as_deref().unwrap()).is_ok());
     }
 
@@ -421,6 +451,32 @@ mod tests {
         assert_eq!(messages[0].id.as_deref(), Some(custom_id.as_str()));
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "Hi there");
+        assert!(matches!(
+            messages[0].embedding_status,
+            Some(EmbeddingStatus::Pending)
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_message_returns_service_unavailable_when_queue_is_full() {
+        let (embedding_job_sender, receiver) = embedding_job_channel(1);
+        embedding_job_sender
+            .try_send(EmbeddingJob::new("prefill-session", "prefill-message", "prefill"))
+            .unwrap();
+
+        let _receiver = receiver;
+        let server = TestServer::new(build_router(build_test_state_with_sender(embedding_job_sender))).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+
+        let response = server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": "Hello"
+            }))
+            .await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

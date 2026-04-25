@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 
 use crate::core::{MemoryError, ShortTermMemory, TokenCounter, trim_messages_to_token_budget};
-use crate::models::Message;
+use crate::models::{EmbeddingStatus, Message};
 
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
@@ -165,6 +165,37 @@ impl ShortTermMemory for RedisShortTermMemory {
             .await
             .map_err(memory_error)?;
         Ok(())
+    }
+
+    async fn update_message_status(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        status: EmbeddingStatus,
+    ) -> Result<(), MemoryError> {
+        let mut messages = self.read_messages(session_id).await?;
+
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|message| message.id.as_deref() == Some(message_id))
+        {
+            message.embedding_status = Some(status);
+            self.write_messages(session_id, &messages).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_message_by_id(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<Message>, MemoryError> {
+        let messages = self.read_messages(session_id).await?;
+
+        Ok(messages
+            .into_iter()
+            .find(|message| message.id.as_deref() == Some(message_id)))
     }
 }
 

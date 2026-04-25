@@ -8,7 +8,7 @@ use rand::Rng;
 use thiserror::Error;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 
-use crate::models::Message;
+use crate::models::{EmbeddingStatus, Message};
 
 type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -104,6 +104,23 @@ pub trait ShortTermMemory: Send + Sync {
     ) -> Result<Vec<Message>, MemoryError>;
 
     async fn delete_session(&self, session_id: &str) -> Result<(), MemoryError>;
+
+    async fn update_message_status(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _status: EmbeddingStatus,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    async fn get_message_by_id(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<Message>, MemoryError> {
+        Ok(None)
+    }
 }
 
 pub trait TokenCounter: Send + Sync {
@@ -311,6 +328,41 @@ impl ShortTermMemory for InMemoryStore {
 
         messages.remove(session_id);
         Ok(())
+    }
+
+    async fn update_message_status(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        status: EmbeddingStatus,
+    ) -> Result<(), MemoryError> {
+        let mut messages = self
+            .messages
+            .lock()
+            .map_err(|error| MemoryError::Message(error.to_string()))?;
+
+        if let Some(session_messages) = messages.get_mut(session_id) {
+            if let Some(message) = session_messages
+                .iter_mut()
+                .find(|message| message.id.as_deref() == Some(message_id))
+            {
+                message.embedding_status = Some(status);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn get_message_by_id(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<Message>, MemoryError> {
+        let messages = self.clone_messages(session_id)?;
+
+        Ok(messages
+            .into_iter()
+            .find(|message| message.id.as_deref() == Some(message_id)))
     }
 }
 
