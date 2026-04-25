@@ -1,4 +1,6 @@
+pub mod app;
 pub mod assembler;
+pub mod config;
 pub mod core;
 pub mod embedding;
 pub mod models;

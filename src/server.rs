@@ -27,6 +27,7 @@ pub struct AppState {
     pub core_memory_store: Arc<dyn CoreMemoryStore>,
     pub context_assembler: Arc<ContextAssembler>,
     pub embedding_job_sender: mpsc::Sender<EmbeddingJob>,
+    pub short_term_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +123,12 @@ async fn add_message(
     state
         .short_term_memory
         .add_message(&session_id, message)
+        .await
+        .map_err(internal_server_error)?;
+
+    state
+        .short_term_memory
+        .trim(&session_id, state.short_term_count)
         .await
         .map_err(internal_server_error)?;
 
@@ -347,7 +354,9 @@ mod tests {
         build_test_state_with_sender(embedding_job_sender)
     }
 
-    fn build_test_state_with_sender(embedding_job_sender: mpsc::Sender<EmbeddingJob>) -> Arc<AppState> {
+    fn build_test_state_with_sender(
+        embedding_job_sender: mpsc::Sender<EmbeddingJob>,
+    ) -> Arc<AppState> {
         let short_term_memory = Arc::new(InMemoryStore::default());
         let vector_store = Arc::new(InMemoryVectorStore::default());
         let embedding_provider = Arc::new(RandomEmbeddingProvider);
@@ -369,6 +378,7 @@ mod tests {
             core_memory_store,
             context_assembler,
             embedding_job_sender,
+            short_term_count: 20,
         })
     }
 
@@ -465,7 +475,10 @@ mod tests {
             .unwrap();
 
         let _receiver = receiver;
-        let server = TestServer::new(build_router(build_test_state_with_sender(embedding_job_sender))).unwrap();
+        let server = TestServer::new(build_router(build_test_state_with_sender(
+            embedding_job_sender,
+        )))
+        .unwrap();
         let session_id = Uuid::new_v4().to_string();
 
         let response = server

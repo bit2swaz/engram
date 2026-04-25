@@ -46,9 +46,20 @@ impl OpenAIEmbedder {
             .filter(|value| !value.trim().is_empty())
             .ok_or(EmbedError::MissingApiKey)?;
 
+        Self::new_with_api_key(api_key)
+    }
+
+    pub fn new_with_api_key(api_key: impl Into<String>) -> Result<Self, EmbedError> {
+        Self::new_with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    pub fn new_with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self, EmbedError> {
         Self::new_with_config(
-            api_key,
-            DEFAULT_BASE_URL.to_string(),
+            api_key.into(),
+            base_url.into(),
             DEFAULT_MODEL.to_string(),
             DEFAULT_MAX_RETRIES,
             DEFAULT_BASE_BACKOFF_MS,
@@ -226,14 +237,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let embedder = OpenAIEmbedder::new_with_config(
-            "test-key".to_string(),
-            mock_server.uri(),
-            "text-embedding-3-small".to_string(),
-            3,
-            1,
-        )
-        .unwrap();
+        let embedder = OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap();
 
         let embeddings = embedder.embed(&["hello".to_string()]).await.unwrap();
 
@@ -267,14 +271,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let embedder = OpenAIEmbedder::new_with_config(
-            "test-key".to_string(),
-            mock_server.uri(),
-            "text-embedding-3-small".to_string(),
-            3,
-            1,
-        )
-        .unwrap();
+        let embedder = OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap();
 
         let embeddings = embedder.embed(&["hello".to_string()]).await.unwrap();
 
@@ -305,14 +302,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let embedder = OpenAIEmbedder::new_with_config(
-            "test-key".to_string(),
-            mock_server.uri(),
-            "text-embedding-3-small".to_string(),
-            3,
-            1,
-        )
-        .unwrap();
+        let embedder = OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap();
 
         let error = embedder.embed(&["hello".to_string()]).await.unwrap_err();
 
