@@ -22,6 +22,14 @@ pub struct SearchResult {
 
 #[derive(Debug, Error)]
 pub enum EmbedError {
+    #[error("OPENAI_API_KEY is missing")]
+    MissingApiKey,
+    #[error("OpenAI API rate limit exceeded after retries")]
+    RateLimitExceeded,
+    #[error("unexpected embedding response: {0}")]
+    InvalidResponse(String),
+    #[error("OpenAI API returned status {status}: {body}")]
+    HttpStatus { status: u16, body: String },
     #[error("{0}")]
     Message(String),
     #[error(transparent)]

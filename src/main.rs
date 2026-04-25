@@ -4,8 +4,8 @@ use std::sync::Arc;
 use engram::assembler::ContextAssembler;
 use engram::core::{
     InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
-    RandomEmbeddingProvider,
 };
+use engram::embedding::OpenAIEmbedder;
 use engram::server::{AppState, build_router};
 
 fn bind_address() -> String {
@@ -16,7 +16,7 @@ fn bind_address() -> String {
 async fn main() -> std::io::Result<()> {
     let short_term_memory = Arc::new(InMemoryStore::default());
     let vector_store = Arc::new(InMemoryVectorStore::default());
-    let embedding_provider = Arc::new(RandomEmbeddingProvider);
+    let embedding_provider = Arc::new(OpenAIEmbedder::new().map_err(std::io::Error::other)?);
     let token_counter =
         Arc::new(OpenAITokenCounter::new().expect("cl100k_base tokenizer should initialize"));
     let core_memory_store = Arc::new(InMemoryCoreMemoryStore::default());
