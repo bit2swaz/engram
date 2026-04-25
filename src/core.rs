@@ -295,14 +295,12 @@ impl ShortTermMemory for InMemoryStore {
         max_tokens: usize,
         token_counter: &dyn TokenCounter,
     ) -> Result<Vec<Message>, MemoryError> {
-        let mut messages = self.clone_messages(session_id)?;
-
-        while total_tokens(&messages, token_counter) > max_tokens && !messages.is_empty() {
-            let remove_count = removable_prefix_len(&messages);
-            messages.drain(0..remove_count);
-        }
-
-        Ok(messages)
+        let messages = self.clone_messages(session_id)?;
+        Ok(trim_messages_to_token_budget(
+            messages,
+            max_tokens,
+            token_counter,
+        ))
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), MemoryError> {
@@ -379,6 +377,19 @@ fn total_tokens(messages: &[Message], token_counter: &dyn TokenCounter) -> usize
         .iter()
         .map(|message| token_counter.count_tokens(&message.content))
         .sum()
+}
+
+pub(crate) fn trim_messages_to_token_budget(
+    mut messages: Vec<Message>,
+    max_tokens: usize,
+    token_counter: &dyn TokenCounter,
+) -> Vec<Message> {
+    while total_tokens(&messages, token_counter) > max_tokens && !messages.is_empty() {
+        let remove_count = removable_prefix_len(&messages);
+        messages.drain(0..remove_count);
+    }
+
+    messages
 }
 
 fn removable_prefix_len(messages: &[Message]) -> usize {
