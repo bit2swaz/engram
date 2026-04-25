@@ -3,6 +3,7 @@ pub mod assembler;
 pub mod config;
 pub mod core;
 pub mod embedding;
+pub mod logging;
 pub mod models;
 pub mod server;
 pub mod stores;

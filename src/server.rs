@@ -95,16 +95,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[tracing::instrument]
 async fn health_check() -> StatusCode {
+    tracing::info!("health check completed");
     StatusCode::OK
 }
 
+#[tracing::instrument]
 async fn create_session() -> Json<CreateSessionResponse> {
-    Json(CreateSessionResponse {
-        session_id: Uuid::new_v4().to_string(),
-    })
+    let session_id = Uuid::new_v4().to_string();
+    tracing::info!(session_id = %session_id, "created session");
+
+    Json(CreateSessionResponse { session_id })
 }
 
+#[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
 async fn add_message(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -119,37 +124,60 @@ async fn add_message(
         timestamp: Some(Utc::now()),
         embedding_status: Some(EmbeddingStatus::Pending),
     };
+    tracing::info!(
+        message_id = %message_id,
+        role = %message.role,
+        embedding_status = ?message.embedding_status,
+        "storing message"
+    );
 
     state
         .short_term_memory
         .add_message(&session_id, message)
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to add message to short-term store");
+            internal_server_error(error)
+        })?;
 
     state
         .short_term_memory
         .trim(&session_id, state.short_term_count)
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to trim short-term store");
+            internal_server_error(error)
+        })?;
 
     state
         .embedding_job_sender
         .try_send(EmbeddingJob::new(&session_id, &message_id, content))
         .map_err(|error| {
+            tracing::error!(error = %error, message_id = %message_id, "failed to queue embedding job");
             service_unavailable(format!("embedding queue unavailable: {error}"))
         })?;
+
+    tracing::info!(message_id = %message_id, "queued embedding job");
 
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[tracing::instrument(skip(state, query), fields(session_id = %session_id))]
 async fn get_context(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     query: Result<Query<ContextQueryParams>, QueryRejection>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let params = parse_context_query(query)?;
+    tracing::info!(
+        max_tokens = params.max_tokens,
+        similarity_threshold = params.similarity_threshold,
+        long_term_top_k = params.long_term_top_k,
+        "assembling context"
+    );
 
     if !session_exists(&state, &session_id).await? {
+        tracing::info!("session not found for context request");
         return Err(not_found(format!("session not found: {session_id}")));
     }
 
@@ -162,11 +190,17 @@ async fn get_context(
             params.long_term_top_k,
         )
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to assemble context");
+            internal_server_error(error)
+        })?;
+
+    tracing::info!(context_len = context.len(), "assembled context");
 
     Ok(Json(ContextResponse { context }))
 }
 
+#[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
 async fn search_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -174,12 +208,16 @@ async fn search_session(
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let payload = parse_search_request(payload)?;
     let query = payload.query;
+    tracing::info!(query_len = query.len(), top_k = payload.top_k, "searching session");
 
     let embeddings = state
         .embedding_provider
         .embed(std::slice::from_ref(&query))
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to embed search query");
+            internal_server_error(error)
+        })?;
     let query_embedding = embeddings
         .first()
         .ok_or_else(|| internal_server_error("embedding provider returned no embeddings"))?;
@@ -188,7 +226,10 @@ async fn search_session(
         .vector_store
         .search(&session_id, query_embedding, payload.top_k)
         .await
-        .map_err(internal_server_error)?
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to search vector store");
+            internal_server_error(error)
+        })?
         .into_iter()
         .map(|result| SearchResultResponse {
             text: result.text,
@@ -196,32 +237,50 @@ async fn search_session(
         })
         .collect();
 
+    tracing::info!("completed session search");
+
     Ok(Json(SearchResponse { results }))
 }
 
+#[tracing::instrument(skip(state), fields(session_id = %session_id))]
 async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> StatusCode {
-    let _ = state.short_term_memory.delete_session(&session_id).await;
-    let _ = state.vector_store.delete_session(&session_id).await;
-    let _ = state.core_memory_store.delete_session(&session_id).await;
+    if let Err(error) = state.short_term_memory.delete_session(&session_id).await {
+        tracing::error!(error = %error, "failed to delete short-term session data");
+    }
+    if let Err(error) = state.vector_store.delete_session(&session_id).await {
+        tracing::error!(error = %error, "failed to delete vector-store session data");
+    }
+    if let Err(error) = state.core_memory_store.delete_session(&session_id).await {
+        tracing::error!(error = %error, "failed to delete core-memory session data");
+    }
+
+    tracing::info!("deleted session data");
 
     StatusCode::NO_CONTENT
 }
 
+#[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
 async fn put_core_memory(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     payload: Result<Json<CoreMemoryRequest>, JsonRejection>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let payload = parse_core_memory_request(payload)?;
+    tracing::info!(fact_len = payload.fact.len(), "adding core memory fact");
 
     state
         .core_memory_store
         .add_fact(&session_id, &payload.fact)
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to add core memory fact");
+            internal_server_error(error)
+        })?;
+
+    tracing::info!("added core memory fact");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -313,6 +372,7 @@ mod tests {
     use axum_test::TestServer;
     use serde::Deserialize;
     use serde_json::json;
+    use tracing_test::traced_test;
     use uuid::Uuid;
 
     use super::{AppState, build_router};
@@ -758,5 +818,43 @@ mod tests {
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn handler_spans_are_logged_without_content_fields() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        let secret_content = "sensitive-message-body";
+
+        server.get("/health").await.assert_status_ok();
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": secret_content
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        assert!(logs_contain("health_check"));
+        logs_assert(|lines: &[&str]| {
+            if !lines
+                .iter()
+                .any(|line| line.contains("add_message") && line.contains(&session_id))
+            {
+                return Err("expected add_message span logs with matching session_id".to_string());
+            }
+
+            if lines
+                .iter()
+                .any(|line| line.contains("content=") || line.contains(secret_content))
+            {
+                return Err("expected logs to exclude content fields and values".to_string());
+            }
+
+            Ok(())
+        });
     }
 }

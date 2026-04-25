@@ -2,6 +2,7 @@ use std::env;
 
 use engram::app::build_real_app_state;
 use engram::config::Config;
+use engram::logging::init_tracing;
 use engram::server::build_router;
 
 fn bind_address() -> String {
@@ -10,6 +11,8 @@ fn bind_address() -> String {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    init_tracing();
+
     let config = Config::from_env().map_err(std::io::Error::other)?;
     let state = build_real_app_state(&config)
         .await

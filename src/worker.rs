@@ -111,16 +111,42 @@ async fn process_embedding_job(
     vector_store: &dyn VectorStore,
     embedding_provider: &dyn EmbeddingProvider,
 ) {
+    process_embedding_job_traced(job, short_term_memory, vector_store, embedding_provider).await;
+}
+
+#[tracing::instrument(
+    skip_all,
+    fields(
+        session_id = %job.session_id,
+        message_id = %job.message_id,
+        text_len = job.text.len()
+    )
+)]
+async fn process_embedding_job_traced(
+    job: EmbeddingJob,
+    short_term_memory: &dyn ShortTermMemory,
+    vector_store: &dyn VectorStore,
+    embedding_provider: &dyn EmbeddingProvider,
+) {
+    tracing::info!("processing embedding job");
+
     let current_message = match short_term_memory
         .get_message_by_id(&job.session_id, &job.message_id)
         .await
     {
         Ok(message) => message,
-        Err(_) => return,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load message for embedding job");
+            return;
+        }
     };
 
     match current_message.and_then(|message| message.embedding_status) {
-        Some(EmbeddingStatus::Completed) | Some(EmbeddingStatus::Processing) => return,
+        Some(status @ EmbeddingStatus::Completed)
+        | Some(status @ EmbeddingStatus::Processing) => {
+            tracing::info!(status = ?status, "skipping embedding job due to existing terminal or active status");
+            return;
+        }
         _ => {}
     }
 
@@ -133,13 +159,17 @@ async fn process_embedding_job(
         .await
         .is_err()
     {
+        tracing::error!("failed to mark message as processing");
         return;
     }
+
+    tracing::info!("marked message as processing");
 
     let embedding = match embedding_provider.embed(std::slice::from_ref(&job.text)).await {
         Ok(mut embeddings) => match embeddings.pop() {
             Some(embedding) => embedding,
             None => {
+                tracing::error!("embedding provider returned no embeddings");
                 let _ = short_term_memory
                     .update_message_status(
                         &job.session_id,
@@ -153,6 +183,7 @@ async fn process_embedding_job(
             }
         },
         Err(error) => {
+            tracing::error!(error = %error, "embedding provider failed");
             let _ = short_term_memory
                 .update_message_status(
                     &job.session_id,
@@ -168,6 +199,7 @@ async fn process_embedding_job(
         .insert(&job.session_id, &job.text, embedding, &job.message_id)
         .await
     {
+        tracing::error!(error = %error, "failed to insert embedding into vector store");
         let _ = short_term_memory
             .update_message_status(
                 &job.session_id,
@@ -178,11 +210,17 @@ async fn process_embedding_job(
         return;
     }
 
-    let _ = short_term_memory
+    if let Err(error) = short_term_memory
         .update_message_status(
             &job.session_id,
             &job.message_id,
             EmbeddingStatus::Completed,
         )
-        .await;
+        .await
+    {
+        tracing::error!(error = %error, "failed to mark message as completed");
+        return;
+    }
+
+    tracing::info!("completed embedding job");
 }
