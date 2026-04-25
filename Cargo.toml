@@ -8,9 +8,11 @@ async-trait = "0.1"
 arrow-array = "56"
 arrow-schema = "56"
 axum = "0.8"
+axum-prometheus = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 lancedb = "0.23"
+prometheus = "0.14"
 rand = "0.9"
 redis = { version = "0.32", features = ["aio", "tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

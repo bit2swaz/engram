@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use prometheus::Error as PrometheusError;
 use thiserror::Error;
 
 use crate::assembler::ContextAssembler;
@@ -10,6 +11,7 @@ use crate::core::{
     TokenCounter, VectorStore,
 };
 use crate::embedding::OpenAIEmbedder;
+use crate::metrics::AppMetrics;
 use crate::server::AppState;
 use crate::stores::{LanceDBStore, RedisCoreMemoryStore, RedisShortTermMemory};
 use crate::worker::{embedding_job_channel, spawn_embedding_workers};
@@ -22,6 +24,8 @@ pub enum AppBuildError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    #[error(transparent)]
+    Metrics(#[from] PrometheusError),
     #[error(transparent)]
     Other(#[from] Box<dyn StdError + Send + Sync + 'static>),
 }
@@ -43,6 +47,7 @@ pub async fn build_app_state_with_embedding_provider(
         Arc::new(LanceDBStore::connect(&config.lance_db_path).await?);
     let token_counter: Arc<dyn TokenCounter> = Arc::new(OpenAITokenCounter::new()?);
     let core_memory_store = Arc::new(RedisCoreMemoryStore::connect(&config.redis_url).await?);
+    let metrics = Arc::new(AppMetrics::new()?);
     let context_assembler = Arc::new(ContextAssembler::new(
         short_term_memory.clone(),
         vector_store.clone(),
@@ -55,6 +60,7 @@ pub async fn build_app_state_with_embedding_provider(
         short_term_memory.clone(),
         vector_store.clone(),
         embedding_provider.clone(),
+        metrics.clone(),
         receiver,
         config.embedding_max_concurrency,
     );
@@ -66,6 +72,7 @@ pub async fn build_app_state_with_embedding_provider(
         token_counter,
         core_memory_store,
         context_assembler,
+        metrics,
         embedding_job_sender,
         short_term_count: config.short_term_count,
     }))

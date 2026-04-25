@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::core::{EmbeddingProvider, ShortTermMemory, VectorStore};
+use crate::metrics::{AppMetrics, DEFAULT_EMBEDDING_MODEL_LABEL};
 use crate::models::EmbeddingStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub fn spawn_embedding_workers(
     short_term_memory: Arc<dyn ShortTermMemory>,
     vector_store: Arc<dyn VectorStore>,
     embedding_provider: Arc<dyn EmbeddingProvider>,
+    metrics: Arc<AppMetrics>,
     receiver: mpsc::Receiver<EmbeddingJob>,
     worker_count: usize,
 ) -> Vec<JoinHandle<()>> {
@@ -65,6 +67,7 @@ pub fn spawn_embedding_workers(
             let short_term_memory = short_term_memory.clone();
             let vector_store = vector_store.clone();
             let embedding_provider = embedding_provider.clone();
+            let metrics = metrics.clone();
 
             tokio::spawn(async move {
                 worker_loop(
@@ -72,6 +75,7 @@ pub fn spawn_embedding_workers(
                     short_term_memory,
                     vector_store,
                     embedding_provider,
+                    metrics,
                 )
                 .await;
             })
@@ -84,12 +88,17 @@ async fn worker_loop(
     short_term_memory: Arc<dyn ShortTermMemory>,
     vector_store: Arc<dyn VectorStore>,
     embedding_provider: Arc<dyn EmbeddingProvider>,
+    metrics: Arc<AppMetrics>,
 ) {
     loop {
-        let job = {
+        let (job, queue_size) = {
             let mut receiver = receiver.lock().await;
-            receiver.recv().await
+            let job = receiver.recv().await;
+            let queue_size = receiver.len();
+            (job, queue_size)
         };
+
+        metrics.set_embedding_queue_size(queue_size);
 
         let Some(job) = job else {
             break;
@@ -100,6 +109,7 @@ async fn worker_loop(
             short_term_memory.as_ref(),
             vector_store.as_ref(),
             embedding_provider.as_ref(),
+            metrics.as_ref(),
         )
         .await;
     }
@@ -110,8 +120,10 @@ async fn process_embedding_job(
     short_term_memory: &dyn ShortTermMemory,
     vector_store: &dyn VectorStore,
     embedding_provider: &dyn EmbeddingProvider,
+    metrics: &AppMetrics,
 ) {
-    process_embedding_job_traced(job, short_term_memory, vector_store, embedding_provider).await;
+    process_embedding_job_traced(job, short_term_memory, vector_store, embedding_provider, metrics)
+        .await;
 }
 
 #[tracing::instrument(
@@ -127,6 +139,7 @@ async fn process_embedding_job_traced(
     short_term_memory: &dyn ShortTermMemory,
     vector_store: &dyn VectorStore,
     embedding_provider: &dyn EmbeddingProvider,
+    metrics: &AppMetrics,
 ) {
     tracing::info!("processing embedding job");
 
@@ -136,6 +149,7 @@ async fn process_embedding_job_traced(
     {
         Ok(message) => message,
         Err(error) => {
+            metrics.increment_short_term_store_error("get_message_by_id");
             tracing::error!(error = %error, "failed to load message for embedding job");
             return;
         }
@@ -159,16 +173,19 @@ async fn process_embedding_job_traced(
         .await
         .is_err()
     {
+        metrics.increment_short_term_store_error("update_message_status_processing");
         tracing::error!("failed to mark message as processing");
         return;
     }
 
     tracing::info!("marked message as processing");
 
+    let embedding_timer = metrics.start_embedding_timer(DEFAULT_EMBEDDING_MODEL_LABEL);
     let embedding = match embedding_provider.embed(std::slice::from_ref(&job.text)).await {
         Ok(mut embeddings) => match embeddings.pop() {
             Some(embedding) => embedding,
             None => {
+                drop(embedding_timer);
                 tracing::error!("embedding provider returned no embeddings");
                 let _ = short_term_memory
                     .update_message_status(
@@ -183,6 +200,7 @@ async fn process_embedding_job_traced(
             }
         },
         Err(error) => {
+            drop(embedding_timer);
             tracing::error!(error = %error, "embedding provider failed");
             let _ = short_term_memory
                 .update_message_status(
@@ -194,6 +212,7 @@ async fn process_embedding_job_traced(
             return;
         }
     };
+    drop(embedding_timer);
 
     if let Err(error) = vector_store
         .insert(&job.session_id, &job.text, embedding, &job.message_id)
@@ -218,6 +237,7 @@ async fn process_embedding_job_traced(
         )
         .await
     {
+        metrics.increment_short_term_store_error("update_message_status_completed");
         tracing::error!(error = %error, "failed to mark message as completed");
         return;
     }

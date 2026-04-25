@@ -9,6 +9,7 @@ use engram::core::{
     EmbedError, EmbeddingProvider, InMemoryStore, InMemoryVectorStore, ShortTermMemory,
     VectorStore,
 };
+use engram::metrics::AppMetrics;
 use engram::models::{EmbeddingStatus, Message};
 use engram::worker::{EmbeddingJob, embedding_job_channel, spawn_embedding_workers};
 use tokio::sync::mpsc::error::TrySendError;
@@ -88,12 +89,14 @@ async fn worker_processes_job_and_marks_message_completed() {
     let short_term_memory = Arc::new(InMemoryStore::default());
     let vector_store = Arc::new(InMemoryVectorStore::default());
     let embedding_provider = Arc::new(MockEmbeddingProvider::successful());
+    let metrics = Arc::new(AppMetrics::new().unwrap());
     let (sender, receiver) = embedding_job_channel(8);
 
     let workers = spawn_embedding_workers(
         short_term_memory.clone(),
         vector_store.clone(),
         embedding_provider.clone(),
+        metrics,
         receiver,
         1,
     );
@@ -130,12 +133,14 @@ async fn worker_skips_duplicate_job_after_completion() {
     let short_term_memory = Arc::new(InMemoryStore::default());
     let vector_store = Arc::new(InMemoryVectorStore::default());
     let embedding_provider = Arc::new(MockEmbeddingProvider::successful());
+    let metrics = Arc::new(AppMetrics::new().unwrap());
     let (sender, receiver) = embedding_job_channel(8);
 
     let workers = spawn_embedding_workers(
         short_term_memory.clone(),
         vector_store,
         embedding_provider.clone(),
+        metrics,
         receiver,
         1,
     );
@@ -185,12 +190,14 @@ async fn worker_marks_message_failed_when_embedding_errors() {
     let short_term_memory = Arc::new(InMemoryStore::default());
     let vector_store = Arc::new(InMemoryVectorStore::default());
     let embedding_provider = Arc::new(MockEmbeddingProvider::failing("embed failed"));
+    let metrics = Arc::new(AppMetrics::new().unwrap());
     let (sender, receiver) = embedding_job_channel(8);
 
     let workers = spawn_embedding_workers(
         short_term_memory.clone(),
         vector_store.clone(),
         embedding_provider.clone(),
+        metrics,
         receiver,
         1,
     );

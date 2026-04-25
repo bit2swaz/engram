@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     Json, Router,
@@ -6,9 +6,12 @@ use axum::{
         Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
+    http::{StatusCode, header},
+    response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use axum_prometheus::{PrometheusMetricLayer, PrometheusMetricLayerBuilder};
+use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -16,6 +19,9 @@ use uuid::Uuid;
 
 use crate::assembler::ContextAssembler;
 use crate::core::{CoreMemoryStore, EmbeddingProvider, ShortTermMemory, TokenCounter, VectorStore};
+use crate::metrics::{
+    AppMetrics, DEFAULT_EMBEDDING_MODEL_LABEL, DEFAULT_VECTOR_STORE_LABEL,
+};
 use crate::models::{EmbeddingStatus, Message};
 use crate::worker::EmbeddingJob;
 
@@ -26,6 +32,7 @@ pub struct AppState {
     pub token_counter: Arc<dyn TokenCounter>,
     pub core_memory_store: Arc<dyn CoreMemoryStore>,
     pub context_assembler: Arc<ContextAssembler>,
+    pub metrics: Arc<AppMetrics>,
     pub embedding_job_sender: mpsc::Sender<EmbeddingJob>,
     pub short_term_count: usize,
 }
@@ -84,6 +91,9 @@ struct SearchResponse {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let (prometheus_layer, prometheus_handle) = http_metrics_layer();
+    let metrics = state.metrics.clone();
+
     Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions/{session_id}", delete(delete_session))
@@ -92,7 +102,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/search", post(search_session))
         .route("/sessions/{session_id}/core-memory", put(put_core_memory))
         .route("/health", get(health_check))
+        .route(
+            "/metrics",
+            get(move || metrics_endpoint(metrics.clone(), prometheus_handle.clone())),
+        )
+        .layer(prometheus_layer)
         .with_state(state)
+}
+
+fn http_metrics_layer() -> (PrometheusMetricLayer<'static>, Arc<PrometheusHandle>) {
+    static HTTP_METRICS: OnceLock<(PrometheusMetricLayer<'static>, Arc<PrometheusHandle>)> =
+        OnceLock::new();
+
+    let (layer, handle) = HTTP_METRICS.get_or_init(|| {
+        let (layer, handle) = PrometheusMetricLayerBuilder::new()
+            .with_ignore_pattern("/metrics")
+            .with_default_metrics()
+            .build_pair();
+        (layer, Arc::new(handle))
+    });
+
+    (layer.clone(), handle.clone())
+}
+
+async fn metrics_endpoint(
+    metrics: Arc<AppMetrics>,
+    prometheus_handle: Arc<PrometheusHandle>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut body = prometheus_handle.render();
+    let custom_metrics = metrics.render().map_err(internal_server_error)?;
+
+    if !custom_metrics.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&custom_metrics);
+    }
+
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    ))
 }
 
 #[tracing::instrument]
@@ -116,10 +166,11 @@ async fn add_message(
     Json(payload): Json<AddMessageRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let message_id = payload.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let role = payload.role;
     let content = payload.content;
     let message = Message {
         id: Some(message_id.clone()),
-        role: payload.role,
+        role: role.clone(),
         content: content.clone(),
         timestamp: Some(Utc::now()),
         embedding_status: Some(EmbeddingStatus::Pending),
@@ -136,22 +187,31 @@ async fn add_message(
         .add_message(&session_id, message)
         .await
         .map_err(|error| {
+            state.metrics.increment_short_term_store_error("add_message");
             tracing::error!(error = %error, "failed to add message to short-term store");
             internal_server_error(error)
         })?;
+
+    state.metrics.increment_messages_added(&role);
 
     state
         .short_term_memory
         .trim(&session_id, state.short_term_count)
         .await
         .map_err(|error| {
+            state.metrics.increment_short_term_store_error("trim");
             tracing::error!(error = %error, "failed to trim short-term store");
             internal_server_error(error)
         })?;
 
-    state
+    let queue_result = state
         .embedding_job_sender
-        .try_send(EmbeddingJob::new(&session_id, &message_id, content))
+        .try_send(EmbeddingJob::new(&session_id, &message_id, content));
+    state
+        .metrics
+        .set_embedding_queue_size(embedding_queue_size(&state.embedding_job_sender));
+
+    queue_result
         .map_err(|error| {
             tracing::error!(error = %error, message_id = %message_id, "failed to queue embedding job");
             service_unavailable(format!("embedding queue unavailable: {error}"))
@@ -169,6 +229,7 @@ async fn get_context(
     query: Result<Query<ContextQueryParams>, QueryRejection>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let params = parse_context_query(query)?;
+    state.metrics.increment_context_requests();
     tracing::info!(
         max_tokens = params.max_tokens,
         similarity_threshold = params.similarity_threshold,
@@ -210,6 +271,9 @@ async fn search_session(
     let query = payload.query;
     tracing::info!(query_len = query.len(), top_k = payload.top_k, "searching session");
 
+    let embedding_timer = state
+        .metrics
+        .start_embedding_timer(DEFAULT_EMBEDDING_MODEL_LABEL);
     let embeddings = state
         .embedding_provider
         .embed(std::slice::from_ref(&query))
@@ -218,10 +282,15 @@ async fn search_session(
             tracing::error!(error = %error, "failed to embed search query");
             internal_server_error(error)
         })?;
+    drop(embedding_timer);
+
     let query_embedding = embeddings
         .first()
         .ok_or_else(|| internal_server_error("embedding provider returned no embeddings"))?;
 
+    let vector_search_timer = state
+        .metrics
+        .start_vector_search_timer(DEFAULT_VECTOR_STORE_LABEL);
     let results = state
         .vector_store
         .search(&session_id, query_embedding, payload.top_k)
@@ -236,6 +305,7 @@ async fn search_session(
             score: result.score,
         })
         .collect();
+    drop(vector_search_timer);
 
     tracing::info!("completed session search");
 
@@ -335,7 +405,10 @@ async fn session_exists(state: &AppState, session_id: &str) -> Result<bool, (Sta
         .short_term_memory
         .get_recent(session_id, 1)
         .await
-        .map_err(internal_server_error)?;
+        .map_err(|error| {
+            state.metrics.increment_short_term_store_error("get_recent");
+            internal_server_error(error)
+        })?;
     let facts = state
         .core_memory_store
         .get_facts(session_id)
@@ -364,6 +437,10 @@ fn service_unavailable(message: impl Into<String>) -> (StatusCode, String) {
     (StatusCode::SERVICE_UNAVAILABLE, message.into())
 }
 
+fn embedding_queue_size(sender: &mpsc::Sender<EmbeddingJob>) -> usize {
+    sender.max_capacity().saturating_sub(sender.capacity())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -381,6 +458,7 @@ mod tests {
         InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
         RandomEmbeddingProvider,
     };
+    use crate::metrics::AppMetrics;
     use crate::models::EmbeddingStatus;
     use crate::worker::{EmbeddingJob, embedding_job_channel};
     use tokio::sync::mpsc;
@@ -422,6 +500,7 @@ mod tests {
         let embedding_provider = Arc::new(RandomEmbeddingProvider);
         let token_counter = Arc::new(OpenAITokenCounter::new().unwrap());
         let core_memory_store = Arc::new(InMemoryCoreMemoryStore::default());
+        let metrics = Arc::new(AppMetrics::new().unwrap());
         let context_assembler = Arc::new(ContextAssembler::new(
             short_term_memory.clone(),
             vector_store.clone(),
@@ -437,6 +516,7 @@ mod tests {
             token_counter,
             core_memory_store,
             context_assembler,
+            metrics,
             embedding_job_sender,
             short_term_count: 20,
         })
@@ -447,6 +527,49 @@ mod tests {
         let server = TestServer::new(build_router(build_test_state())).unwrap();
 
         server.get("/health").await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_route_exposes_http_and_custom_metrics() {
+        let state = build_test_state();
+        let server = TestServer::new(build_router(state.clone())).unwrap();
+
+        let session = server.post("/sessions").await;
+        session.assert_status_ok();
+        let session_body: CreateSessionResponse = session.json();
+        let session_id = session_body.session_id;
+
+        server
+            .post(&format!("/sessions/{session_id}/messages"))
+            .json(&json!({
+                "role": "user",
+                "content": "Track this message"
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        server
+            .post(&format!("/sessions/{session_id}/search"))
+            .json(&json!({
+                "query": "Track this search",
+                "top_k": 3
+            }))
+            .await
+            .assert_status_ok();
+
+        state.metrics.observe_embedding_duration("test", 0.025);
+        state.metrics.observe_vector_search_duration("in_memory", 0.010);
+        state.metrics.set_embedding_queue_size(1);
+
+        let response = server.get("/metrics").await;
+        response.assert_status_ok();
+
+        let body = response.text();
+        assert!(body.contains("engram_memory_embedding_duration_seconds"));
+        assert!(body.contains("engram_memory_vector_search_duration_seconds"));
+        assert!(body.contains("engram_memory_embedding_queue_size"));
+        assert!(body.contains("engram_memory_messages_added_total"));
+        assert!(body.contains("axum_http_requests_total"));
     }
 
     #[tokio::test]
