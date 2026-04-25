@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rand::Rng;
 use thiserror::Error;
+use tiktoken_rs::{CoreBPE, cl100k_base};
 
 use crate::models::Message;
 
@@ -307,12 +308,21 @@ impl ShortTermMemory for InMemoryStore {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct DummyTokenCounter;
+pub struct OpenAITokenCounter {
+    encoding: CoreBPE,
+}
 
-impl TokenCounter for DummyTokenCounter {
+impl OpenAITokenCounter {
+    pub fn new() -> Result<Self, BoxError> {
+        Ok(Self {
+            encoding: cl100k_base()?,
+        })
+    }
+}
+
+impl TokenCounter for OpenAITokenCounter {
     fn count_tokens(&self, text: &str) -> usize {
-        text.chars().count()
+        self.encoding.encode_with_special_tokens(text).len()
     }
 }
 
@@ -501,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_trim_to_token_budget_preserves_pairs() {
         let store = InMemoryStore::default();
-        let token_counter = DummyTokenCounter;
+        let token_counter = OpenAITokenCounter::new().unwrap();
 
         store
             .add_message("session-1", message("user", "aaa"))
@@ -524,8 +534,13 @@ mod tests {
             .await
             .unwrap();
 
+        let max_tokens = ["cc", "dd", "eee"]
+            .into_iter()
+            .map(|content| token_counter.count_tokens(content))
+            .sum();
+
         let trimmed = store
-            .trim_to_token_budget("session-1", 7, &token_counter)
+            .trim_to_token_budget("session-1", max_tokens, &token_counter)
             .await
             .unwrap();
 
@@ -541,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_never_orphans_assistant_message_when_budget_is_tight() {
         let store = InMemoryStore::default();
-        let token_counter = DummyTokenCounter;
+        let token_counter = OpenAITokenCounter::new().unwrap();
 
         store
             .add_message("session-1", message("user", "aa"))
@@ -569,11 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn dummy_token_counter_counts_characters() {
-        let counter = DummyTokenCounter;
+    fn openai_token_counter_matches_known_counts() {
+        let counter = OpenAITokenCounter::new().unwrap();
 
-        assert_eq!(counter.count_tokens("hello"), 5);
         assert_eq!(counter.count_tokens(""), 0);
+        assert_eq!(counter.count_tokens("Hello world"), 2);
+        assert_eq!(counter.count_tokens("Hello, world!"), 4);
     }
 
     #[tokio::test]

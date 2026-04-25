@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tiktoken-rs = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use engram::assembler::ContextAssembler;
 use engram::core::{
-    DummyTokenCounter, InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore,
+    InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
     RandomEmbeddingProvider,
 };
 use engram::server::{AppState, build_router};
@@ -17,7 +17,8 @@ async fn main() -> std::io::Result<()> {
     let short_term_memory = Arc::new(InMemoryStore::default());
     let vector_store = Arc::new(InMemoryVectorStore::default());
     let embedding_provider = Arc::new(RandomEmbeddingProvider);
-    let token_counter = Arc::new(DummyTokenCounter);
+    let token_counter =
+        Arc::new(OpenAITokenCounter::new().expect("cl100k_base tokenizer should initialize"));
     let core_memory_store = Arc::new(InMemoryCoreMemoryStore::default());
     let context_assembler = Arc::new(ContextAssembler::new(
         short_term_memory.clone(),

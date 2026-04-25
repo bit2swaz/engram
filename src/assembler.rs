@@ -175,7 +175,7 @@ mod tests {
 
     use super::ContextAssembler;
     use crate::core::{
-        CoreMemoryStore, DummyTokenCounter, EmbedError, EmbeddingProvider, MemoryError,
+        CoreMemoryStore, EmbedError, EmbeddingProvider, MemoryError, OpenAITokenCounter,
         SearchResult, ShortTermMemory, StoreError, TokenCounter, VectorStore,
     };
     use crate::models::{EmbeddingStatus, Message};
@@ -211,7 +211,7 @@ mod tests {
     }
 
     fn total_tokens(text: &str) -> usize {
-        DummyTokenCounter.count_tokens(text)
+        OpenAITokenCounter::new().unwrap().count_tokens(text)
     }
 
     struct MockShortTermMemory {
@@ -440,7 +440,7 @@ mod tests {
             Arc::new(MockEmbeddingProvider {
                 embedding: vec![1.0; 1536],
             }),
-            Arc::new(DummyTokenCounter),
+            Arc::new(OpenAITokenCounter::new().unwrap()),
             Arc::new(core_memory_store),
         )
     }
@@ -530,6 +530,12 @@ mod tests {
     #[tokio::test]
     async fn pair_preservation_keeps_user_assistant_pairs_intact() {
         let session_id = "session-1";
+        let token_counter = OpenAITokenCounter::new().unwrap();
+        let max_tokens = ["cc", "dd", "eee"]
+            .into_iter()
+            .map(|content| token_counter.count_tokens(content))
+            .sum();
+
         let assembler = assembler(
             MockShortTermMemory::new(HashMap::from([(
                 session_id.to_string(),
@@ -546,7 +552,7 @@ mod tests {
         );
 
         let context = assembler
-            .assemble_context(session_id, 7, 0.7, 10)
+            .assemble_context(session_id, max_tokens, 0.7, 10)
             .await
             .unwrap();
 

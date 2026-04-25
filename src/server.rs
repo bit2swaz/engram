@@ -295,7 +295,7 @@ mod tests {
     use super::{AppState, build_router};
     use crate::assembler::ContextAssembler;
     use crate::core::{
-        DummyTokenCounter, InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore,
+        InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
         RandomEmbeddingProvider,
     };
 
@@ -325,7 +325,7 @@ mod tests {
         let short_term_memory = Arc::new(InMemoryStore::default());
         let vector_store = Arc::new(InMemoryVectorStore::default());
         let embedding_provider = Arc::new(RandomEmbeddingProvider);
-        let token_counter = Arc::new(DummyTokenCounter);
+        let token_counter = Arc::new(OpenAITokenCounter::new().unwrap());
         let core_memory_store = Arc::new(InMemoryCoreMemoryStore::default());
         let context_assembler = Arc::new(ContextAssembler::new(
             short_term_memory.clone(),
