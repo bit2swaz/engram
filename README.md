@@ -2,50 +2,57 @@
 
 an asynchronous semantic memory backend for llm agents, written in rust.
 
-[![build status](https://github.com/bit2swaz/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/bit2swaz/engram/actions)
 [![license: mit](https://img.shields.io/badge/license-mit-blue.svg)](LICENSE)
-[![rust version](https://img.shields.io/badge/rust-1.72%2B-blue)](https://www.rust-lang.org/)
+[![rust version](https://img.shields.io/badge/rust-1.92%2B-blue)](https://www.rust-lang.org/)
 
 ## overview
 
-engram is a backend service for large language model (llm) agents. it provides three types of memory: short-term (recent messages), long-term (semantic vector search), and core memory (pinned facts). the goal is to give llm agents a transparent, efficient, and controllable way to manage context and recall information. engram is written in rust for performance and reliability. it is designed for transparency, with full control over token budgets and context assembly, and exposes all operations via a simple rest api.
+engram is a backend service for large language model (LLM) agents. it provides three types of memory: short-term (recent messages), long-term (semantic vector search), and core memory (pinned facts). the goal is to give LLM agents a transparent, efficient, and controllable way to manage context and recall information.
 
-engram is built for developers who want to plug in their own llm agents, run locally or in production, and have full visibility into how memory is managed. it is easy to run, test, and extend. all memory operations are behind trait abstractions, making it easy to swap implementations or mock for tests.
+engram is written in rust for performance and reliability. it is designed for transparency, with full control over token budgets and context assembly, and exposes all operations via a simple REST API.
+
+engram is built for developers who want to plug in their own LLM agents, run locally or in production, and have full visibility into how memory is managed. it is easy to run, test, and extend. all memory operations are behind trait abstractions, making it easy to swap implementations or mock for tests.
 
 ## architecture
 
 ```mermaid
-graph td
-    client[ai agent / user] -->|rest json| axiom[axum http server]
-    axiom -->|request| router
-    router --> sessionhandler[session handler]
-    router --> memoryhandler[memory handler]
-    memoryhandler -->|add message| shortterm[short-term memory trait]
-    memoryhandler -->|embedding job| embedqueue[background embedding task]
-    embedqueue -->|generate| embedprovider[embedding provider trait]
-    embedprovider -->|call api| openai[openai embeddings]
-    embedqueue -->|store vector| longterm[vector store trait]
-    longterm --> lancedb[(lancedb)]
-    shortterm --> redis[(redis)]
-    shortterm --> inmem[in-memory fallback for tests]
-    contextassembler[context assembler module] --> shortterm
-    contextassembler --> longterm
-    contextassembler --> coremem[core memory store]
-    contextassembler --> tokencounter[token counter trait]
-    contextassembler --> assembledcontext[final prompt string]
-    router --> contexthandler[context handler] --> contextassembler
-    router --> searchhandler[search handler] --> longterm
-    router --> corememhandler[core memory handler] --> coremem
-    router --> healthhandler[health handler]
-    observability[observability layer] -->|metrics & traces| prometheus[(prometheus)]
+graph TD
+    client["ai agent / user"] -->|rest json| axum["axum http server"]
+    axum --> router["router"]
+    router --> sessionhandler["session handler"]
+    router --> memoryhandler["message handler"]
+    memoryhandler -->|add message + queue| shortterm["short-term memory trait"]
+    shortterm --> redis[("redis<br/>volatile, fast")]
+    shortterm --> inmem["in-memory store<br/>test fallback"]
+    memoryhandler -->|embedding job<br/>bounded mpsc| embedqueue["background worker<br/>bounded channel + semaphore"]
+    embedqueue -->|generate embedding| embedprovider["embedding provider trait"]
+    embedprovider -->|https| openai["openai embeddings"]
+    embedqueue -->|store vector + metadata| longterm["vector store trait"]
+    longterm --> lancedb[("lancedb<br/>persistent ann search")]
+    router --> contexthandler["context handler"]
+    contexthandler --> assembler["context assembler"]
+    assembler --> shortterm
+    assembler --> longterm
+    assembler --> coremem["core memory store trait"]
+    coremem --> redis
+    assembler --> tokencounter["token counter trait"]
+    tokencounter --> tiktoken["tiktoken<br/>cl100k base"]
+    router --> searchhandler["search handler"]
+    searchhandler --> embedprovider
+    searchhandler --> longterm
+    router --> corememhandler["core memory handler"]
+    corememhandler --> coremem
+    router --> healthhandler["health handler"]
+    observability["observability layer<br/>tracing + prometheus"] -->|metrics + logs| prometheus[("prometheus")]
+    assembler --> finalcontext["assembled prompt<br/>core + long-term + short-term"]
 ```
 
 ## quickstart (local)
 
 ### prerequisites
-- rust (1.72 or newer)
-- docker (for redis)
-- openai api key
+- Rust (1.92 or newer)
+- Docker (for Redis)
+- OpenAI API key
 
 ### clone and build
 ```sh
@@ -54,7 +61,7 @@ cd engram
 cargo build --release
 ```
 
-### start redis
+### start Redis
 ```sh
 docker run -d --name engram-redis -p 6379:6379 redis:7-alpine
 ```
@@ -103,7 +110,7 @@ delete session:
 curl -X DELETE http://localhost:3000/sessions/{session_id}
 ```
 
-## quickstart (docker)
+## quickstart (Docker)
 
 - copy `.env.example` to `.env` and fill in your openai api key
 - run:
@@ -113,19 +120,19 @@ docker compose up -d
 - wait for the health check to pass
 - use the same curl examples above (replace `localhost:3000` if needed)
 
-## api overview
+## API overview
 
 | method | path                                 | description                       |
 |--------|--------------------------------------|-----------------------------------|
-| get    | /health                              | health check                      |
-| post   | /sessions                            | create session                    |
-| post   | /sessions/{session_id}/messages      | add message                       |
-| get    | /sessions/{session_id}/context       | get assembled context             |
-| post   | /sessions/{session_id}/search        | semantic search                   |
-| put    | /sessions/{session_id}/core-memory   | add core memory fact              |
-| delete | /sessions/{session_id}               | delete session                    |
+| GET    | /health                              | health check                      |
+| POST   | /sessions                            | create session                    |
+| POST   | /sessions/{session_id}/messages      | add message                       |
+| GET    | /sessions/{session_id}/context       | get assembled context             |
+| POST   | /sessions/{session_id}/search        | semantic search                   |
+| PUT    | /sessions/{session_id}/core-memory   | add core memory fact              |
+| DELETE | /sessions/{session_id}               | delete session                    |
 
-see [api.md](API.md) for full details.
+see [API.md](API.md) for full details.
 
 ## configuration
 
@@ -159,12 +166,12 @@ all configuration is via environment variables:
 
 ## documentation
 
-- [api.md](API.md)
-- [architecture.md](ARCHITECTURE.md)
-- [comparison.md](COMPARISON.md)
-- [contributing.md](CONTRIBUTING.md)
-- [ssot](docs/SSOT.md)
+- [API.md](API.md)
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [COMPARISON.md](COMPARISON.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SSOT.md](docs/SSOT.md)
 
 ## license
 
-mit license. see [license](LICENSE) for details.
+MIT license. see [LICENSE](LICENSE) for details.
