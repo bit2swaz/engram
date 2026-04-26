@@ -132,7 +132,7 @@ docker compose up -d
 | PUT    | /sessions/{session_id}/core-memory   | add core memory fact              |
 | DELETE | /sessions/{session_id}               | delete session                    |
 
-see [API.md](API.md) for full details.
+see [API.md](docs/API.md) for full details.
 
 ## configuration
 
@@ -140,9 +140,9 @@ all configuration is via environment variables:
 
 | variable                | description                              | default                  |
 |-------------------------|------------------------------------------|--------------------------|
-| redis_url               | redis connection url                     | redis://localhost:6379   |
-| openai_api_key          | openai api key (required)                |                          |
-| embedding_model         | openai embedding model                   | text-embedding-3-small   |
+| redis_url               | Redis connection url                     | redis://localhost:6379   |
+| openai_api_key          | OpenAI API key (required)                |                          |
+| embedding_model         | OpenAI embedding model                   | text-embedding-3-small   |
 | short_term_count        | number of recent messages to keep        | 20                       |
 | similarity_threshold    | min similarity for long-term memories    | 0.7                      |
 | max_tokens_default      | default max tokens for context           | 8000                     |
@@ -159,16 +159,16 @@ all configuration is via environment variables:
 - pair-preserving trim for dialogue
 - background embedding worker
 - idempotency for message ingestion
-- prometheus metrics endpoint
-- openapi docs and swagger ui
+- Prometheus metrics endpoint
+- OpenAPI docs and Swagger UI
 - debug endpoint
 - optional authentication (future)
 
 ## documentation
 
-- [API.md](API.md)
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [COMPARISON.md](COMPARISON.md)
+- [API.md](docs/API.md)
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [COMPARISON.md](docs/COMPARISON.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [SSOT.md](docs/SSOT.md)
 
