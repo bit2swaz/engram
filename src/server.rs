@@ -15,10 +15,15 @@ use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::assembler::ContextAssembler;
-use crate::core::{CoreMemoryStore, EmbeddingProvider, ShortTermMemory, TokenCounter, VectorStore};
+use crate::core::{
+    CoreMemoryStore, EmbeddingProvider, SearchResult, ShortTermMemory, TokenCounter,
+    VectorStore,
+};
 use crate::metrics::{
     AppMetrics, DEFAULT_EMBEDDING_MODEL_LABEL, DEFAULT_VECTOR_STORE_LABEL,
 };
@@ -37,19 +42,19 @@ pub struct AppState {
     pub short_term_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct CreateSessionResponse {
     session_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct AddMessageRequest {
     id: Option<String>,
     role: String,
     content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ContextResponse {
     context: String,
 }
@@ -68,33 +73,58 @@ struct ResolvedContextQueryParams {
     long_term_top_k: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct SearchRequest {
     query: String,
     top_k: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct CoreMemoryRequest {
     fact: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResultResponse {
-    text: String,
-    score: f32,
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct SearchResponse {
+    results: Vec<SearchResult>,
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResponse {
-    results: Vec<SearchResultResponse>,
-}
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        health_check,
+        create_session,
+        add_message,
+        get_context,
+        search_session,
+        delete_session,
+        put_core_memory,
+    ),
+    components(schemas(
+        Message,
+        EmbeddingStatus,
+        AddMessageRequest,
+        SearchRequest,
+        CoreMemoryRequest,
+        CreateSessionResponse,
+        ContextResponse,
+        SearchResponse,
+        SearchResult,
+    )),
+    tags(
+        (name = "sessions", description = "Session lifecycle and message ingestion"),
+        (name = "memory", description = "Context assembly and memory operations"),
+        (name = "health", description = "Service health checks"),
+    )
+)]
+struct ApiDoc;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     let (prometheus_layer, prometheus_handle) = http_metrics_layer();
     let metrics = state.metrics.clone();
 
     Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/sessions", post(create_session))
         .route("/sessions/{session_id}", delete(delete_session))
         .route("/sessions/{session_id}/messages", post(add_message))
@@ -146,12 +176,28 @@ async fn metrics_endpoint(
 }
 
 #[tracing::instrument]
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service is healthy")
+    )
+)]
 async fn health_check() -> StatusCode {
     tracing::info!("health check completed");
     StatusCode::OK
 }
 
 #[tracing::instrument]
+#[utoipa::path(
+    post,
+    path = "/sessions",
+    tag = "sessions",
+    responses(
+        (status = 200, description = "Session created successfully", body = CreateSessionResponse)
+    )
+)]
 async fn create_session() -> Json<CreateSessionResponse> {
     let session_id = Uuid::new_v4().to_string();
     tracing::info!(session_id = %session_id, "created session");
@@ -160,6 +206,21 @@ async fn create_session() -> Json<CreateSessionResponse> {
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
+#[utoipa::path(
+    post,
+    path = "/sessions/{session_id}/messages",
+    tag = "sessions",
+    params(
+        ("session_id" = String, Path, description = "Session identifier")
+    ),
+    request_body = AddMessageRequest,
+    responses(
+        (status = 204, description = "Message accepted for storage and embedding"),
+        (status = 422, description = "Malformed message payload", body = String),
+        (status = 500, description = "Failed to store the message", body = String),
+        (status = 503, description = "Embedding queue unavailable", body = String)
+    )
+)]
 async fn add_message(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -223,6 +284,23 @@ async fn add_message(
 }
 
 #[tracing::instrument(skip(state, query), fields(session_id = %session_id))]
+#[utoipa::path(
+    get,
+    path = "/sessions/{session_id}/context",
+    tag = "memory",
+    params(
+        ("session_id" = String, Path, description = "Session identifier"),
+        ("max_tokens" = Option<usize>, Query, description = "Maximum tokens for assembled context"),
+        ("similarity_threshold" = Option<f32>, Query, description = "Similarity threshold for long-term memories"),
+        ("long_term_top_k" = Option<usize>, Query, description = "Maximum number of long-term memories to include")
+    ),
+    responses(
+        (status = 200, description = "Context assembled successfully", body = ContextResponse),
+        (status = 400, description = "Invalid context query parameters", body = String),
+        (status = 404, description = "Session not found", body = String),
+        (status = 500, description = "Failed to assemble context", body = String)
+    )
+)]
 async fn get_context(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -262,6 +340,20 @@ async fn get_context(
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
+#[utoipa::path(
+    post,
+    path = "/sessions/{session_id}/search",
+    tag = "memory",
+    params(
+        ("session_id" = String, Path, description = "Session identifier")
+    ),
+    request_body = SearchRequest,
+    responses(
+        (status = 200, description = "Search completed successfully", body = SearchResponse),
+        (status = 400, description = "Invalid search request body", body = String),
+        (status = 500, description = "Failed to search session memory", body = String)
+    )
+)]
 async fn search_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -298,13 +390,7 @@ async fn search_session(
         .map_err(|error| {
             tracing::error!(error = %error, "failed to search vector store");
             internal_server_error(error)
-        })?
-        .into_iter()
-        .map(|result| SearchResultResponse {
-            text: result.text,
-            score: result.score,
-        })
-        .collect();
+        })?;
     drop(vector_search_timer);
 
     tracing::info!("completed session search");
@@ -313,6 +399,17 @@ async fn search_session(
 }
 
 #[tracing::instrument(skip(state), fields(session_id = %session_id))]
+#[utoipa::path(
+    delete,
+    path = "/sessions/{session_id}",
+    tag = "sessions",
+    params(
+        ("session_id" = String, Path, description = "Session identifier")
+    ),
+    responses(
+        (status = 204, description = "Session data deleted")
+    )
+)]
 async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -333,6 +430,20 @@ async fn delete_session(
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
+#[utoipa::path(
+    put,
+    path = "/sessions/{session_id}/core-memory",
+    tag = "memory",
+    params(
+        ("session_id" = String, Path, description = "Session identifier")
+    ),
+    request_body = CoreMemoryRequest,
+    responses(
+        (status = 204, description = "Core memory fact stored"),
+        (status = 400, description = "Invalid core memory request body", body = String),
+        (status = 500, description = "Failed to store core memory fact", body = String)
+    )
+)]
 async fn put_core_memory(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -448,7 +559,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum_test::TestServer;
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tracing_test::traced_test;
     use uuid::Uuid;
 
@@ -527,6 +638,25 @@ mod tests {
         let server = TestServer::new(build_router(build_test_state())).unwrap();
 
         server.get("/health").await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn openapi_routes_expose_generated_spec_and_swagger_ui() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+
+        let spec_response = server.get("/api-docs/openapi.json").await;
+        spec_response.assert_status_ok();
+
+        let spec: Value = spec_response.json();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert!(spec["paths"].get("/health").is_some());
+        assert!(spec["paths"].get("/sessions").is_some());
+        assert!(spec["paths"].get("/sessions/{session_id}/messages").is_some());
+        assert!(spec["paths"].get("/sessions/{session_id}/context").is_some());
+        assert!(spec["paths"].get("/sessions/{session_id}/search").is_some());
+        assert!(spec["paths"].get("/sessions/{session_id}/core-memory").is_some());
+
+        server.get("/swagger-ui/").await.assert_status_ok();
     }
 
     #[tokio::test]

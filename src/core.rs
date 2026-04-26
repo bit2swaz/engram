@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 
@@ -14,7 +15,7 @@ type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 const EMBEDDING_DIMENSION: usize = 1536;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SearchResult {
     pub text: String,
     pub score: f32,

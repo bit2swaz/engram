@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub struct Message {
     pub id: Option<String>,
     pub role: String,
@@ -10,7 +10,7 @@ pub struct Message {
     pub embedding_status: Option<EmbeddingStatus>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub enum EmbeddingStatus {
     Pending,
     Processing,
