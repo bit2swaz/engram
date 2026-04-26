@@ -1,0 +1,79 @@
+warning: unused import: `black_box`
+ --> benches/context_assembly_benchmark.rs:2:74
+  |
+2 | ...main, Criterion, BenchmarkId, black_box};
+  |                                  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Mutex`
+ --> benches/context_assembly_benchmark.rs:5:22
+  |
+5 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> benches/context_assembly_benchmark.rs:9:5
+  |
+9 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `engram` (bench "context_assembly_benchmark") generated 3 warnings (run `cargo fix --bench "context_assembly_benchmark" -p engram` to apply 3 suggestions)
+    Finished `bench` profile [optimized] target(s) in 0.25s
+     Running benches/context_assembly_benchmark.rs (target/release/deps/context_assembly_benchmark-7c59c53a7c24c5c3)
+Gnuplot not found, using plotters backend
+Benchmarking context_assembly/small/10
+Benchmarking context_assembly/small/10: Warming up for 3.0000 s
+Benchmarking context_assembly/small/10: Collecting 100 samples in estimated 5.1106 s (106k iterations)
+Benchmarking context_assembly/small/10: Analyzing
+context_assembly/small/10
+                        time:   [47.081 µs 47.148 µs 47.246 µs]
+                        change: [-4.0947% -3.2203% -2.3839%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 16 outliers among 100 measurements (16.00%)
+  2 (2.00%) high mild
+  14 (14.00%) high severe
+Benchmarking context_assembly/medium/100
+Benchmarking context_assembly/medium/100: Warming up for 3.0000 s
+Benchmarking context_assembly/medium/100: Collecting 100 samples in estimated 5.2877 s (20k iterations)
+Benchmarking context_assembly/medium/100: Analyzing
+context_assembly/medium/100
+                        time:   [261.51 µs 262.35 µs 263.41 µs]
+                        change: [-4.0333% -2.9948% -2.0174%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 17 outliers among 100 measurements (17.00%)
+  6 (6.00%) high mild
+  11 (11.00%) high severe
+Benchmarking context_assembly/large/1000
+Benchmarking context_assembly/large/1000: Warming up for 3.0000 s
+Benchmarking context_assembly/large/1000: Collecting 100 samples in estimated 5.1042 s (2100 iterations)
+Benchmarking context_assembly/large/1000: Analyzing
+context_assembly/large/1000
+                        time:   [2.4181 ms 2.4394 ms 2.4685 ms]
+                        change: [-2.2701% -1.0539% +0.1510%] (p = 0.11 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  3 (3.00%) high mild
+  8 (8.00%) high severe
+Benchmarking context_assembly/tight_budget/50
+Benchmarking context_assembly/tight_budget/50: Warming up for 3.0000 s
+Benchmarking context_assembly/tight_budget/50: Collecting 100 samples in estimated 5.1700 s (35k iterations)
+Benchmarking context_assembly/tight_budget/50: Analyzing
+context_assembly/tight_budget/50
+                        time:   [146.12 µs 146.22 µs 146.34 µs]
+                        change: [-9.3144% -8.5054% -7.7522%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 13 outliers among 100 measurements (13.00%)
+  13 (13.00%) high severe
+Benchmarking context_assembly/long_term/5000
+Benchmarking context_assembly/long_term/5000: Warming up for 3.0000 s
+Benchmarking context_assembly/long_term/5000: Collecting 100 samples in estimated 5.3335 s (400 iterations)
+Benchmarking context_assembly/long_term/5000: Analyzing
+context_assembly/long_term/5000
+                        time:   [13.267 ms 13.287 ms 13.313 ms]
+                        change: [+0.2550% +0.4885% +0.7296%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+

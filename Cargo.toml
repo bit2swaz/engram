@@ -30,7 +30,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 axum-test = "17"
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 testcontainers = "0.23"
 tracing-test = "0.2"
 wiremock = "0.6"
+
+[[bench]]
+name = "context_assembly_benchmark"
+harness = false
