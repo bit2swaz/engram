@@ -15,7 +15,13 @@ struct OneTokenPerMessage;
 
 impl TokenCounter for OneTokenPerMessage {
     fn count_tokens(&self, text: &str) -> usize {
-        text.split_whitespace().count().max(1)
+        if text.is_empty() {
+            return 0;
+        }
+
+        text.lines()
+            .filter(|line| !line.is_empty() && *line != "Conversation:")
+            .count()
     }
 }
 

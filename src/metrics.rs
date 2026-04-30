@@ -121,6 +121,10 @@ impl AppMetrics {
         self.embedding_queue_size.set(size as i64);
     }
 
+    pub fn embedding_queue_size(&self) -> i64 {
+        self.embedding_queue_size.get()
+    }
+
     pub fn render(&self) -> Result<String, String> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();

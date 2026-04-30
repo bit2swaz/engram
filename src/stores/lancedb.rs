@@ -23,7 +23,7 @@ use crate::core::{SearchResult, StoreError, VectorStore};
 
 const EMBEDDING_DIMENSION: i32 = 1536;
 const DEFAULT_TABLE_NAME: &str = "memories";
-const MIN_VECTOR_INDEX_ROWS: usize = 32;
+const MIN_VECTOR_INDEX_ROWS: usize = 256;
 
 pub struct LanceDBStore {
     db: Connection,

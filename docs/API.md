@@ -1,6 +1,6 @@
-# API reference
+# API Reference
 
-this document describes every rest endpoint exposed by engram. all endpoints are served at `http://localhost:3000` by default.
+This document describes every REST endpoint exposed by engram. All endpoints are served at `http://localhost:3000` by default.
 
 | method | path                                   | description                                 |
 |--------|----------------------------------------|---------------------------------------------|
@@ -13,7 +13,7 @@ this document describes every rest endpoint exposed by engram. all endpoints are
 | GET    | /health                               | health check                                |
 | GET    | /metrics                              | Prometheus metrics                          |
 | GET    | /api-docs/openapi.json                 | OpenAPI specification                       |
-| GET    | /swagger-ui                           | Swagger UI                                  |
+| GET    | /swagger-ui/                          | Swagger UI                                  |
 
 ---
 
@@ -52,11 +52,13 @@ add a message to a session.
 **request body:**
 ```json
 {
-  "id": "optional-client-generated-uuid", // optional
-  "role": "user",                        // required, "user" | "assistant" | "system"
-  "content": "hello, what is rust?"       // required
+  "id": "optional-client-generated-uuid",
+  "role": "user",
+  "content": "hello, what is rust?"
 }
 ```
+
+`id` is optional. `role` and `content` are required.
 
 **success response:**
 - status: 204 (no content)
@@ -119,10 +121,12 @@ semantic search over long-term memory.
 **request body:**
 ```json
 {
-  "query": "rust async",   // required
-  "top_k": 5               // required
+  "query": "rust async",
+  "top_k": 5
 }
 ```
+
+Both `query` and `top_k` are required.
 
 **success response:**
 - status: 200
@@ -178,9 +182,11 @@ add a core memory fact to a session.
 **request body:**
 ```json
 {
-  "fact": "user prefers dark mode" // required
+  "fact": "user prefers dark mode"
 }
 ```
+
+`fact` is required and must not be empty.
 
 **success response:**
 - status: 204 (no content)
@@ -229,7 +235,7 @@ curl http://localhost:3000/metrics
 
 ## GET /api-docs/openapi.json
 
-OpenAPI specification (json).
+OpenAPI specification (JSON).
 
 **success response:**
 - status: 200
@@ -242,9 +248,9 @@ curl http://localhost:3000/api-docs/openapi.json | jq
 
 ---
 
-## GET /swagger-ui
+## GET /swagger-ui/
 
-Swagger UI for interactive api docs.
+Swagger UI for interactive API docs.
 
 **success response:**
 - status: 200
@@ -252,5 +258,5 @@ Swagger UI for interactive api docs.
 
 **example:**
 ```sh
-curl http://localhost:3000/swagger-ui
+curl http://localhost:3000/swagger-ui/
 ```

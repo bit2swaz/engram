@@ -265,7 +265,7 @@ Response: `204 No Content`
 `GET /api-docs/openapi.json` → OpenAPI JSON _(200 OK)_
 
 #### Swagger UI
-`GET /swagger-ui` → Swagger UI _(200 OK)_
+`GET /swagger-ui/` → Swagger UI _(200 OK)_
 
 _All endpoints verified against API.md and server.rs._
 ---
@@ -380,10 +380,10 @@ This algorithm preserves conversational continuity (recent messages), injects on
 2. Server generates a `message_id` (UUID) if none provided, adds it to the `Message`.
 3. Handler stores the message in short‑term (Redis) **with** `embedding_status = Pending`.
 4. Handler sends `EmbeddingJob { session_id, message_id, text }` to a **bounded** `mpsc::channel(1000)`.
-5. Background worker pool (up to `N` concurrent via `Semaphore`, e.g., 10) receives jobs, updates status to `Processing`, calls `embed()`, updates status to `Completed` and inserts into LanceDB.
+5. A fixed-size background worker pool (default 10 workers) receives jobs, updates status to `Processing`, calls `embed()`, updates status to `Completed`, and inserts into LanceDB.
 6. The API returns `204` immediately; the client can safely resend the same `message_id` without creating duplicates (idempotency key).
 
-**Why bounded channel + semaphore?** Prevents memory blow‑up under load and caps concurrent OpenAI calls.
+**Why bounded channel + worker pool?** Prevents memory blow‑up under load and caps concurrent OpenAI calls without moving embeddings back into the request path.
 
 ---
 
@@ -435,13 +435,15 @@ services:
 ### 9.3 Configuration (Environment Variables)
 - `REDIS_URL` (default: `redis://localhost:6379`)
 - `OPENAI_API_KEY` (required)
-- `EMBEDDING_MODEL` (default `text-embedding-3-small`)
+- `LANCE_DB_PATH` (default `./data/lancedb`)
+- `LANCEDB_PATH` (legacy alias for `LANCE_DB_PATH`)
 - `SHORT_TERM_COUNT` (default 20)
-- `SIMILARITY_THRESHOLD` (default 0.7)
-- `MAX_TOKENS_DEFAULT` (default 8000)
-- `RUST_LOG` (tracing filter)
 - `EMBEDDING_MAX_CONCURRENCY` (default 10)
 - `MPSC_CHANNEL_SIZE` (default 1000)
+- `RUST_LOG` (tracing filter)
+- `LOG_FORMAT` (default `pretty`, supports `json`)
+
+Per-request context settings such as `max_tokens`, `similarity_threshold`, and `long_term_top_k` are currently controlled through query parameters on the context endpoint rather than startup environment variables.
 
 ---
 
@@ -495,7 +497,7 @@ In-memory store implementations of all traits allow testing without external dep
 |----------|--------|---------------|
 | Use traits for every storage | Yes | Swap implementations, testability, clean boundaries. |
 | Embedding in background vs. inline | Background | Keeps API fast, decouples, real-world pattern. |
-| Bounded channel + semaphore | Yes | Prevents OOM and rate-limit surges. |
+| Bounded channel + worker pool | Yes | Prevents OOM and caps concurrent embedding work. |
 | Idempotent embedding jobs | Yes (message_id, status) | Avoid duplicates on retry/crash. |
 | LanceDB over Milvus for start | LanceDB | Embedded, no ops overhead, good for learning. |
 | In‑memory short‑term store for tests | Yes | Enables testing without Redis. |

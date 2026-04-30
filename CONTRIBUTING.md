@@ -37,13 +37,21 @@ Welcome! Contributions of all kinds are encouraged and appreciated.
   ```
 - **Integration tests (requires Docker):**
   ```sh
-  cargo test --test integration
+   cargo test --test integration_test
+   cargo test --test e2e_test
   ```
 - **All tests:**
   ```sh
-  cargo test --all-targets
+   cargo test --all
   ```
-- Note: Integration tests use `testcontainers` to spin up real dependencies (Redis, LanceDB).
+- **Benchmarks:**
+   ```sh
+   cargo bench --bench context_assembly_benchmark
+   cargo bench --bench e2e_throughput
+   cargo bench --bench real_store_latency
+   ./scripts/generate_benchmark_report.sh
+   ```
+- Note: Integration tests use `testcontainers` to spin up real dependencies such as Redis. The end-to-end and benchmark flows also create temporary LanceDB state during execution.
 
 ## TDD Workflow
 

@@ -1,6 +1,6 @@
 # engram
 
-an asynchronous semantic memory backend for llm agents, written in rust.
+An asynchronous semantic memory backend for LLM agents, written in Rust.
 
 [![license: mit](https://img.shields.io/badge/license-mit-blue.svg)](LICENSE)
 [![rust version](https://img.shields.io/badge/rust-1.92%2B-blue)](https://www.rust-lang.org/)
@@ -24,7 +24,7 @@ graph TD
     memoryhandler -->|add message + queue| shortterm["short-term memory trait"]
     shortterm --> redis[("redis<br/>volatile, fast")]
     shortterm --> inmem["in-memory store<br/>test fallback"]
-    memoryhandler -->|embedding job<br/>bounded mpsc| embedqueue["background worker<br/>bounded channel + semaphore"]
+    memoryhandler -->|embedding job<br/>bounded mpsc| embedqueue["background worker pool<br/>bounded channel"]
     embedqueue -->|generate embedding| embedprovider["embedding provider trait"]
     embedprovider -->|https| openai["openai embeddings"]
     embedqueue -->|store vector + metadata| longterm["vector store trait"]
@@ -69,8 +69,8 @@ docker run -d --name engram-redis -p 6379:6379 redis:7-alpine
 ### set environment variables
 copy `.env.example` to `.env` and fill in your openai api key, or set them manually:
 ```sh
-export openai_api_key=sk-your-key-here
-export redis_url=redis://localhost:6379
+export OPENAI_API_KEY=sk-your-key-here
+export REDIS_URL=redis://localhost:6379
 ```
 
 ### run the server
@@ -125,6 +125,9 @@ docker compose up -d
 | method | path                                 | description                       |
 |--------|--------------------------------------|-----------------------------------|
 | GET    | /health                              | health check                      |
+| GET    | /metrics                             | Prometheus metrics                |
+| GET    | /api-docs/openapi.json               | OpenAPI specification             |
+| GET    | /swagger-ui/                         | Swagger UI                        |
 | POST   | /sessions                            | create session                    |
 | POST   | /sessions/{session_id}/messages      | add message                       |
 | GET    | /sessions/{session_id}/context       | get assembled context             |
@@ -136,19 +139,21 @@ see [API.md](docs/API.md) for full details.
 
 ## configuration
 
-all configuration is via environment variables:
+the application currently reads these environment variables directly:
 
 | variable                | description                              | default                  |
 |-------------------------|------------------------------------------|--------------------------|
-| redis_url               | Redis connection url                     | redis://localhost:6379   |
-| openai_api_key          | OpenAI API key (required)                |                          |
-| embedding_model         | OpenAI embedding model                   | text-embedding-3-small   |
-| short_term_count        | number of recent messages to keep        | 20                       |
-| similarity_threshold    | min similarity for long-term memories    | 0.7                      |
-| max_tokens_default      | default max tokens for context           | 8000                     |
-| rust_log                | tracing log filter                       | info                     |
-| embedding_max_concurrency | max concurrent embedding jobs          | 10                       |
-| mpsc_channel_size       | embedding job queue size                 | 1000                     |
+| REDIS_URL               | Redis connection url                     | redis://localhost:6379   |
+| OPENAI_API_KEY          | OpenAI API key                           | required                 |
+| LANCE_DB_PATH           | LanceDB data path                        | ./data/lancedb           |
+| LANCEDB_PATH            | legacy alias for `LANCE_DB_PATH`         | unset                    |
+| SHORT_TERM_COUNT        | number of recent messages to keep        | 20                       |
+| EMBEDDING_MAX_CONCURRENCY | number of embedding workers            | 10                       |
+| MPSC_CHANNEL_SIZE       | embedding job queue size                 | 1000                     |
+| RUST_LOG                | tracing log filter                       | info                     |
+| LOG_FORMAT              | logging format (`pretty` or `json`)      | pretty                   |
+
+values like `similarity_threshold` and `max_tokens` are currently controlled per request through query parameters on the context endpoint rather than startup environment variables.
 
 ## features
 
@@ -161,13 +166,14 @@ all configuration is via environment variables:
 - idempotency for message ingestion
 - Prometheus metrics endpoint
 - OpenAPI docs and Swagger UI
-- debug endpoint
+- generated benchmark report
 - optional authentication (future)
 
 ## documentation
 
 - [API.md](docs/API.md)
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [BENCHMARKS.md](BENCHMARKS.md)
 - [COMPARISON.md](docs/COMPARISON.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [SSOT.md](docs/SSOT.md)

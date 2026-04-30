@@ -1,12 +1,11 @@
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, black_box};
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use engram::assembler::ContextAssembler;
 use engram::core::{OpenAITokenCounter};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 
-use std::collections::HashMap;
 use engram::models::{Message, EmbeddingStatus};
 use async_trait::async_trait;
 

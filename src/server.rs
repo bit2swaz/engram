@@ -30,6 +30,7 @@ use crate::metrics::{
 use crate::models::{EmbeddingStatus, Message};
 use crate::worker::EmbeddingJob;
 
+#[derive(Clone)]
 pub struct AppState {
     pub short_term_memory: Arc<dyn ShortTermMemory>,
     pub vector_store: Arc<dyn VectorStore>,
@@ -41,6 +42,7 @@ pub struct AppState {
     pub embedding_job_sender: mpsc::Sender<EmbeddingJob>,
     pub short_term_count: usize,
 }
+
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct CreateSessionResponse {

@@ -425,11 +425,22 @@ impl CoreMemoryStore for InMemoryCoreMemoryStore {
     }
 }
 
+fn conversation_text(messages: &[Message]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec!["Conversation:".to_string()];
+    lines.extend(
+        messages
+            .iter()
+            .map(|message| format!("{}: {}", message.role, message.content)),
+    );
+    lines.join("\n")
+}
+
 fn total_tokens(messages: &[Message], token_counter: &dyn TokenCounter) -> usize {
-    messages
-        .iter()
-        .map(|message| token_counter.count_tokens(&message.content))
-        .sum()
+    token_counter.count_tokens(&conversation_text(messages))
 }
 
 pub(crate) fn trim_messages_to_token_budget(
@@ -606,10 +617,11 @@ mod tests {
             .await
             .unwrap();
 
-        let max_tokens = ["cc", "dd", "eee"]
-            .into_iter()
-            .map(|content| token_counter.count_tokens(content))
-            .sum();
+        let max_tokens = token_counter.count_tokens(&conversation_text(&[
+            message("user", "cc"),
+            message("assistant", "dd"),
+            message("user", "eee"),
+        ]));
 
         let trimmed = store
             .trim_to_token_budget("session-1", max_tokens, &token_counter)
