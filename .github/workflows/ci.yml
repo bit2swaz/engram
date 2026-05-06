@@ -39,7 +39,6 @@ jobs:
     env:
       OPENAI_API_KEY: ci-test-key
       REDIS_URL: redis://127.0.0.1:6379
-      LANCE_DB_PATH: ${{ runner.temp }}/lancedb-ci
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
@@ -60,7 +59,10 @@ jobs:
           python3 -m pip install -r benchmarks/requirements.txt
 
       - name: Prepare LanceDB path
-        run: mkdir -p "$LANCE_DB_PATH"
+        run: |
+          lance_db_path="$RUNNER_TEMP/lancedb-ci"
+          mkdir -p "$lance_db_path"
+          echo "LANCE_DB_PATH=$lance_db_path" >> "$GITHUB_ENV"
 
       - name: Run Rust tests
         run: cargo test --locked --workspace
@@ -85,7 +87,6 @@ jobs:
     env:
       OPENAI_API_KEY: ci-local-embed-key
       REDIS_URL: redis://127.0.0.1:6379
-      LANCE_DB_PATH: ${{ runner.temp }}/lancedb-quality
       WORKFLOW_LONGMEMEVAL_LIMIT: ${{ inputs.longmemeval_limit }}
     steps:
       - name: Check out repository code
@@ -108,6 +109,10 @@ jobs:
 
       - name: Resolve benchmark limit
         run: |
+          lance_db_path="$RUNNER_TEMP/lancedb-quality"
+          mkdir -p "$lance_db_path"
+          echo "LANCE_DB_PATH=$lance_db_path" >> "$GITHUB_ENV"
+
           if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
             echo "LONGMEMEVAL_LIMIT=5" >> "$GITHUB_ENV"
           elif [[ -n "$WORKFLOW_LONGMEMEVAL_LIMIT" ]]; then
