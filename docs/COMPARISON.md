@@ -18,10 +18,10 @@
 | **Background processing**      | Async worker, bounded queue | Async worker | Async | No | Async worker |
 | **Sustainability / dependencies** | Minimal (Redis, LanceDB, OpenAI) | Postgres, Redis, vector DB | Postgres, Redis, vector DB | None required | Postgres, Redis, vector DB |
 | **Documentation**              | OpenAPI, Swagger, guides | OpenAPI, Swagger, guides | Guides, OpenAPI | Docs, guides | Guides, OpenAPI |
-| **Latency (100 msg context)**  | 0.30 ms in-memory; 30.26 ms real-store | < 200 ms retrieval (public) | ~200 ms P50 search (public) | Not standardized | < 200 ms estimate |
-| **Throughput (msg/s)**         | 60,766.78 (benchmarked) | Not disclosed | Not disclosed | Not standardized | Not disclosed |
+| **Latency (100 msg context)**  | 0.281 ms in-memory; 21.66-29.55 ms real-store | < 200 ms retrieval (public) | ~200 ms P50 search (public) | Not standardized | < 200 ms estimate |
+| **Throughput (msg/s)**         | 64,500.32 (benchmarked) | Not disclosed | Not disclosed | Not standardized | Not disclosed |
 | **Token efficiency**           | 39.99% fewer tokens vs naive full dump at 4k budget | Not disclosed | Not disclosed | Depends on chain and summarizer | Not disclosed |
-| **Retrieval quality**          | Benchmark harness implemented; public LongMemEval/BEAM numbers still pending | 71.2% via Graphiti; 63.8% LongMemEval GPT-4o | 49.0% (independent) | Not standardized | 91.4% LongMemEval |
+| **Retrieval quality**          | Runnable LongMemEval/BEAM harnesses with local-embedding fallback; full public scorecards still pending | 71.2% via Graphiti; 63.8% LongMemEval GPT-4o | 49.0% (independent) | Not standardized | 91.4% LongMemEval |
 | **License**                    | MIT            | Apache 2.0    | Apache 2.0    | MIT              | Apache 2.0            |
 | **Community / maintenance**    | Active (2026)   | Active        | Active        | Active           | Active                |
 
@@ -31,12 +31,12 @@
 
 | System | Context Assembly Latency (100 msg) | Throughput (msg/s) | Token Efficiency (vs full-dump) | LongMemEval Score |
 |--------|------------------------------------|--------------------|---------------------------------|-------------------|
-| engram | 0.30 ms (in-memory), 30.26 ms (real-store) | 60,766.78 | 39.99% reduction | Harness implemented; results pending run |
+| engram | 0.281 ms (in-memory), 21.66-29.55 ms (real-store) | 64,500.32 | 39.99% reduction | Harnesses and local slices published; full scorecards pending |
 | Mem0   | ~200 ms (P50 search) | Not disclosed | Not disclosed | 49.0% (independent) |
 | Zep    | < 200 ms (retrieval) | Not disclosed | Not disclosed | 71.2% (via Graphiti), 63.8% (LongMemEval GPT-4o) |
 | Hindsight | < 200 ms (est.) | Not disclosed | Not disclosed | 91.4% (LongMemEval) |
 
-On the currently published numbers, engram's in-memory context assembly path is hundreds of times faster than the roughly 200 ms public retrieval figures cited for comparable systems. Its real-store path remains comfortably competitive at about 30 ms while exercising actual Redis and LanceDB integrations, not placeholder mocks. The new token-efficiency measurement also shows a 39.99% reduction versus a naive full-history dump at a 4k-token budget. The retrieval-quality gap is narrower than before because the repository now includes dedicated LongMemEval and BEAM harnesses, but the public score cells should remain provisional until those runs are executed against the real datasets.
+On the currently published numbers, engram's in-memory context assembly path is hundreds of times faster than the roughly 200 ms public retrieval figures cited for comparable systems. Its real-store path remains comfortably competitive at 21.66-29.55 ms while exercising actual Redis and LanceDB integrations, not placeholder mocks. The token-efficiency measurement also shows a 39.99% reduction versus a naive full-history dump at a 4k-token budget. The retrieval-quality gap is narrower than before because the repository now includes dedicated LongMemEval and BEAM harnesses plus a local-embedding fallback, but the public score cells should remain provisional until full runs are published against the real datasets.
 
 > **Comparison note:** The engram numbers above are direct local benchmarks of full context assembly or end-to-end request throughput. Public competitor figures are typically retrieval or search latencies, so the table should be read as directional rather than strictly apples-to-apples.
 
@@ -44,6 +44,7 @@ On the currently published numbers, engram's in-memory context assembly path is 
 
 **Where engram excels:**
 - **Benchmarked performance:** Current measurements show 0.30 ms in-memory context assembly for a 100-message session, 30.26 ms with real stores, and 60,766.78 messages per second in the reduced e2e throughput run.
+- **Benchmarked performance:** Current measurements show 0.281 ms in-memory context assembly for a 100-message session, 21.66-29.55 ms with real stores depending on workload, and 64,500.32 messages per second in the reduced e2e throughput run.
 - **Transparency:** Developers can inspect the exact assembled context returned by the API rather than relying on hidden chain state.
 - **Rust performance:** High concurrency, low memory overhead, and strong type safety.
 - **Single-binary deployment:** Easy to run locally or in production; Docker and Compose supported.
@@ -57,7 +58,7 @@ On the currently published numbers, engram's in-memory context assembly path is 
 - **No managed cloud offering:** Self-hosted only; no SaaS or managed tier.
 - **Smaller community:** Newer and less widely adopted than Zep or LangChain.
 - **Retrieval is single-strategy:** Only semantic search is implemented; no hybrid or BM25 yet.
-- **Quality harness ready, scores pending:** There are now published latency, throughput, and token-efficiency numbers plus repository-local LongMemEval and BEAM runners, but the final retrieval-quality scorecards still need full dataset runs.
+- **Quality harnesses are operational, but the headline scorecards are still provisional:** There are now published latency, throughput, and token-efficiency numbers plus repository-local LongMemEval and BEAM runners with a local-embedding fallback, but the final retrieval-quality scorecards still need full dataset runs.
 
 **Who engram is best for:**
 - Rust developers and teams who want a self-hosted, debuggable, and transparent memory layer for LLM agents.

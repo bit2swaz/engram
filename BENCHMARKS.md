@@ -6,26 +6,26 @@
 
 | Scenario | Messages | Max Tokens | Median Latency | Unit |
 |----------|----------|------------|----------------|------|
-| small | 10 | 2048 | 49.675 | µs |
-| medium | 100 | 2048 | 300.37 | µs |
-| large | 1000 | 2048 | 2.6058 | ms |
-| tight_budget | 50 | 2048 | 153.70 | µs |
-| long_term | 5000 | 2048 | 14.269 | ms |
+| small | 10 | 2048 | 50.103 | µs |
+| medium | 100 | 2048 | 281.02 | µs |
+| large | 1000 | 2048 | 2.4864 | ms |
+| tight_budget | 50 | 2048 | 153.38 | µs |
+| long_term | 5000 | 2048 | 13.415 | ms |
 
 ## End-to-End Throughput
 
 | Metric | Value |
 |--------|-------|
-| Throughput (msg/s) | 60766.78 |
-| P99 Context Latency (ms) | 224.01 |
+| Throughput (msg/s) | 64500.32 |
+| P99 Context Latency (ms) | 208.24 |
 
 ## Real-Store Latency
 
 | Scenario | Short-Term Messages | Long-Term Entries | Max Tokens | Median Latency | Unit |
 |----------|---------------------|-------------------|------------|----------------|------|
-| small_real | 10 | 0 | 8000 | 30.262 | ms |
-| medium_real | 100 | 0 | 8000 | 31.770 | ms |
-| large_real | 1000 | 0 | 8000 | 7.0019 | ms |
+| small_real | 10 | 0 | 8000 | 21.658 | ms |
+| medium_real | 100 | 0 | 8000 | 22.518 | ms |
+| large_real | 1000 | 0 | 8000 | 29.552 | ms |
 
 ## Interpretation
 

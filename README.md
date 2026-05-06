@@ -117,8 +117,8 @@ curl -X DELETE http://localhost:3000/sessions/{session_id}
 ```sh
 docker compose up -d
 ```
-- wait for the health check to pass
-- use the same curl examples above (replace `localhost:3000` if needed)
+- wait for the health check to pass on `http://127.0.0.1:${ENGRAM_HOST_PORT:-3002}/health`
+- use the same curl examples above, but target `http://127.0.0.1:${ENGRAM_HOST_PORT:-3002}` for the Compose deployment
 
 ## API overview
 
@@ -145,8 +145,10 @@ the application currently reads these environment variables directly:
 |-------------------------|------------------------------------------|--------------------------|
 | REDIS_URL               | Redis connection url                     | redis://localhost:6379   |
 | OPENAI_API_KEY          | OpenAI API key                           | required                 |
+| OPENAI_BASE_URL         | Optional OpenAI-compatible API base URL  | unset                    |
 | LANCE_DB_PATH           | LanceDB data path                        | ./data/lancedb           |
 | LANCEDB_PATH            | legacy alias for `LANCE_DB_PATH`         | unset                    |
+| EMBEDDING_DIMENSION     | embedding vector width                   | 1536                     |
 | SHORT_TERM_COUNT        | number of recent messages to keep        | 20                       |
 | EMBEDDING_MAX_CONCURRENCY | number of embedding workers            | 10                       |
 | MPSC_CHANNEL_SIZE       | embedding job queue size                 | 1000                     |
@@ -167,13 +169,26 @@ values like `similarity_threshold` and `max_tokens` are currently controlled per
 - Prometheus metrics endpoint
 - OpenAPI docs and Swagger UI
 - generated benchmark report
+- LongMemEval and BEAM benchmark harnesses
 - optional authentication (future)
+
+## quality benchmarking
+
+the repository includes a retrieval-quality harness for LongMemEval and BEAM under `benchmarks/`.
+
+- LongMemEval uses `benchmarks/longmemeval_engram.py` and emits retrieval summaries plus `hypothesis.jsonl` for the official evaluator.
+- BEAM uses `benchmarks/beam_engram.py` and supports flat JSON input as well as the repository-style `chats/100K`, `chats/500K`, and `chats/1M` layouts.
+- `scripts/run_quality_benchmarks.sh` defaults to `http://127.0.0.1:3002` and is meant to target the Docker Compose deployment to avoid common port `3000` conflicts.
+- Retrieval smoke runs can avoid hosted embedding APIs entirely by letting the harness start `tools/local_embed_server.py` and a matching engram process with `--start-local-embed-server --start-engram`.
+
+see [docs/QUALITY_BENCHMARKS.md](docs/QUALITY_BENCHMARKS.md) for the end-to-end runbook.
 
 ## documentation
 
 - [API.md](docs/API.md)
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [BENCHMARKS.md](BENCHMARKS.md)
+- [QUALITY_BENCHMARKS.md](docs/QUALITY_BENCHMARKS.md)
 - [COMPARISON.md](docs/COMPARISON.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [SSOT.md](docs/SSOT.md)
