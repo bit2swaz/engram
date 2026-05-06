@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_full_quality_benchmark:
+        description: Run the LongMemEval retrieval benchmark job.
+        required: true
+        default: false
+        type: boolean
+      longmemeval_limit:
+        description: LongMemEval questions to process for manual runs. Use 0 for a full dataset pass.
+        required: true
+        default: "0"
+        type: string
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  fast-tests:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    env:
+      OPENAI_API_KEY: ci-test-key
+      REDIS_URL: redis://127.0.0.1:6379
+      LANCE_DB_PATH: ${{ runner.temp }}/lancedb-ci
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: benchmarks/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r benchmarks/requirements.txt
+
+      - name: Prepare LanceDB path
+        run: mkdir -p "$LANCE_DB_PATH"
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace
+
+      - name: Compile benchmark helpers
+        run: python3 -m py_compile benchmarks/quality_common.py benchmarks/longmemeval_engram.py benchmarks/beam_engram.py tools/local_embed_server.py
+
+  quality-benchmark:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_full_quality_benchmark) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    env:
+      OPENAI_API_KEY: ci-local-embed-key
+      REDIS_URL: redis://127.0.0.1:6379
+      LANCE_DB_PATH: ${{ runner.temp }}/lancedb-quality
+      WORKFLOW_LONGMEMEVAL_LIMIT: ${{ inputs.longmemeval_limit }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: benchmarks/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r benchmarks/requirements.txt
+
+      - name: Resolve benchmark limit
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            echo "LONGMEMEVAL_LIMIT=5" >> "$GITHUB_ENV"
+          elif [[ -n "$WORKFLOW_LONGMEMEVAL_LIMIT" ]]; then
+            echo "LONGMEMEVAL_LIMIT=$WORKFLOW_LONGMEMEVAL_LIMIT" >> "$GITHUB_ENV"
+          else
+            echo "LONGMEMEVAL_LIMIT=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download LongMemEval dataset
+        run: |
+          mkdir -p benchmarks/deps/LongMemEval/data
+          curl -L --fail --retry 3 \
+            https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s \
+            -o benchmarks/deps/LongMemEval/data/longmemeval_s.json
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Run LongMemEval retrieval benchmark
+        run: |
+          mkdir -p "$LANCE_DB_PATH"
+          python3 benchmarks/longmemeval_engram.py \
+            --dataset benchmarks/deps/LongMemEval/data/longmemeval_s.json \
+            --mode retrieval \
+            --limit "$LONGMEMEVAL_LIMIT" \
+            --progress-every 1 \
+            --engram-url http://127.0.0.1:3002 \
+            --output-dir benchmarks/results/ci-longmemeval \
+            --start-local-embed-server \
+            --start-engram \
+            --engram-command "env ENGRAM_BIND_ADDR=127.0.0.1:3002 target/release/engram" \
+            --lance-db-path "$LANCE_DB_PATH"
