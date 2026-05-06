@@ -12,8 +12,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from quality_common import (  # noqa: E402
     BenchError,
+    DEFAULT_LOCAL_EMBED_BASE_URL,
+    DEFAULT_LOCAL_EMBED_COMMAND,
+    DEFAULT_LOCAL_EMBED_ENV_OVERRIDES,
+    DEFAULT_LOCAL_EMBED_HEALTH_URL,
     DEFAULT_QUEUE_METRIC_NAME,
     EngramClient,
+    build_engram_env_overrides,
     ensure_directory,
     load_json,
     log,
@@ -23,13 +28,16 @@ from quality_common import (  # noqa: E402
     recall_any_at_k,
     reciprocal_rank,
     render_retrieval_summary_markdown,
+    resolve_embedding_dimension,
     run_openai_compatible_qa,
     save_json,
     save_jsonl,
     save_markdown,
+    start_process,
     start_engram_process,
     stop_process,
     summarize_retrieval_results,
+    wait_for_http_ok,
 )
 
 
@@ -44,13 +52,19 @@ def parse_args() -> argparse.Namespace:
         default="retrieval",
         help="Evaluation mode to run.",
     )
-    parser.add_argument("--engram-url", default="http://localhost:3000")
+    parser.add_argument("--engram-url", default="http://127.0.0.1:3002")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=50)
     parser.add_argument("--timeout-secs", type=float, default=30.0)
+    parser.add_argument(
+        "--health-timeout-secs",
+        type=float,
+        default=120.0,
+        help="How long to wait for started HTTP services to become healthy.",
+    )
     parser.add_argument("--wait-timeout-secs", type=float, default=120.0)
     parser.add_argument("--queue-metric-name", default=DEFAULT_QUEUE_METRIC_NAME)
     parser.add_argument("--queue-settle-secs", type=float, default=2.0)
@@ -59,7 +73,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-sessions", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--start-engram", action="store_true")
-    parser.add_argument("--engram-command", default="cargo run --release")
+    parser.add_argument(
+        "--start-local-embed-server",
+        action="store_true",
+        help="Start a local OpenAI-compatible embedding server before starting engram.",
+    )
+    parser.add_argument(
+        "--local-embed-command",
+        default=DEFAULT_LOCAL_EMBED_COMMAND,
+        help="Command used when --start-local-embed-server is enabled.",
+    )
+    parser.add_argument(
+        "--local-embed-cwd",
+        type=Path,
+        default=SCRIPT_DIR.parent,
+        help="Working directory used when --start-local-embed-server is enabled.",
+    )
+    parser.add_argument(
+        "--local-embed-base-url",
+        default=DEFAULT_LOCAL_EMBED_BASE_URL,
+        help="OpenAI-compatible base URL exposed by the local embedding server.",
+    )
+    parser.add_argument(
+        "--local-embed-health-url",
+        default=DEFAULT_LOCAL_EMBED_HEALTH_URL,
+        help="Health endpoint used to wait for the local embedding server.",
+    )
+    parser.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=None,
+        help="Embedding width expected by engram; defaults to 384 when --start-local-embed-server is enabled.",
+    )
+    parser.add_argument(
+        "--lance-db-path",
+        type=Path,
+        default=None,
+        help="Optional LANCE_DB_PATH override passed to a started engram process.",
+    )
+    parser.add_argument(
+        "--engram-command",
+        default="env ENGRAM_BIND_ADDR=127.0.0.1:3002 cargo run --release",
+    )
     parser.add_argument(
         "--engram-cwd",
         type=Path,
@@ -76,6 +131,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-base-url", default="https://api.openai.com/v1")
     parser.add_argument("--llm-api-key-env", default="OPENAI_API_KEY")
     return parser.parse_args()
+
+
+def start_benchmark_processes(
+    args: argparse.Namespace,
+) -> Tuple[Optional[object], Optional[object]]:
+    local_embed_process = None
+    engram_process = None
+
+    embedding_dimension = resolve_embedding_dimension(
+        args.embedding_dimension,
+        use_local_embed_server=args.start_local_embed_server,
+    )
+    engram_env_overrides = build_engram_env_overrides(
+        embedding_dimension=embedding_dimension,
+        openai_base_url=args.local_embed_base_url if args.start_local_embed_server else None,
+        lance_db_path=args.lance_db_path,
+    )
+
+    if args.start_local_embed_server:
+        local_embed_process = start_process(
+            args.local_embed_command,
+            args.local_embed_cwd,
+            env_overrides=DEFAULT_LOCAL_EMBED_ENV_OVERRIDES,
+        )
+        wait_for_http_ok(
+            args.local_embed_health_url,
+            timeout_secs=args.health_timeout_secs,
+            process=local_embed_process,
+            service_name="local embedding server",
+        )
+
+    if args.start_engram:
+        engram_process = start_engram_process(
+            args.engram_command,
+            args.engram_cwd,
+            env_overrides=engram_env_overrides or None,
+        )
+
+    return local_embed_process, engram_process
 
 
 def load_dataset(dataset_path: Path, limit: int) -> List[Dict[str, Any]]:
@@ -140,6 +234,7 @@ def ingest_entry(
         ordered_sessions(entry),
         start=1,
     ):
+        session_enqueued = False
         if inject_session_markers:
             marker_text = (
                 f"[engram-longmemeval] session={session_index} "
@@ -152,6 +247,7 @@ def ingest_entry(
                 message_id=f"marker-{session_index}",
             )
             text_to_session_ids.setdefault(marker_text, []).append(source_session_id)
+            session_enqueued = True
 
         for turn_index, turn in enumerate(turns, start=1):
             role = str(turn.get("role", "user"))
@@ -166,10 +262,19 @@ def ingest_entry(
                 message_id=f"msg-{session_index}-{turn_index}-{message_counter}",
             )
             text_to_session_ids.setdefault(content, []).append(source_session_id)
+            session_enqueued = True
             if sleep_between_messages > 0:
                 import time
 
                 time.sleep(sleep_between_messages)
+
+        if session_enqueued:
+            client.wait_for_embeddings(
+                metric_name=queue_metric_name,
+                timeout_secs=wait_timeout_secs,
+                settle_secs=queue_settle_secs,
+                poll_interval_secs=queue_poll_interval_secs,
+            )
 
     client.wait_for_embeddings(
         metric_name=queue_metric_name,
@@ -253,12 +358,15 @@ def run_retrieval_mode(args: argparse.Namespace, dataset: Sequence[Mapping[str, 
     completed_ids = {item["question_id"] for item in existing_results}
     all_results: List[Dict[str, Any]] = list(existing_results)
 
-    process = None
+    local_embed_process = None
+    engram_process = None
     client = EngramClient(args.engram_url, timeout_secs=args.timeout_secs)
     try:
-        if args.start_engram:
-            process = start_engram_process(args.engram_command, args.engram_cwd)
-        client.wait_until_healthy()
+        local_embed_process, engram_process = start_benchmark_processes(args)
+        client.wait_until_healthy(
+            timeout_secs=args.health_timeout_secs,
+            process=engram_process,
+        )
 
         total = len(dataset)
         for index, entry in enumerate(dataset, start=1):
@@ -327,7 +435,8 @@ def run_retrieval_mode(args: argparse.Namespace, dataset: Sequence[Mapping[str, 
         log(f"LongMemEval retrieval results written to {results_path}")
         log(f"LongMemEval retrieval metrics written to {metrics_path}")
     finally:
-        stop_process(process)
+        stop_process(engram_process)
+        stop_process(local_embed_process)
 
 
 def run_qa_mode(args: argparse.Namespace, dataset: Sequence[Mapping[str, Any]]) -> None:
@@ -339,12 +448,15 @@ def run_qa_mode(args: argparse.Namespace, dataset: Sequence[Mapping[str, Any]]) 
     existing_hypotheses = load_existing_hypotheses(hypothesis_path) if args.resume else []
     completed_ids = {item["question_id"] for item in existing_hypotheses}
     details: List[Dict[str, Any]] = []
-    process = None
+    local_embed_process = None
+    engram_process = None
     client = EngramClient(args.engram_url, timeout_secs=args.timeout_secs)
     try:
-        if args.start_engram:
-            process = start_engram_process(args.engram_command, args.engram_cwd)
-        client.wait_until_healthy()
+        local_embed_process, engram_process = start_benchmark_processes(args)
+        client.wait_until_healthy(
+            timeout_secs=args.health_timeout_secs,
+            process=engram_process,
+        )
 
         total = len(dataset)
         hypotheses = list(existing_hypotheses)
@@ -421,7 +533,8 @@ def run_qa_mode(args: argparse.Namespace, dataset: Sequence[Mapping[str, Any]]) 
         )
         log(f"LongMemEval QA hypotheses written to {hypothesis_path}")
     finally:
-        stop_process(process)
+        stop_process(engram_process)
+        stop_process(local_embed_process)
 
 
 def main() -> None:

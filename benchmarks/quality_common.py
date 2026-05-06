@@ -5,6 +5,7 @@ import math
 import os
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,22 @@ DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 DEFAULT_QUEUE_SETTLE_SECS = 2.0
 DEFAULT_QUEUE_POLL_INTERVAL_SECS = 1.0
 DEFAULT_QUEUE_METRIC_NAME = "engram_memory_embedding_queue_size"
+DEFAULT_LOCAL_EMBED_BASE_URL = "http://127.0.0.1:8085"
+DEFAULT_LOCAL_EMBED_HEALTH_URL = "http://127.0.0.1:8085/health"
+DEFAULT_LOCAL_EMBED_DIMENSION = 384
+DEFAULT_LOCAL_EMBED_ENV_OVERRIDES = {"HF_HUB_DISABLE_XET": "1"}
+DEFAULT_LOCAL_EMBED_COMMAND = " ".join(
+    [
+        shlex.quote(sys.executable),
+        "tools/local_embed_server.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8085",
+        "--model",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    ]
+)
 
 
 class BenchError(RuntimeError):
@@ -92,6 +109,64 @@ def parse_prometheus_metric(metrics_text: str, metric_name: str) -> Optional[flo
     return None
 
 
+def wait_for_http_ok(
+    url: str,
+    *,
+    timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS,
+    timeout_per_request_secs: float = 5.0,
+    process: Optional[subprocess.Popen[str]] = None,
+    service_name: str = "service",
+) -> None:
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise BenchError(
+                f"{service_name} exited with code {process.returncode} before becoming healthy at {url}"
+            )
+        try:
+            response = requests.get(url, timeout=timeout_per_request_secs)
+            if response.status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(1.0)
+
+    raise BenchError(
+        f"{service_name} did not become healthy within {timeout_secs:.0f}s at {url}"
+    )
+
+
+def resolve_embedding_dimension(
+    embedding_dimension: Optional[int],
+    *,
+    use_local_embed_server: bool,
+) -> Optional[int]:
+    if embedding_dimension is not None:
+        if embedding_dimension <= 0:
+            raise BenchError("embedding dimension must be a positive integer")
+        return embedding_dimension
+    if use_local_embed_server:
+        return DEFAULT_LOCAL_EMBED_DIMENSION
+    return None
+
+
+def build_engram_env_overrides(
+    *,
+    embedding_dimension: Optional[int],
+    openai_base_url: Optional[str] = None,
+    lance_db_path: Optional[Path] = None,
+) -> Dict[str, str]:
+    env_overrides: Dict[str, str] = {}
+    if embedding_dimension is not None:
+        env_overrides["EMBEDDING_DIMENSION"] = str(embedding_dimension)
+    if openai_base_url:
+        env_overrides["OPENAI_BASE_URL"] = openai_base_url.rstrip("/")
+        env_overrides["OPENAI_API_KEY"] = "local-embed-benchmark"
+    if lance_db_path is not None:
+        env_overrides["LANCE_DB_PATH"] = str(lance_db_path)
+    return env_overrides
+
+
 class EngramClient:
     def __init__(
         self,
@@ -126,21 +201,18 @@ class EngramClient:
 
         return response
 
-    def wait_until_healthy(self, timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS) -> None:
-        deadline = time.monotonic() + timeout_secs
-        while time.monotonic() < deadline:
-            try:
-                response = self.session.get(
-                    f"{self.base_url}/health", timeout=min(self.timeout_secs, 5.0)
-                )
-                if response.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(1.0)
-
-        raise BenchError(
-            f"engram did not become healthy within {timeout_secs:.0f}s at {self.base_url}"
+    def wait_until_healthy(
+        self,
+        timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS,
+        *,
+        process: Optional[subprocess.Popen[str]] = None,
+    ) -> None:
+        wait_for_http_ok(
+            f"{self.base_url}/health",
+            timeout_secs=timeout_secs,
+            timeout_per_request_secs=min(self.timeout_secs, 5.0),
+            process=process,
+            service_name="engram",
         )
 
     def create_session(self) -> str:
@@ -251,15 +323,32 @@ class EngramClient:
         )
 
 
-def start_engram_process(command: str, cwd: Path) -> subprocess.Popen[str]:
+def start_process(
+    command: str,
+    cwd: Path,
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+) -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.Popen(
         shlex.split(command),
         cwd=str(cwd),
-        env=os.environ.copy(),
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
     )
+
+
+def start_engram_process(
+    command: str,
+    cwd: Path,
+    *,
+    env_overrides: Optional[Mapping[str, str]] = None,
+) -> subprocess.Popen[str]:
+    return start_process(command, cwd, env_overrides=env_overrides)
 
 
 def stop_process(process: Optional[subprocess.Popen[str]]) -> None:

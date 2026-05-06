@@ -31,8 +31,13 @@ pub enum AppBuildError {
 }
 
 pub async fn build_real_app_state(config: &Config) -> Result<Arc<AppState>, AppBuildError> {
-    let embedding_provider: Arc<dyn EmbeddingProvider> =
-        Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?);
+    let embedding_provider: Arc<dyn EmbeddingProvider> = match &config.openai_base_url {
+        Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
+            config.openai_api_key.clone(),
+            base_url.clone(),
+        )?),
+        None => Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?),
+    };
 
     build_app_state_with_embedding_provider(config, embedding_provider).await
 }
@@ -44,7 +49,7 @@ pub async fn build_app_state_with_embedding_provider(
     let short_term_memory: Arc<dyn ShortTermMemory> =
         Arc::new(RedisShortTermMemory::connect(&config.redis_url).await?);
     let vector_store: Arc<dyn VectorStore> =
-        Arc::new(LanceDBStore::connect(&config.lance_db_path).await?);
+        Arc::new(LanceDBStore::connect(&config.lance_db_path, config.embedding_dimension).await?);
     let token_counter: Arc<dyn TokenCounter> = Arc::new(OpenAITokenCounter::new()?);
     let core_memory_store = Arc::new(RedisCoreMemoryStore::connect(&config.redis_url).await?);
     let metrics = Arc::new(AppMetrics::new()?);

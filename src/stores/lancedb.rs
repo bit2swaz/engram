@@ -21,31 +21,35 @@ use lancedb::{DistanceType, Table, connect};
 
 use crate::core::{SearchResult, StoreError, VectorStore};
 
-const EMBEDDING_DIMENSION: i32 = 1536;
 const DEFAULT_TABLE_NAME: &str = "memories";
 const MIN_VECTOR_INDEX_ROWS: usize = 256;
 
 pub struct LanceDBStore {
     db: Connection,
     table_name: String,
+    embedding_dimension: i32,
     next_id: AtomicI64,
 }
 
 impl LanceDBStore {
-    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub async fn connect(path: impl AsRef<Path>, embedding_dimension: usize) -> Result<Self, StoreError> {
         let uri = path
             .as_ref()
             .to_str()
             .ok_or_else(|| StoreError::Message("LanceDB path must be valid UTF-8".to_string()))?;
+        let embedding_dimension = i32::try_from(embedding_dimension).map_err(|_| {
+            StoreError::Message("embedding dimension exceeds supported range".to_string())
+        })?;
         let db = connect(uri).execute().await.map_err(store_error)?;
         let table_name = DEFAULT_TABLE_NAME.to_string();
-        let table = ensure_table(&db, &table_name).await?;
+        let table = ensure_table(&db, &table_name, embedding_dimension).await?;
         ensure_indexes(&table).await?;
         let next_id = load_next_id(&table).await?;
 
         Ok(Self {
             db,
             table_name,
+            embedding_dimension,
             next_id: AtomicI64::new(next_id),
         })
     }
@@ -100,7 +104,15 @@ impl VectorStore for LanceDBStore {
 
         let row_id = self.next_row_id();
         let created_at = Utc::now().timestamp_micros();
-        let reader = make_reader(row_id, session_id, message_id, text, &embedding, created_at)?;
+        let reader = make_reader(
+            row_id,
+            session_id,
+            message_id,
+            text,
+            &embedding,
+            created_at,
+            self.embedding_dimension,
+        )?;
 
         table.add(reader).execute().await.map_err(store_error)?;
         ensure_indexes(&table).await?;
@@ -116,6 +128,13 @@ impl VectorStore for LanceDBStore {
     ) -> Result<Vec<SearchResult>, StoreError> {
         if top_k == 0 {
             return Ok(Vec::new());
+        }
+        if query_embedding.len() != self.embedding_dimension as usize {
+            return Err(StoreError::Message(format!(
+                "query embedding must have dimension {}, got {}",
+                self.embedding_dimension,
+                query_embedding.len()
+            )));
         }
 
         let table = self.open_table().await?;
@@ -182,7 +201,11 @@ impl VectorStore for LanceDBStore {
     }
 }
 
-async fn ensure_table(db: &Connection, table_name: &str) -> Result<Table, StoreError> {
+async fn ensure_table(
+    db: &Connection,
+    table_name: &str,
+    embedding_dimension: i32,
+) -> Result<Table, StoreError> {
     let table_names = db.table_names().execute().await.map_err(store_error)?;
     if table_names.iter().any(|name| name == table_name) {
         db.open_table(table_name)
@@ -190,7 +213,7 @@ async fn ensure_table(db: &Connection, table_name: &str) -> Result<Table, StoreE
             .await
             .map_err(store_error)
     } else {
-        db.create_empty_table(table_name, schema())
+        db.create_empty_table(table_name, schema(embedding_dimension))
             .execute()
             .await
             .map_err(store_error)
@@ -267,16 +290,17 @@ fn make_reader(
     text: &str,
     embedding: &[f32],
     created_at: i64,
+    embedding_dimension: i32,
 ) -> Result<Box<dyn RecordBatchReader + Send>, StoreError> {
-    if embedding.len() != EMBEDDING_DIMENSION as usize {
+    if embedding.len() != embedding_dimension as usize {
         return Err(StoreError::Message(format!(
             "embedding must have dimension {}, got {}",
-            EMBEDDING_DIMENSION,
+            embedding_dimension,
             embedding.len()
         )));
     }
 
-    let schema = schema();
+    let schema = schema(embedding_dimension);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -289,7 +313,7 @@ fn make_reader(
                     vec![Some(
                         embedding.iter().copied().map(Some).collect::<Vec<_>>(),
                     )],
-                    EMBEDDING_DIMENSION,
+                    embedding_dimension,
                 ),
             ),
             Arc::new(TimestampMicrosecondArray::from(vec![created_at])),
@@ -303,7 +327,7 @@ fn make_reader(
     )))
 }
 
-fn schema() -> Arc<Schema> {
+fn schema(embedding_dimension: i32) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("session_id", DataType::Utf8, false),
@@ -313,7 +337,7 @@ fn schema() -> Arc<Schema> {
             "embedding",
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIMENSION,
+                embedding_dimension,
             ),
             true,
         ),

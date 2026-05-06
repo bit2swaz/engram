@@ -80,7 +80,9 @@ async fn setup_test_app() -> TestApp {
     let config = Config {
         redis_url,
         openai_api_key: "test-key".to_string(),
+        openai_base_url: None,
         lance_db_path: lance_db_dir.path().to_path_buf(),
+        embedding_dimension: 1536,
         embedding_max_concurrency: 1,
         mpsc_channel_size: 4,
         short_term_count: 20,

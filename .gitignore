@@ -2,6 +2,11 @@
 docs/ROADMAP.md
 __pycache__/
 *.pyc
+benchmarks/deps/
+benchmarks/results/
+data/benchmarks-lancedb-local/
+data/lancedb-bench/
+tools/__pycache__/
 
 # Added by cargo
 
