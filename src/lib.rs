@@ -9,3 +9,4 @@ pub mod models;
 pub mod server;
 pub mod stores;
 pub mod worker;
+pub mod raft;
