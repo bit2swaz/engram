@@ -14,6 +14,10 @@ pub struct AppMetrics {
     vector_search_duration_seconds: HistogramVec,
     short_term_store_errors_total: IntCounterVec,
     embedding_queue_size: IntGauge,
+    pub raft_term: IntGauge,
+    pub raft_commit_index: IntGauge,
+    pub raft_is_leader: IntGauge,
+    pub raft_leader_changes_total: IntCounter,
 }
 
 impl AppMetrics {
@@ -68,6 +72,30 @@ impl AppMetrics {
         ))?;
         registry.register(Box::new(embedding_queue_size.clone()))?;
 
+        let raft_term = IntGauge::with_opts(Opts::new(
+            "raft_term",
+            "Current Raft term on this node.",
+        ))?;
+        registry.register(Box::new(raft_term.clone()))?;
+
+        let raft_commit_index = IntGauge::with_opts(Opts::new(
+            "raft_commit_index",
+            "Index of the last log entry applied to the state machine.",
+        ))?;
+        registry.register(Box::new(raft_commit_index.clone()))?;
+
+        let raft_is_leader = IntGauge::with_opts(Opts::new(
+            "raft_is_leader",
+            "1 if this node is the current Raft leader, 0 otherwise.",
+        ))?;
+        registry.register(Box::new(raft_is_leader.clone()))?;
+
+        let raft_leader_changes_total = IntCounter::with_opts(Opts::new(
+            "raft_leader_changes_total",
+            "Total number of Raft leader changes observed by this node.",
+        ))?;
+        registry.register(Box::new(raft_leader_changes_total.clone()))?;
+
         Ok(Self {
             registry,
             messages_added_total,
@@ -76,6 +104,10 @@ impl AppMetrics {
             vector_search_duration_seconds,
             short_term_store_errors_total,
             embedding_queue_size,
+            raft_term,
+            raft_commit_index,
+            raft_is_leader,
+            raft_leader_changes_total,
         })
     }
 

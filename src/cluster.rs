@@ -140,7 +140,7 @@ mod tests {
     use axum_test::TestServer;
     use serde_json::Value;
 
-    use crate::app::build_raft_node;
+    use crate::app::{build_raft_node, spawn_raft_metrics_watcher};
     use crate::assembler::ContextAssembler;
     use crate::config::Config;
     use crate::core::{
@@ -190,6 +190,8 @@ mod tests {
         raft.initialize(members).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(600)).await;
+
+        spawn_raft_metrics_watcher(raft.clone(), metrics.clone());
 
         let state = Arc::new(AppState {
             short_term_memory: short_term,
@@ -267,5 +269,16 @@ mod tests {
         let app = build_test_app_standalone();
         let resp = app.get("/cluster").await;
         assert_eq!(resp.status_code(), 503);
+    }
+
+    #[tokio::test]
+    async fn raft_metrics_appear_in_prometheus_scrape() {
+        let app = build_test_app_with_single_node_raft().await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let resp = app.get("/metrics").await;
+        let body = resp.text();
+        assert!(body.contains("engram_raft_term"), "missing engram_raft_term");
+        assert!(body.contains("engram_raft_commit_index"), "missing engram_raft_commit_index");
+        assert!(body.contains("engram_raft_is_leader"), "missing engram_raft_is_leader");
     }
 }

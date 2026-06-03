@@ -68,6 +68,33 @@ pub async fn build_raft_node(
     Ok(Arc::new(raft))
 }
 
+/// Spawns a background task that watches the Raft metrics channel and updates
+/// Prometheus gauges. Must be called after the Raft node is initialized.
+pub fn spawn_raft_metrics_watcher(
+    raft: Arc<crate::raft::types::RaftHandle>,
+    metrics: Arc<AppMetrics>,
+) {
+    tokio::spawn(async move {
+        let mut rx = raft.metrics();
+        let mut last_leader: Option<u64> = None;
+        loop {
+            if rx.changed().await.is_err() {
+                break;
+            }
+            let m = rx.borrow().clone();
+            metrics.raft_term.set(m.current_term as i64);
+            if let Some(applied) = &m.last_applied {
+                metrics.raft_commit_index.set(applied.index as i64);
+            }
+            metrics.raft_is_leader.set((m.current_leader == Some(m.id)) as i64);
+            if m.current_leader != last_leader {
+                metrics.raft_leader_changes_total.inc();
+                last_leader = m.current_leader;
+            }
+        }
+    });
+}
+
 pub async fn build_real_app_state(config: &Config) -> Result<Arc<AppState>, AppBuildError> {
     let embedding_provider: Arc<dyn EmbeddingProvider> = match &config.openai_base_url {
         Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
@@ -127,6 +154,10 @@ pub async fn build_app_state_with_embedding_provider(
     } else {
         (None, 0u64, std::collections::HashMap::new(), None, vec![])
     };
+
+    if let Some(raft_handle) = &raft {
+        spawn_raft_metrics_watcher(raft_handle.clone(), metrics.clone());
+    }
 
     Ok(Arc::new(AppState {
         short_term_memory,
