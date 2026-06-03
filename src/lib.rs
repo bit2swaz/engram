@@ -1,5 +1,6 @@
 pub mod app;
 pub mod assembler;
+pub mod cluster;
 pub mod config;
 pub mod core;
 pub mod embedding;

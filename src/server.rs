@@ -100,6 +100,10 @@ pub struct AppState {
     pub node_id: u64,
     /// HTTP addresses of peer nodes keyed by node ID, for follower redirects.
     pub peer_http_addrs: std::collections::HashMap<u64, String>,
+    /// This node's gRPC listen address, e.g. "0.0.0.0:9001". Used by init_cluster.
+    pub raft_addr: Option<String>,
+    /// gRPC addresses of peer nodes, used to build the initial cluster membership.
+    pub cluster_peers: Vec<crate::config::PeerConfig>,
 }
 
 
@@ -192,6 +196,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/context", get(get_context))
         .route("/sessions/{session_id}/search", post(search_session))
         .route("/sessions/{session_id}/core-memory", put(put_core_memory))
+        .route("/cluster", get(crate::cluster::get_cluster_status))
+        .route("/cluster/init", post(crate::cluster::init_cluster))
+        .route("/cluster/add-learner", post(crate::cluster::add_learner))
+        .route(
+            "/cluster/change-membership",
+            post(crate::cluster::change_membership),
+        )
         .route("/health", get(health_check))
         .route(
             "/metrics",
@@ -729,6 +740,8 @@ mod tests {
             raft: None,
             node_id: 0,
             peer_http_addrs: std::collections::HashMap::new(),
+            raft_addr: None,
+            cluster_peers: vec![],
         })
     }
 
