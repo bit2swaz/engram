@@ -10,3 +10,9 @@ pub mod server;
 pub mod stores;
 pub mod worker;
 pub mod raft;
+
+pub mod proto {
+    pub mod raft {
+        tonic::include_proto!("engram.raft");
+    }
+}
