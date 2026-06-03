@@ -1,0 +1,81 @@
+services:
+  redis-1:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [engram-cluster]
+
+  redis-2:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [engram-cluster]
+
+  redis-3:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [engram-cluster]
+
+  node-1:
+    build: .
+    environment:
+      NODE_ID: "1"
+      RAFT_ADDR: "0.0.0.0:9001"
+      CLUSTER_PEERS: "2:node-2:9001,3:node-3:9001"
+      CLUSTER_HTTP_PEERS: "2:node-2:3000,3:node-3:3000"
+      REDIS_URL: "redis://redis-1:6379"
+      LANCE_DB_PATH: "/data/lancedb"
+      ENGRAM_BIND_ADDR: "0.0.0.0:3000"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      RUST_LOG: "info,openraft=debug"
+    ports:
+      - "3000:3000"
+      - "9001:9001"
+    depends_on: [redis-1]
+    volumes: [lancedb-1:/data/lancedb]
+    networks: [engram-cluster]
+
+  node-2:
+    build: .
+    environment:
+      NODE_ID: "2"
+      RAFT_ADDR: "0.0.0.0:9001"
+      CLUSTER_PEERS: "1:node-1:9001,3:node-3:9001"
+      CLUSTER_HTTP_PEERS: "1:node-1:3000,3:node-3:3000"
+      REDIS_URL: "redis://redis-2:6379"
+      LANCE_DB_PATH: "/data/lancedb"
+      ENGRAM_BIND_ADDR: "0.0.0.0:3000"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      RUST_LOG: "info,openraft=debug"
+    ports:
+      - "3001:3000"
+      - "9002:9001"
+    depends_on: [redis-2]
+    volumes: [lancedb-2:/data/lancedb]
+    networks: [engram-cluster]
+
+  node-3:
+    build: .
+    environment:
+      NODE_ID: "3"
+      RAFT_ADDR: "0.0.0.0:9001"
+      CLUSTER_PEERS: "1:node-1:9001,2:node-2:9001"
+      CLUSTER_HTTP_PEERS: "1:node-1:3000,2:node-2:3000"
+      REDIS_URL: "redis://redis-3:6379"
+      LANCE_DB_PATH: "/data/lancedb"
+      ENGRAM_BIND_ADDR: "0.0.0.0:3000"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      RUST_LOG: "info,openraft=debug"
+    ports:
+      - "3002:3000"
+      - "9003:9001"
+    depends_on: [redis-3]
+    volumes: [lancedb-3:/data/lancedb]
+    networks: [engram-cluster]
+
+volumes:
+  lancedb-1:
+  lancedb-2:
+  lancedb-3:
+
+networks:
+  engram-cluster:
+    driver: bridge

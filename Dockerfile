@@ -16,6 +16,8 @@ RUN mkdir -p src \
     && cargo fetch --locked \
     && rm -rf src
 
+COPY build.rs build.rs
+COPY proto proto
 COPY src src
 COPY tests tests
 
@@ -44,5 +46,6 @@ ENV LANCE_DB_PATH=/data/lancedb
 ENV ENGRAM_BIND_ADDR=0.0.0.0:3000
 
 EXPOSE 3000
+EXPOSE 9001
 
 CMD ["engram"]
