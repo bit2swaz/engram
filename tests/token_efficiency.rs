@@ -1,5 +1,4 @@
-// Token Efficiency Measurement for Engram
-// See ROADMAP.md Phase 6.4 Part C
+// Token Efficiency Measurement
 
 use engram::assembler::ContextAssembler;
 use engram::core::{
@@ -69,6 +68,9 @@ fn build_test_state() -> Arc<AppState> {
         metrics,
         embedding_job_sender,
         short_term_count: MESSAGE_COUNT,
+        raft: None,
+        node_id: 0,
+        peer_http_addrs: std::collections::HashMap::new(),
     })
 }
 

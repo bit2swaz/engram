@@ -41,6 +41,12 @@ pub struct AppState {
     pub metrics: Arc<AppMetrics>,
     pub embedding_job_sender: mpsc::Sender<EmbeddingJob>,
     pub short_term_count: usize,
+    /// None in standalone mode (no NODE_ID env var). Some when running as a cluster node.
+    pub raft: Option<Arc<crate::raft::types::RaftHandle>>,
+    /// This node's Raft node ID. 0 in standalone mode.
+    pub node_id: u64,
+    /// HTTP addresses of peer nodes keyed by node ID, for follower redirects.
+    pub peer_http_addrs: std::collections::HashMap<u64, String>,
 }
 
 
@@ -632,7 +638,17 @@ mod tests {
             metrics,
             embedding_job_sender,
             short_term_count: 20,
+            raft: None,
+            node_id: 0,
+            peer_http_addrs: std::collections::HashMap::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn appstate_has_raft_field() {
+        let s = build_test_state();
+        let _ = s.raft.is_none();
+        let _ = s.node_id;
     }
 
     #[tokio::test]

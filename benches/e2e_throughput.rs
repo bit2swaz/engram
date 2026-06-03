@@ -185,6 +185,9 @@ impl BenchmarkHarness {
             metrics: metrics.clone(),
             embedding_job_sender,
             short_term_count: config.total_messages().max(1),
+            raft: None,
+            node_id: 0,
+            peer_http_addrs: std::collections::HashMap::new(),
         });
 
         let _worker_handles = spawn_embedding_workers(

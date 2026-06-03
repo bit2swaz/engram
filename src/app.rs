@@ -7,14 +7,14 @@ use thiserror::Error;
 use crate::assembler::ContextAssembler;
 use crate::config::Config;
 use crate::core::{
-    EmbedError, EmbeddingProvider, MemoryError, OpenAITokenCounter, ShortTermMemory, StoreError,
-    TokenCounter, VectorStore,
+    CoreMemoryStore, EmbedError, EmbeddingProvider, MemoryError, OpenAITokenCounter, ShortTermMemory,
+    StoreError, TokenCounter, VectorStore,
 };
 use crate::embedding::OpenAIEmbedder;
 use crate::metrics::AppMetrics;
 use crate::server::AppState;
 use crate::stores::{LanceDBStore, RedisCoreMemoryStore, RedisShortTermMemory};
-use crate::worker::{embedding_job_channel, spawn_embedding_workers};
+use crate::worker::{EmbeddingJob, embedding_job_channel, spawn_embedding_workers};
 
 #[derive(Debug, Error)]
 pub enum AppBuildError {
@@ -28,6 +28,44 @@ pub enum AppBuildError {
     Metrics(#[from] PrometheusError),
     #[error(transparent)]
     Other(#[from] Box<dyn StdError + Send + Sync + 'static>),
+}
+
+pub async fn build_raft_node(
+    config: &Config,
+    short_term: Arc<dyn ShortTermMemory>,
+    core_memory: Arc<dyn CoreMemoryStore>,
+    vector_store: Arc<dyn VectorStore>,
+    embedding_tx: tokio::sync::mpsc::Sender<EmbeddingJob>,
+) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
+    use crate::raft::{
+        log_store::EngRaftLogStore, network::EngRaftNetwork,
+        state_machine::EngStateMachineStore, types::TypeConfig,
+    };
+
+    let node_id = config
+        .node_id
+        .expect("NODE_ID must be set in cluster mode");
+
+    let raft_config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 250,
+            election_timeout_min: 299,
+            election_timeout_max: 500,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+
+    let raft = openraft::Raft::<TypeConfig>::new(
+        node_id,
+        raft_config,
+        EngRaftNetwork,
+        EngRaftLogStore::default(),
+        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx),
+    )
+    .await?;
+
+    Ok(Arc::new(raft))
 }
 
 pub async fn build_real_app_state(config: &Config) -> Result<Arc<AppState>, AppBuildError> {
@@ -51,7 +89,8 @@ pub async fn build_app_state_with_embedding_provider(
     let vector_store: Arc<dyn VectorStore> =
         Arc::new(LanceDBStore::connect(&config.lance_db_path, config.embedding_dimension).await?);
     let token_counter: Arc<dyn TokenCounter> = Arc::new(OpenAITokenCounter::new()?);
-    let core_memory_store = Arc::new(RedisCoreMemoryStore::connect(&config.redis_url).await?);
+    let core_memory_store: Arc<dyn CoreMemoryStore> =
+        Arc::new(RedisCoreMemoryStore::connect(&config.redis_url).await?);
     let metrics = Arc::new(AppMetrics::new()?);
     let context_assembler = Arc::new(ContextAssembler::new(
         short_term_memory.clone(),
@@ -70,6 +109,23 @@ pub async fn build_app_state_with_embedding_provider(
         config.embedding_max_concurrency,
     );
 
+    let (raft, node_id, peer_http_addrs) = if config.node_id.is_some() {
+        let raft = build_raft_node(
+            config,
+            short_term_memory.clone(),
+            core_memory_store.clone(),
+            vector_store.clone(),
+            embedding_job_sender.clone(),
+        )
+        .await
+        .map_err(|e| AppBuildError::Other(e.into()))?;
+        let node_id = config.node_id.unwrap();
+        let peer_http_addrs = config.cluster_http_peers.clone();
+        (Some(raft), node_id, peer_http_addrs)
+    } else {
+        (None, 0u64, std::collections::HashMap::new())
+    };
+
     Ok(Arc::new(AppState {
         short_term_memory,
         vector_store,
@@ -80,5 +136,8 @@ pub async fn build_app_state_with_embedding_provider(
         metrics,
         embedding_job_sender,
         short_term_count: config.short_term_count,
+        raft,
+        node_id,
+        peer_http_addrs,
     }))
 }

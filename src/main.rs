@@ -18,6 +18,26 @@ async fn main() -> std::io::Result<()> {
         .await
         .map_err(std::io::Error::other)?;
 
+    if let Some(raft) = &state.raft {
+        let raft_addr = config
+            .raft_addr
+            .as_ref()
+            .expect("RAFT_ADDR must be set in cluster mode");
+        let grpc_server = engram::raft::grpc_server::RaftGrpcServer { raft: raft.clone() };
+        let svc = engram::proto::raft::raft_service_server::RaftServiceServer::new(grpc_server);
+        let addr: std::net::SocketAddr = raft_addr
+            .parse()
+            .map_err(std::io::Error::other)?;
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(addr)
+                .await
+                .expect("gRPC Raft server failed");
+        });
+        tracing::info!(addr = %raft_addr, "gRPC Raft server listening");
+    }
+
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind_address()).await?;
 
