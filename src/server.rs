@@ -21,14 +21,67 @@ use uuid::Uuid;
 
 use crate::assembler::ContextAssembler;
 use crate::core::{
-    CoreMemoryStore, EmbeddingProvider, SearchResult, ShortTermMemory, TokenCounter,
-    VectorStore,
+    CoreMemoryStore, EmbeddingProvider, MemoryServerError, SearchResult, ShortTermMemory,
+    TokenCounter, VectorStore,
 };
 use crate::metrics::{
     AppMetrics, DEFAULT_EMBEDDING_MODEL_LABEL, DEFAULT_VECTOR_STORE_LABEL,
 };
 use crate::models::{EmbeddingStatus, Message};
+use crate::raft::types::{MemoryCommand, MessagePayload};
 use crate::worker::EmbeddingJob;
+
+impl axum::response::IntoResponse for MemoryServerError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            MemoryServerError::RedirectToLeader(location) => {
+                axum::response::Redirect::temporary(&location).into_response()
+            }
+            MemoryServerError::NoLeader => {
+                (StatusCode::SERVICE_UNAVAILABLE, "no leader elected").into_response()
+            }
+            MemoryServerError::QueueFull => {
+                (StatusCode::SERVICE_UNAVAILABLE, "embedding queue unavailable").into_response()
+            }
+            MemoryServerError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, msg).into_response()
+            }
+            MemoryServerError::Internal(msg)
+            | MemoryServerError::Embed(crate::core::EmbedError::Message(msg))
+            | MemoryServerError::Store(crate::core::StoreError::Message(msg))
+            | MemoryServerError::Memory(crate::core::MemoryError::Message(msg)) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            }
+            other => {
+                (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response()
+            }
+        }
+    }
+}
+
+/// Converts a Raft client-write error into a `MemoryServerError`.
+///
+/// When the node is a follower, the leader's HTTP address is looked up in `peer_http_addrs`
+/// and a `RedirectToLeader` error is returned so the handler can issue a 307.
+fn forward_to_redirect(
+    e: &openraft::error::RaftError<
+        u64,
+        openraft::error::ClientWriteError<u64, openraft::BasicNode>,
+    >,
+    peer_http_addrs: &std::collections::HashMap<u64, String>,
+    path: &str,
+) -> MemoryServerError {
+    if let Some(fwd) = e.forward_to_leader::<openraft::BasicNode>() {
+        if let Some(leader_id) = fwd.leader_id {
+            if let Some(http_addr) = peer_http_addrs.get(&leader_id) {
+                let location = format!("http://{}{}", http_addr, path);
+                return MemoryServerError::RedirectToLeader(location);
+            }
+        }
+        return MemoryServerError::NoLeader;
+    }
+    MemoryServerError::Internal(format!("raft error: {e}"))
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -233,10 +286,30 @@ async fn add_message(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Json(payload): Json<AddMessageRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, MemoryServerError> {
     let message_id = payload.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let role = payload.role;
     let content = payload.content;
+
+    if let Some(raft) = &state.raft {
+        // Cluster mode: replicate through Raft. The state machine applies the command to
+        // Redis and enqueues the embedding job on every node independently.
+        let cmd = MemoryCommand::AddMessage {
+            session_id: session_id.clone(),
+            message: MessagePayload {
+                id: message_id,
+                role,
+                content,
+                timestamp: Utc::now(),
+            },
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}/messages")))?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Standalone mode: write directly to Redis and enqueue embedding.
     let message = Message {
         id: Some(message_id.clone()),
         role: role.clone(),
@@ -258,7 +331,7 @@ async fn add_message(
         .map_err(|error| {
             state.metrics.increment_short_term_store_error("add_message");
             tracing::error!(error = %error, "failed to add message to short-term store");
-            internal_server_error(error)
+            MemoryServerError::from(error)
         })?;
 
     state.metrics.increment_messages_added(&role);
@@ -270,7 +343,7 @@ async fn add_message(
         .map_err(|error| {
             state.metrics.increment_short_term_store_error("trim");
             tracing::error!(error = %error, "failed to trim short-term store");
-            internal_server_error(error)
+            MemoryServerError::from(error)
         })?;
 
     let queue_result = state
@@ -280,11 +353,10 @@ async fn add_message(
         .metrics
         .set_embedding_queue_size(embedding_queue_size(&state.embedding_job_sender));
 
-    queue_result
-        .map_err(|error| {
-            tracing::error!(error = %error, message_id = %message_id, "failed to queue embedding job");
-            service_unavailable(format!("embedding queue unavailable: {error}"))
-        })?;
+    queue_result.map_err(|error| {
+        tracing::error!(error = %error, message_id = %message_id, "failed to queue embedding job");
+        MemoryServerError::QueueFull
+    })?;
 
     tracing::info!(message_id = %message_id, "queued embedding job");
 
@@ -421,7 +493,16 @@ async fn search_session(
 async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> StatusCode {
+) -> Result<StatusCode, MemoryServerError> {
+    if let Some(raft) = &state.raft {
+        let cmd = MemoryCommand::DeleteSession { session_id: session_id.clone() };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}")))?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Standalone mode: delete directly; errors are logged but not surfaced.
     if let Err(error) = state.short_term_memory.delete_session(&session_id).await {
         tracing::error!(error = %error, "failed to delete short-term session data");
     }
@@ -434,7 +515,7 @@ async fn delete_session(
 
     tracing::info!("deleted session data");
 
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
@@ -456,9 +537,20 @@ async fn put_core_memory(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     payload: Result<Json<CoreMemoryRequest>, JsonRejection>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, MemoryServerError> {
     let payload = parse_core_memory_request(payload)?;
     tracing::info!(fact_len = payload.fact.len(), "adding core memory fact");
+
+    if let Some(raft) = &state.raft {
+        let cmd = MemoryCommand::AddFact {
+            session_id: session_id.clone(),
+            fact: payload.fact,
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}/core-memory")))?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     state
         .core_memory_store
@@ -466,7 +558,7 @@ async fn put_core_memory(
         .await
         .map_err(|error| {
             tracing::error!(error = %error, "failed to add core memory fact");
-            internal_server_error(error)
+            MemoryServerError::from(error)
         })?;
 
     tracing::info!("added core memory fact");
@@ -507,13 +599,13 @@ fn parse_search_request(
 
 fn parse_core_memory_request(
     payload: Result<Json<CoreMemoryRequest>, JsonRejection>,
-) -> Result<CoreMemoryRequest, (StatusCode, String)> {
+) -> Result<CoreMemoryRequest, MemoryServerError> {
     let Json(payload) = payload.map_err(|rejection| {
-        bad_request(format!("invalid core memory request body: {rejection}"))
+        MemoryServerError::BadRequest(format!("invalid core memory request body: {rejection}"))
     })?;
 
     if payload.fact.trim().is_empty() {
-        return Err(bad_request("fact must not be empty"));
+        return Err(MemoryServerError::BadRequest("fact must not be empty".to_string()));
     }
 
     Ok(payload)
@@ -550,10 +642,6 @@ fn internal_server_error(error: impl std::fmt::Display) -> (StatusCode, String) 
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("internal server error: {error}"),
     )
-}
-
-fn service_unavailable(message: impl Into<String>) -> (StatusCode, String) {
-    (StatusCode::SERVICE_UNAVAILABLE, message.into())
 }
 
 fn embedding_queue_size(sender: &mpsc::Sender<EmbeddingJob>) -> usize {

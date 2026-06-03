@@ -61,6 +61,18 @@ pub enum MemoryServerError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    /// In cluster mode: this node is a follower; the client should retry at the given URL.
+    #[error("redirect to leader at {0}")]
+    RedirectToLeader(String),
+    /// In cluster mode: no leader is currently elected.
+    #[error("no leader elected")]
+    NoLeader,
+    #[error("internal error: {0}")]
+    Internal(String),
+    #[error("embedding queue full")]
+    QueueFull,
+    #[error("bad request: {0}")]
+    BadRequest(String),
 }
 
 #[async_trait]

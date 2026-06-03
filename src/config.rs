@@ -55,6 +55,25 @@ pub enum ConfigError {
     InvalidPositiveInteger { name: &'static str },
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            redis_url: DEFAULT_REDIS_URL.to_string(),
+            openai_api_key: String::new(),
+            openai_base_url: None,
+            lance_db_path: std::path::PathBuf::from(DEFAULT_LANCE_DB_PATH),
+            embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
+            embedding_max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
+            mpsc_channel_size: DEFAULT_MPSC_CHANNEL_SIZE,
+            short_term_count: DEFAULT_SHORT_TERM_COUNT,
+            node_id: None,
+            raft_addr: None,
+            cluster_peers: vec![],
+            cluster_http_peers: HashMap::new(),
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
