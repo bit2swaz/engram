@@ -27,6 +27,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 utoipa = { version = "5.4", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+openraft = { version = "0.9", features = ["serde"] }
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
 
 [dev-dependencies]
 axum-test = "17"
@@ -35,6 +39,9 @@ tempfile = "3"
 testcontainers = "0.23"
 tracing-test = "0.2"
 wiremock = "0.6"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [[bench]]
 name = "context_assembly_benchmark"
