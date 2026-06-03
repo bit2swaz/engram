@@ -123,6 +123,10 @@ async fn e2e_flow_uses_real_stores_and_background_worker() {
         embedding_max_concurrency: 2,
         mpsc_channel_size: 8,
         short_term_count: 20,
+        node_id: None,
+        raft_addr: None,
+        cluster_peers: vec![],
+        cluster_http_peers: std::collections::HashMap::new(),
     };
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
         OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap(),

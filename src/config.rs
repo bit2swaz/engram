@@ -1,7 +1,19 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
 use thiserror::Error;
+
+/// A single Raft peer's node ID and gRPC address.
+///
+/// NOTE: IPv6 addresses are not supported. The `host:port` format relies on
+/// splitting on `:` and would mis-parse `[::1]:9001`. This is acceptable for
+/// Stage 1 (Docker Compose assigns IPv4 names like `node-1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerConfig {
+    pub id: u64,
+    pub addr: String, // "host:grpc_port"
+}
 
 const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
 const DEFAULT_LANCE_DB_PATH: &str = "./data/lancedb";
@@ -20,6 +32,17 @@ pub struct Config {
     pub embedding_max_concurrency: usize,
     pub mpsc_channel_size: usize,
     pub short_term_count: usize,
+    /// Set via NODE_ID env var. None means standalone (non-cluster) mode.
+    pub node_id: Option<u64>,
+    /// gRPC listen address for this node's Raft server, e.g. "0.0.0.0:9001".
+    /// Set via RAFT_ADDR env var.
+    pub raft_addr: Option<String>,
+    /// Other Raft peers in the cluster, parsed from CLUSTER_PEERS.
+    /// Format: "id:host:grpc_port,id:host:grpc_port"
+    pub cluster_peers: Vec<PeerConfig>,
+    /// HTTP addresses of peer nodes keyed by node ID, parsed from CLUSTER_HTTP_PEERS.
+    /// Format: "id:host:http_port,id:host:http_port"
+    pub cluster_http_peers: HashMap<u64, String>,
 }
 
 #[derive(Debug, Error)]
@@ -58,7 +81,44 @@ impl Config {
                 "SHORT_TERM_COUNT",
                 DEFAULT_SHORT_TERM_COUNT,
             )?,
+            node_id: env::var("NODE_ID").ok().and_then(|s| s.trim().parse().ok()),
+            raft_addr: optional_env("RAFT_ADDR")?,
+            cluster_peers: Self::parse_cluster_peers(
+                &env::var("CLUSTER_PEERS").unwrap_or_default(),
+            ),
+            cluster_http_peers: Self::parse_http_peers(
+                &env::var("CLUSTER_HTTP_PEERS").unwrap_or_default(),
+            ),
         })
+    }
+
+    pub fn parse_cluster_peers(raw: &str) -> Vec<PeerConfig> {
+        raw.split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| parse_peer_entry(s).map(|(id, addr)| PeerConfig { id, addr }))
+            .collect()
+    }
+
+    pub fn parse_http_peers(raw: &str) -> HashMap<u64, String> {
+        raw.split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(parse_peer_entry)
+            .collect()
+    }
+}
+
+/// Parses a single "id:host:port" entry into (node_id, "host:port").
+/// Returns None if the entry is malformed or the id is not a valid u64.
+fn parse_peer_entry(s: &str) -> Option<(u64, String)> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() == 3 {
+        parts[0]
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|id| (id, format!("{}:{}", parts[1].trim(), parts[2].trim())))
+    } else {
+        None
     }
 }
 
@@ -261,5 +321,40 @@ mod tests {
             Some(value) => unsafe { env::set_var(name, value) },
             None => unsafe { env::remove_var(name) },
         }
+    }
+}
+
+#[cfg(test)]
+mod cluster_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cluster_peers() {
+        let peers = Config::parse_cluster_peers("1:node1:9001,2:node2:9001");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].id, 1);
+        assert_eq!(peers[0].addr, "node1:9001");
+        assert_eq!(peers[1].id, 2);
+        assert_eq!(peers[1].addr, "node2:9001");
+    }
+
+    #[test]
+    fn parses_http_peers() {
+        let m = Config::parse_http_peers("1:node1:3000,2:node2:3001");
+        assert_eq!(m.get(&1u64).unwrap(), "node1:3000");
+        assert_eq!(m.get(&2u64).unwrap(), "node2:3001");
+    }
+
+    #[test]
+    fn empty_peers_returns_empty_collections() {
+        assert!(Config::parse_cluster_peers("").is_empty());
+        assert!(Config::parse_http_peers("").is_empty());
+    }
+
+    #[test]
+    fn malformed_peer_entry_is_skipped() {
+        let peers = Config::parse_cluster_peers("bad-entry,1:node1:9001");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, 1);
     }
 }

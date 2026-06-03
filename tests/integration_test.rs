@@ -86,6 +86,10 @@ async fn setup_test_app() -> TestApp {
         embedding_max_concurrency: 1,
         mpsc_channel_size: 4,
         short_term_count: 20,
+        node_id: None,
+        raft_addr: None,
+        cluster_peers: vec![],
+        cluster_http_peers: std::collections::HashMap::new(),
     };
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
