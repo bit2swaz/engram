@@ -1,0 +1,73 @@
+syntax = "proto3";
+package engram.raft;
+
+// ---- Core types ----
+
+message LeaderId {
+  uint64 term    = 1;
+  uint64 node_id = 2;
+}
+
+message Vote {
+  LeaderId leader_id = 1;
+  bool     committed = 2;
+}
+
+message LogId {
+  uint64 term  = 1;
+  uint64 index = 2;
+}
+
+message Node {
+  uint64 node_id  = 1;
+  string rpc_addr = 2;
+}
+
+// ---- Log entries ----
+
+message Entry {
+  LogId log_id  = 1;
+  // JSON-serialized openraft EntryPayload<TypeConfig>.
+  // MemoryCommand variants (AddMessage, AddFact, DeleteSession, NoOp)
+  // plus Membership payloads are all encoded here.
+  bytes payload = 2;
+}
+
+// ---- Vote RPC ----
+
+message VoteRequest {
+  Vote  vote        = 1;
+  LogId last_log_id = 2;
+}
+
+message VoteResponse {
+  Vote  vote         = 1;
+  bool  vote_granted = 2;
+  LogId last_log_id  = 3;
+}
+
+// ---- AppendEntries RPC ----
+
+message AppendEntriesRequest {
+  Vote           vote          = 1;
+  LogId          prev_log_id   = 2;
+  repeated Entry entries       = 3;
+  LogId          leader_commit = 4;
+}
+
+message AppendEntriesResponse {
+  // Non-default value means this node rejected the request; leader should update its view.
+  Vote  rejected_by = 1;
+  bool  conflict    = 2;
+  LogId last_log_id = 3;
+}
+
+// ---- Service ----
+
+// InstallSnapshot is intentionally omitted from Stage 1.
+// Nodes that fall too far behind must be manually removed and re-added to the cluster.
+// Stage 2 will add log compaction and the InstallSnapshot RPC.
+service RaftService {
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
