@@ -9,10 +9,17 @@ use crate::metrics::{AppMetrics, DEFAULT_EMBEDDING_MODEL_LABEL};
 use crate::models::EmbeddingStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingJob {
-    session_id: String,
-    message_id: String,
-    text: String,
+pub enum EmbeddingJob {
+    Embed {
+        session_id: String,
+        message_id: String,
+        text: String,
+    },
+    // Signals the embedding worker to delete all vectors for this session from LanceDB.
+    // Sent by the state machine when a DeleteSession command is applied.
+    DeleteSession {
+        session_id: String,
+    },
 }
 
 impl EmbeddingJob {
@@ -21,7 +28,7 @@ impl EmbeddingJob {
         message_id: impl Into<String>,
         text: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::Embed {
             session_id: session_id.into(),
             message_id: message_id.into(),
             text: text.into(),
@@ -104,38 +111,61 @@ async fn worker_loop(
             break;
         };
 
-        process_embedding_job(
-            job,
-            short_term_memory.as_ref(),
-            vector_store.as_ref(),
-            embedding_provider.as_ref(),
-            metrics.as_ref(),
-        )
-        .await;
+        match job {
+            EmbeddingJob::Embed { session_id, message_id, text } => {
+                process_embedding_job(
+                    session_id,
+                    message_id,
+                    text,
+                    short_term_memory.as_ref(),
+                    vector_store.as_ref(),
+                    embedding_provider.as_ref(),
+                    metrics.as_ref(),
+                )
+                .await;
+            }
+            EmbeddingJob::DeleteSession { session_id } => {
+                if let Err(e) = vector_store.delete_session(&session_id).await {
+                    tracing::error!(error = %e, session_id = %session_id, "failed to delete session from vector store");
+                }
+            }
+        }
     }
 }
 
 async fn process_embedding_job(
-    job: EmbeddingJob,
+    session_id: String,
+    message_id: String,
+    text: String,
     short_term_memory: &dyn ShortTermMemory,
     vector_store: &dyn VectorStore,
     embedding_provider: &dyn EmbeddingProvider,
     metrics: &AppMetrics,
 ) {
-    process_embedding_job_traced(job, short_term_memory, vector_store, embedding_provider, metrics)
-        .await;
+    process_embedding_job_traced(
+        session_id,
+        message_id,
+        text,
+        short_term_memory,
+        vector_store,
+        embedding_provider,
+        metrics,
+    )
+    .await;
 }
 
 #[tracing::instrument(
     skip_all,
     fields(
-        session_id = %job.session_id,
-        message_id = %job.message_id,
-        text_len = job.text.len()
+        session_id = %session_id,
+        message_id = %message_id,
+        text_len = text.len()
     )
 )]
 async fn process_embedding_job_traced(
-    job: EmbeddingJob,
+    session_id: String,
+    message_id: String,
+    text: String,
     short_term_memory: &dyn ShortTermMemory,
     vector_store: &dyn VectorStore,
     embedding_provider: &dyn EmbeddingProvider,
@@ -144,7 +174,7 @@ async fn process_embedding_job_traced(
     tracing::info!("processing embedding job");
 
     let current_message = match short_term_memory
-        .get_message_by_id(&job.session_id, &job.message_id)
+        .get_message_by_id(&session_id, &message_id)
         .await
     {
         Ok(message) => message,
@@ -165,11 +195,7 @@ async fn process_embedding_job_traced(
     }
 
     if short_term_memory
-        .update_message_status(
-            &job.session_id,
-            &job.message_id,
-            EmbeddingStatus::Processing,
-        )
+        .update_message_status(&session_id, &message_id, EmbeddingStatus::Processing)
         .await
         .is_err()
     {
@@ -181,7 +207,7 @@ async fn process_embedding_job_traced(
     tracing::info!("marked message as processing");
 
     let embedding_timer = metrics.start_embedding_timer(DEFAULT_EMBEDDING_MODEL_LABEL);
-    let embedding = match embedding_provider.embed(std::slice::from_ref(&job.text)).await {
+    let embedding = match embedding_provider.embed(std::slice::from_ref(&text)).await {
         Ok(mut embeddings) => match embeddings.pop() {
             Some(embedding) => embedding,
             None => {
@@ -189,8 +215,8 @@ async fn process_embedding_job_traced(
                 tracing::error!("embedding provider returned no embeddings");
                 let _ = short_term_memory
                     .update_message_status(
-                        &job.session_id,
-                        &job.message_id,
+                        &session_id,
+                        &message_id,
                         EmbeddingStatus::Failed(
                             "embedding provider returned no embeddings".to_string(),
                         ),
@@ -204,8 +230,8 @@ async fn process_embedding_job_traced(
             tracing::error!(error = %error, "embedding provider failed");
             let _ = short_term_memory
                 .update_message_status(
-                    &job.session_id,
-                    &job.message_id,
+                    &session_id,
+                    &message_id,
                     EmbeddingStatus::Failed(error.to_string()),
                 )
                 .await;
@@ -215,14 +241,14 @@ async fn process_embedding_job_traced(
     drop(embedding_timer);
 
     if let Err(error) = vector_store
-        .insert(&job.session_id, &job.text, embedding, &job.message_id)
+        .insert(&session_id, &text, embedding, &message_id)
         .await
     {
         tracing::error!(error = %error, "failed to insert embedding into vector store");
         let _ = short_term_memory
             .update_message_status(
-                &job.session_id,
-                &job.message_id,
+                &session_id,
+                &message_id,
                 EmbeddingStatus::Failed(error.to_string()),
             )
             .await;
@@ -230,11 +256,7 @@ async fn process_embedding_job_traced(
     }
 
     if let Err(error) = short_term_memory
-        .update_message_status(
-            &job.session_id,
-            &job.message_id,
-            EmbeddingStatus::Completed,
-        )
+        .update_message_status(&session_id, &message_id, EmbeddingStatus::Completed)
         .await
     {
         metrics.increment_short_term_store_error("update_message_status_completed");
