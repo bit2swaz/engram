@@ -83,6 +83,22 @@ fn forward_to_redirect(
     MemoryServerError::Internal(format!("raft error: {e}"))
 }
 
+/// Submits a command to Raft and maps the result to a handler-ready `StatusCode`.
+///
+/// Called only when `state.raft.is_some()`. Centralises the `client_write` call and
+/// the follower-redirect error mapping so write handlers don't repeat the pattern.
+async fn raft_write(
+    raft: &crate::raft::types::RaftHandle,
+    cmd: MemoryCommand,
+    peer_http_addrs: &std::collections::HashMap<u64, String>,
+    path: &str,
+) -> Result<StatusCode, MemoryServerError> {
+    raft.client_write(cmd)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| forward_to_redirect(&e, peer_http_addrs, path))
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub short_term_memory: Arc<dyn ShortTermMemory>,
@@ -302,22 +318,19 @@ async fn add_message(
     let role = payload.role;
     let content = payload.content;
 
+    // Cluster mode: replicate through Raft. The state machine applies the command to
+    // Redis and enqueues the embedding job on every node independently.
     if let Some(raft) = &state.raft {
-        // Cluster mode: replicate through Raft. The state machine applies the command to
-        // Redis and enqueues the embedding job on every node independently.
-        let cmd = MemoryCommand::AddMessage {
-            session_id: session_id.clone(),
-            message: MessagePayload {
-                id: message_id,
-                role,
-                content,
-                timestamp: Utc::now(),
+        return raft_write(
+            raft,
+            MemoryCommand::AddMessage {
+                session_id: session_id.clone(),
+                message: MessagePayload { id: message_id, role, content, timestamp: Utc::now() },
             },
-        };
-        raft.client_write(cmd)
-            .await
-            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}/messages")))?;
-        return Ok(StatusCode::NO_CONTENT);
+            &state.peer_http_addrs,
+            &format!("/sessions/{session_id}/messages"),
+        )
+        .await;
     }
 
     // Standalone mode: write directly to Redis and enqueue embedding.
@@ -506,11 +519,13 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, MemoryServerError> {
     if let Some(raft) = &state.raft {
-        let cmd = MemoryCommand::DeleteSession { session_id: session_id.clone() };
-        raft.client_write(cmd)
-            .await
-            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}")))?;
-        return Ok(StatusCode::NO_CONTENT);
+        return raft_write(
+            raft,
+            MemoryCommand::DeleteSession { session_id: session_id.clone() },
+            &state.peer_http_addrs,
+            &format!("/sessions/{session_id}"),
+        )
+        .await;
     }
 
     // Standalone mode: delete directly; errors are logged but not surfaced.
@@ -553,14 +568,13 @@ async fn put_core_memory(
     tracing::info!(fact_len = payload.fact.len(), "adding core memory fact");
 
     if let Some(raft) = &state.raft {
-        let cmd = MemoryCommand::AddFact {
-            session_id: session_id.clone(),
-            fact: payload.fact,
-        };
-        raft.client_write(cmd)
-            .await
-            .map_err(|e| forward_to_redirect(&e, &state.peer_http_addrs, &format!("/sessions/{session_id}/core-memory")))?;
-        return Ok(StatusCode::NO_CONTENT);
+        return raft_write(
+            raft,
+            MemoryCommand::AddFact { session_id: session_id.clone(), fact: payload.fact },
+            &state.peer_http_addrs,
+            &format!("/sessions/{session_id}/core-memory"),
+        )
+        .await;
     }
 
     state

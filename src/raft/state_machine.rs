@@ -63,28 +63,38 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
-        // Clone Arcs before the loop so the lock is only held for bookkeeping,
-        // not across the async Redis/channel calls inside apply_cmd.
+        // Clone Arcs once so the lock is not held across async apply_cmd calls.
         let (short_term, core_memory, embedding_tx) = {
             let inner = self.inner.lock().await;
             (inner.short_term.clone(), inner.core_memory.clone(), inner.embedding_tx.clone())
         };
 
         let mut responses = Vec::new();
+        let mut last_applied = None;
+        let mut last_membership = None;
+
         for entry in entries {
-            {
-                let mut inner = self.inner.lock().await;
-                inner.last_applied = Some(entry.log_id.clone());
-                if let EntryPayload::Membership(mem) = &entry.payload {
-                    inner.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
-                }
+            last_applied = Some(entry.log_id.clone());
+            if let EntryPayload::Membership(mem) = &entry.payload {
+                last_membership = Some(StoredMembership::new(Some(entry.log_id.clone()), mem.clone()));
             }
             if let EntryPayload::Normal(cmd) = entry.payload {
                 apply_cmd(cmd, &short_term, &core_memory, &embedding_tx).await;
             }
             responses.push(CommandResponse::default());
         }
+
+        // Commit bookkeeping in a single lock rather than once per entry.
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(applied) = last_applied {
+                inner.last_applied = Some(applied);
+            }
+            if let Some(membership) = last_membership {
+                inner.last_membership = membership;
+            }
+        }
+
         Ok(responses)
     }
 
@@ -155,11 +165,7 @@ async fn apply_cmd(
                 tracing::error!(error = %e, session_id = %session_id, "failed to add message to short-term store");
             }
             // Drop the job if the channel is full. embedding is eventually consistent.
-            let _ = embedding_tx.try_send(EmbeddingJob::Embed {
-                session_id,
-                message_id: message.id,
-                text: message.content,
-            });
+            let _ = embedding_tx.try_send(EmbeddingJob::new(session_id, message.id, message.content));
         }
         MemoryCommand::AddFact { session_id, fact } => {
             if let Err(e) = core_memory.add_fact(&session_id, &fact).await {

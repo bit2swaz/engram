@@ -144,24 +144,36 @@ mod tests {
     use crate::assembler::ContextAssembler;
     use crate::config::Config;
     use crate::core::{
-        InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, OpenAITokenCounter,
-        RandomEmbeddingProvider,
+        CoreMemoryStore, EmbeddingProvider, InMemoryCoreMemoryStore, InMemoryStore,
+        InMemoryVectorStore, OpenAITokenCounter, RandomEmbeddingProvider, ShortTermMemory,
+        TokenCounter, VectorStore,
     };
     use crate::metrics::AppMetrics;
     use crate::server::{AppState, build_router};
-    use crate::worker::embedding_job_channel;
+    use crate::worker::{EmbeddingJob, embedding_job_channel};
+    use tokio::sync::mpsc;
 
-    async fn build_test_app_with_single_node_raft() -> TestServer {
+    struct TestComponents {
+        short_term: Arc<dyn ShortTermMemory>,
+        vector_store: Arc<dyn VectorStore>,
+        core_memory: Arc<dyn CoreMemoryStore>,
+        embedding_provider: Arc<dyn EmbeddingProvider>,
+        token_counter: Arc<dyn TokenCounter>,
+        metrics: Arc<AppMetrics>,
+        context_assembler: Arc<ContextAssembler>,
+        embedding_job_sender: mpsc::Sender<EmbeddingJob>,
+    }
+
+    fn build_test_components() -> TestComponents {
         let (embedding_job_sender, mut rx) = embedding_job_channel(16);
         tokio::spawn(async move {
             while rx.recv().await.is_some() {}
         });
-
-        let short_term = Arc::new(InMemoryStore::default());
-        let vector_store = Arc::new(InMemoryVectorStore::default());
-        let core_memory = Arc::new(InMemoryCoreMemoryStore::default());
-        let embedding_provider = Arc::new(RandomEmbeddingProvider);
-        let token_counter = Arc::new(OpenAITokenCounter::new().unwrap());
+        let short_term: Arc<dyn ShortTermMemory> = Arc::new(InMemoryStore::default());
+        let vector_store: Arc<dyn VectorStore> = Arc::new(InMemoryVectorStore::default());
+        let core_memory: Arc<dyn CoreMemoryStore> = Arc::new(InMemoryCoreMemoryStore::default());
+        let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(RandomEmbeddingProvider);
+        let token_counter: Arc<dyn TokenCounter> = Arc::new(OpenAITokenCounter::new().unwrap());
         let metrics = Arc::new(AppMetrics::new().unwrap());
         let context_assembler = Arc::new(ContextAssembler::new(
             short_term.clone(),
@@ -170,17 +182,27 @@ mod tests {
             token_counter.clone(),
             core_memory.clone(),
         ));
+        TestComponents {
+            short_term,
+            vector_store,
+            core_memory,
+            embedding_provider,
+            token_counter,
+            metrics,
+            context_assembler,
+            embedding_job_sender,
+        }
+    }
 
-        let config = Config {
-            node_id: Some(1),
-            ..Config::default()
-        };
+    async fn build_test_app_with_single_node_raft() -> TestServer {
+        let c = build_test_components();
+        let config = Config { node_id: Some(1), ..Config::default() };
         let raft = build_raft_node(
             &config,
-            short_term.clone(),
-            core_memory.clone(),
-            vector_store.clone(),
-            embedding_job_sender.clone(),
+            c.short_term.clone(),
+            c.core_memory.clone(),
+            c.vector_store.clone(),
+            c.embedding_job_sender.clone(),
         )
         .await
         .unwrap();
@@ -188,20 +210,18 @@ mod tests {
         let mut members = BTreeMap::new();
         members.insert(1u64, openraft::BasicNode::new("127.0.0.1:0"));
         raft.initialize(members).await.unwrap();
-
         tokio::time::sleep(Duration::from_millis(600)).await;
-
-        spawn_raft_metrics_watcher(raft.clone(), metrics.clone());
+        spawn_raft_metrics_watcher(raft.clone(), c.metrics.clone());
 
         let state = Arc::new(AppState {
-            short_term_memory: short_term,
-            vector_store,
-            embedding_provider,
-            token_counter,
-            core_memory_store: core_memory,
-            context_assembler,
-            metrics,
-            embedding_job_sender,
+            short_term_memory: c.short_term,
+            vector_store: c.vector_store,
+            embedding_provider: c.embedding_provider,
+            token_counter: c.token_counter,
+            core_memory_store: c.core_memory,
+            context_assembler: c.context_assembler,
+            metrics: c.metrics,
+            embedding_job_sender: c.embedding_job_sender,
             short_term_count: 20,
             raft: Some(raft),
             node_id: 1,
@@ -209,39 +229,20 @@ mod tests {
             raft_addr: Some("127.0.0.1:0".to_string()),
             cluster_peers: vec![],
         });
-
         TestServer::new(build_router(state)).unwrap()
     }
 
     fn build_test_app_standalone() -> TestServer {
-        let (embedding_job_sender, mut rx) = embedding_job_channel(16);
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
-
-        let short_term = Arc::new(InMemoryStore::default());
-        let vector_store = Arc::new(InMemoryVectorStore::default());
-        let core_memory = Arc::new(InMemoryCoreMemoryStore::default());
-        let embedding_provider = Arc::new(RandomEmbeddingProvider);
-        let token_counter = Arc::new(OpenAITokenCounter::new().unwrap());
-        let metrics = Arc::new(AppMetrics::new().unwrap());
-        let context_assembler = Arc::new(ContextAssembler::new(
-            short_term.clone(),
-            vector_store.clone(),
-            embedding_provider.clone(),
-            token_counter.clone(),
-            core_memory.clone(),
-        ));
-
+        let c = build_test_components();
         let state = Arc::new(AppState {
-            short_term_memory: short_term,
-            vector_store,
-            embedding_provider,
-            token_counter,
-            core_memory_store: core_memory,
-            context_assembler,
-            metrics,
-            embedding_job_sender,
+            short_term_memory: c.short_term,
+            vector_store: c.vector_store,
+            embedding_provider: c.embedding_provider,
+            token_counter: c.token_counter,
+            core_memory_store: c.core_memory,
+            context_assembler: c.context_assembler,
+            metrics: c.metrics,
+            embedding_job_sender: c.embedding_job_sender,
             short_term_count: 20,
             raft: None,
             node_id: 0,
@@ -249,7 +250,6 @@ mod tests {
             raft_addr: None,
             cluster_peers: vec![],
         });
-
         TestServer::new(build_router(state)).unwrap()
     }
 

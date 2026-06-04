@@ -46,6 +46,10 @@ impl EngRaftNetworkConnection {
     }
 }
 
+fn proto_decode_err(msg: String) -> RPCError<u64, BasicNode, RaftError<u64>> {
+    RPCError::Network(NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, msg)))
+}
+
 impl RaftNetwork<TypeConfig> for EngRaftNetworkConnection {
     async fn vote(
         &mut self,
@@ -53,14 +57,11 @@ impl RaftNetwork<TypeConfig> for EngRaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let mut client = self.client().await?;
-        let proto_req: crate::proto::raft::VoteRequest = (&rpc).into();
         let resp = client
-            .vote(proto_req)
+            .vote(crate::proto::raft::VoteRequest::from(&rpc))
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        resp.into_inner()
-            .try_into()
-            .map_err(|e: String| RPCError::Network(NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e))))
+        resp.into_inner().try_into().map_err(proto_decode_err)
     }
 
     async fn append_entries(
@@ -69,14 +70,11 @@ impl RaftNetwork<TypeConfig> for EngRaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let mut client = self.client().await?;
-        let proto_req: crate::proto::raft::AppendEntriesRequest = (&rpc).into();
         let resp = client
-            .append_entries(proto_req)
+            .append_entries(crate::proto::raft::AppendEntriesRequest::from(&rpc))
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        resp.into_inner()
-            .try_into()
-            .map_err(|e: String| RPCError::Network(NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e))))
+        resp.into_inner().try_into().map_err(proto_decode_err)
     }
 
     // Stage 1: InstallSnapshot is not implemented.

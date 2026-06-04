@@ -85,22 +85,14 @@ impl RaftLogStorage<TypeConfig> for EngRaftLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.lock().await;
-        // Remove all entries with index >= log_id.index (inclusive).
-        let keys: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for k in keys {
-            inner.log.remove(&k);
-        }
+        self.inner.lock().await.log.retain(|&k, _| k < log_id.index);
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut inner = self.inner.lock().await;
         inner.last_purged_log_id = Some(log_id.clone());
-        let keys: Vec<u64> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for k in keys {
-            inner.log.remove(&k);
-        }
+        inner.log.retain(|&k, _| k > log_id.index);
         Ok(())
     }
 
