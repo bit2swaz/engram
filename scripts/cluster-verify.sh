@@ -22,16 +22,21 @@ MEMBERS=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); 
 
 echo "[2] Write replication"
 SESSION=$(curl -sf -X POST "$N1/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
-curl -sf -X POST "$N1/sessions/$SESSION/messages" \
+WRITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$N1/sessions/$SESSION/messages" \
   -H "Content-Type: application/json" \
-  -d '{"role":"user","content":"stage1 replication test"}' > /dev/null
+  -d '{"role":"user","content":"stage1 replication test"}')
+[ "$WRITE_CODE" = "204" ] || fail "write to leader returned HTTP $WRITE_CODE (expected 204)"
 sleep 1
+# Verify replication by checking last_applied_index matches across all nodes.
+# Using /cluster avoids calling OpenAI (which /context requires).
+LEADER_APPLIED=$(curl -sf "$N1/cluster" | python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
+[ "$LEADER_APPLIED" != "null" ] || fail "could not read last_applied_index from leader"
 for port in 3000 3001 3002; do
-  CTX=$(curl -sf "http://localhost:$port/sessions/$SESSION/context" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['context'])" 2>/dev/null || echo "")
-  echo "$CTX" | grep -q "stage1 replication test" \
-    && pass "node :$port has the replicated message" \
-    || fail "node :$port missing replicated message"
+  NODE_APPLIED=$(curl -sf "http://localhost:$port/cluster" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
+  [ "$NODE_APPLIED" = "$LEADER_APPLIED" ] \
+    && pass "node :$port applied_index=$NODE_APPLIED (matches leader)" \
+    || fail "node :$port applied_index=$NODE_APPLIED (leader has $LEADER_APPLIED)"
 done
 
 echo "[3] Follower redirect"
@@ -56,14 +61,23 @@ done
 echo "[4] Failover"
 echo "  Stopping node-1..."
 docker compose -f docker-compose.cluster.yml stop node-1
-sleep 2
-NEW_STATUS=$(curl -sf "$N2/cluster" 2>/dev/null || curl -sf "$N3/cluster")
-NEW_LEADER=$(echo "$NEW_STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['leader_id'])" 2>/dev/null || echo "null")
-[ "$NEW_LEADER" != "null" ] \
+# Wait up to 5 seconds for a new leader to be elected (heartbeat=250ms, timeout max=500ms)
+NEW_LEADER="null"
+for i in $(seq 1 10); do
+  sleep 0.5
+  NEW_STATUS=$(curl -sf "$N2/cluster" 2>/dev/null || curl -sf "$N3/cluster" 2>/dev/null || echo "{}")
+  NEW_LEADER=$(echo "$NEW_STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('leader_id','null'))" 2>/dev/null || echo "null")
+  [ "$NEW_LEADER" != "null" ] && [ "$NEW_LEADER" != "None" ] && break
+done
+[ "$NEW_LEADER" != "null" ] && [ "$NEW_LEADER" != "None" ] \
   && pass "new leader elected: $NEW_LEADER" \
   || fail "no leader after killing node-1"
-SESSION2=$(curl -sf -X POST "$N2/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
-curl -sf -X POST "$N2/sessions/$SESSION2/messages" \
+# Write to whichever surviving node is now the leader
+WRITE_NODE="$N2"
+WRITE_ROLE=$(curl -sf "$N2/cluster" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+[ "$WRITE_ROLE" = "Leader" ] || WRITE_NODE="$N3"
+SESSION2=$(curl -sf -X POST "$WRITE_NODE/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+curl -sf -X POST "$WRITE_NODE/sessions/$SESSION2/messages" \
   -H "Content-Type: application/json" \
   -d '{"role":"user","content":"post-failover write"}' > /dev/null \
   && pass "write accepted after failover" \
@@ -73,7 +87,11 @@ docker compose -f docker-compose.cluster.yml start node-1
 sleep 2
 
 echo "[5] Cluster observability"
-METRICS=$(curl -sf "$N1/metrics")
+# Read metrics from whichever node is the current leader (node-1 may still be catching up)
+METRICS_NODE="$N2"
+METRICS_ROLE=$(curl -sf "$N2/cluster" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+[ "$METRICS_ROLE" = "Leader" ] || METRICS_NODE="$N3"
+METRICS=$(curl -sf "$METRICS_NODE/metrics")
 echo "$METRICS" | grep -q "engram_raft_term"         && pass "engram_raft_term present"         || fail "engram_raft_term missing"
 echo "$METRICS" | grep -q "engram_raft_commit_index" && pass "engram_raft_commit_index present" || fail "engram_raft_commit_index missing"
 echo "$METRICS" | grep -q "engram_raft_is_leader"    && pass "engram_raft_is_leader present"    || fail "engram_raft_is_leader missing"

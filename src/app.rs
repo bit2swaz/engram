@@ -136,7 +136,7 @@ pub async fn build_app_state_with_embedding_provider(
         config.embedding_max_concurrency,
     );
 
-    let (raft, node_id, peer_http_addrs, raft_addr, cluster_peers) = if config.node_id.is_some() {
+    let (raft, node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers) = if config.node_id.is_some() {
         let raft = build_raft_node(
             config,
             short_term_memory.clone(),
@@ -149,10 +149,11 @@ pub async fn build_app_state_with_embedding_provider(
         let node_id = config.node_id.unwrap();
         let peer_http_addrs = config.cluster_http_peers.clone();
         let raft_addr = config.raft_addr.clone();
+        let raft_advertise_addr = config.raft_advertise_addr.clone();
         let cluster_peers = config.cluster_peers.clone();
-        (Some(raft), node_id, peer_http_addrs, raft_addr, cluster_peers)
+        (Some(raft), node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers)
     } else {
-        (None, 0u64, std::collections::HashMap::new(), None, vec![])
+        (None, 0u64, std::collections::HashMap::new(), None, None, vec![])
     };
 
     if let Some(raft_handle) = &raft {
@@ -173,6 +174,7 @@ pub async fn build_app_state_with_embedding_provider(
         node_id,
         peer_http_addrs,
         raft_addr,
+        raft_advertise_addr,
         cluster_peers,
     }))
 }

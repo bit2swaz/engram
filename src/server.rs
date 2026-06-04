@@ -118,6 +118,9 @@ pub struct AppState {
     pub peer_http_addrs: std::collections::HashMap<u64, String>,
     /// This node's gRPC listen address, e.g. "0.0.0.0:9001". Used by init_cluster.
     pub raft_addr: Option<String>,
+    /// Routable gRPC address advertised to peers and stored in cluster membership.
+    /// E.g. "node-1:9001". Falls back to raft_addr when not set.
+    pub raft_advertise_addr: Option<String>,
     /// gRPC addresses of peer nodes, used to build the initial cluster membership.
     pub cluster_peers: Vec<crate::config::PeerConfig>,
 }
@@ -755,6 +758,7 @@ mod tests {
             node_id: 0,
             peer_http_addrs: std::collections::HashMap::new(),
             raft_addr: None,
+            raft_advertise_addr: None,
             cluster_peers: vec![],
         })
     }

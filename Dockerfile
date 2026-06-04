@@ -10,16 +10,20 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 
-RUN mkdir -p src \
+RUN mkdir -p src benches \
     && printf 'fn main() {}\n' > src/main.rs \
     && printf '\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > benches/context_assembly_benchmark.rs \
+    && printf 'fn main() {}\n' > benches/e2e_throughput.rs \
+    && printf 'fn main() {}\n' > benches/real_store_latency.rs \
     && cargo fetch --locked \
-    && rm -rf src
+    && rm -rf src benches
 
 COPY build.rs build.rs
 COPY proto proto
 COPY src src
 COPY tests tests
+COPY benches benches
 
 RUN for lance_lib in $(find /usr/local/cargo/registry/src -path '*/lance*/src/lib.rs'); do \
         if grep -q '^#!\[recursion_limit = ' "$lance_lib"; then \

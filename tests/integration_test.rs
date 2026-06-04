@@ -88,6 +88,7 @@ async fn setup_test_app() -> TestApp {
         short_term_count: 20,
         node_id: None,
         raft_addr: None,
+        raft_advertise_addr: None,
         cluster_peers: vec![],
         cluster_http_peers: std::collections::HashMap::new(),
     };

@@ -73,10 +73,15 @@ pub async fn init_cluster(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let raft = require_raft(&state)?;
     let mut members = std::collections::BTreeMap::new();
-    members.insert(
-        state.node_id,
-        BasicNode::new(state.raft_addr.as_deref().unwrap_or("127.0.0.1:9001")),
-    );
+    // Use raft_advertise_addr as the address stored in cluster membership so peers can
+    // reach this node. raft_addr (e.g. "0.0.0.0:9001") is the bind address and must NOT
+    // be used here. 0.0.0.0 routes back to the caller's own loopback in Docker networking.
+    let local_raft_addr = state
+        .raft_advertise_addr
+        .as_deref()
+        .or(state.raft_addr.as_deref())
+        .unwrap_or("127.0.0.1:9001");
+    members.insert(state.node_id, BasicNode::new(local_raft_addr));
     for peer in &state.cluster_peers {
         members.insert(peer.id, BasicNode::new(&peer.addr));
     }
@@ -227,6 +232,7 @@ mod tests {
             node_id: 1,
             peer_http_addrs: std::collections::HashMap::new(),
             raft_addr: Some("127.0.0.1:0".to_string()),
+            raft_advertise_addr: None,
             cluster_peers: vec![],
         });
         TestServer::new(build_router(state)).unwrap()
@@ -248,6 +254,7 @@ mod tests {
             node_id: 0,
             peer_http_addrs: std::collections::HashMap::new(),
             raft_addr: None,
+            raft_advertise_addr: None,
             cluster_peers: vec![],
         });
         TestServer::new(build_router(state)).unwrap()

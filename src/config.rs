@@ -37,6 +37,11 @@ pub struct Config {
     /// gRPC listen address for this node's Raft server, e.g. "0.0.0.0:9001".
     /// Set via RAFT_ADDR env var.
     pub raft_addr: Option<String>,
+    /// gRPC address advertised to peers and stored in cluster membership.
+    /// Must be a routable hostname/IP, e.g. "node-1:9001".
+    /// Defaults to raft_addr when not set which is only correct if raft_addr is already a routable address.
+    /// Set via RAFT_ADVERTISE_ADDR env var.
+    pub raft_advertise_addr: Option<String>,
     /// Other Raft peers in the cluster, parsed from CLUSTER_PEERS.
     /// Format: "id:host:grpc_port,id:host:grpc_port"
     pub cluster_peers: Vec<PeerConfig>,
@@ -68,6 +73,7 @@ impl Default for Config {
             short_term_count: DEFAULT_SHORT_TERM_COUNT,
             node_id: None,
             raft_addr: None,
+            raft_advertise_addr: None,
             cluster_peers: vec![],
             cluster_http_peers: HashMap::new(),
         }
@@ -102,6 +108,7 @@ impl Config {
             )?,
             node_id: env::var("NODE_ID").ok().and_then(|s| s.trim().parse().ok()),
             raft_addr: optional_env("RAFT_ADDR")?,
+            raft_advertise_addr: optional_env("RAFT_ADVERTISE_ADDR")?,
             cluster_peers: Self::parse_cluster_peers(
                 &env::var("CLUSTER_PEERS").unwrap_or_default(),
             ),

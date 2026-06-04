@@ -125,6 +125,7 @@ async fn e2e_flow_uses_real_stores_and_background_worker() {
         short_term_count: 20,
         node_id: None,
         raft_addr: None,
+        raft_advertise_addr: None,
         cluster_peers: vec![],
         cluster_http_peers: std::collections::HashMap::new(),
     };

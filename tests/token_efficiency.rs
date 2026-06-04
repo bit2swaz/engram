@@ -72,6 +72,7 @@ fn build_test_state() -> Arc<AppState> {
         node_id: 0,
         peer_http_addrs: std::collections::HashMap::new(),
         raft_addr: None,
+        raft_advertise_addr: None,
         cluster_peers: vec![],
     })
 }
