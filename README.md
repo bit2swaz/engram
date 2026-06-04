@@ -21,30 +21,41 @@ graph TD
     axum --> router["router"]
     router --> sessionhandler["session handler"]
     router --> memoryhandler["message handler"]
-    memoryhandler -->|add message + queue| shortterm["short-term memory trait"]
+    router --> contexthandler["context handler"]
+    router --> searchhandler["search handler"]
+    router --> corememhandler["core memory handler"]
+    router --> healthhandler["health handler"]
+
+    memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
+    corememhandler -->|write| raft
+    sessionhandler -->|delete| raft
+    raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
+    raft -->|state machine apply| shortterm["short-term memory trait"]
+    raft -->|state machine apply| coremem["core memory store trait"]
+    raft -->|embedding job| embedqueue["background worker pool<br/>bounded channel"]
+
     shortterm --> redis[("redis<br/>volatile, fast")]
     shortterm --> inmem["in-memory store<br/>test fallback"]
-    memoryhandler -->|embedding job<br/>bounded mpsc| embedqueue["background worker pool<br/>bounded channel"]
+
     embedqueue -->|generate embedding| embedprovider["embedding provider trait"]
     embedprovider -->|https| openai["openai embeddings"]
     embedqueue -->|store vector + metadata| longterm["vector store trait"]
     longterm --> lancedb[("lancedb<br/>persistent ann search")]
-    router --> contexthandler["context handler"]
+
+    coremem --> redis
+
     contexthandler --> assembler["context assembler"]
     assembler --> shortterm
     assembler --> longterm
-    assembler --> coremem["core memory store trait"]
-    coremem --> redis
+    assembler --> coremem
     assembler --> tokencounter["token counter trait"]
     tokencounter --> tiktoken["tiktoken<br/>cl100k base"]
-    router --> searchhandler["search handler"]
+    assembler --> finalcontext["assembled prompt<br/>core + long-term + short-term"]
+
     searchhandler --> embedprovider
     searchhandler --> longterm
-    router --> corememhandler["core memory handler"]
-    corememhandler --> coremem
-    router --> healthhandler["health handler"]
+
     observability["observability layer<br/>tracing + prometheus"] -->|metrics + logs| prometheus[("prometheus")]
-    assembler --> finalcontext["assembled prompt<br/>core + long-term + short-term"]
 ```
 
 ## quickstart (local)
@@ -122,55 +133,94 @@ docker compose up -d
 
 ## API overview
 
-| method | path                                 | description                       |
-|--------|--------------------------------------|-----------------------------------|
-| GET    | /health                              | health check                      |
-| GET    | /metrics                             | Prometheus metrics                |
-| GET    | /api-docs/openapi.json               | OpenAPI specification             |
-| GET    | /swagger-ui/                         | Swagger UI                        |
-| POST   | /sessions                            | create session                    |
-| POST   | /sessions/{session_id}/messages      | add message                       |
-| GET    | /sessions/{session_id}/context       | get assembled context             |
-| POST   | /sessions/{session_id}/search        | semantic search                   |
-| PUT    | /sessions/{session_id}/core-memory   | add core memory fact              |
-| DELETE | /sessions/{session_id}               | delete session                    |
+| method | path                                   | description                          |
+|--------|----------------------------------------|--------------------------------------|
+| GET    | /health                                | health check                         |
+| GET    | /metrics                               | Prometheus metrics                   |
+| GET    | /api-docs/openapi.json                 | OpenAPI specification                |
+| GET    | /swagger-ui/                           | Swagger UI                           |
+| POST   | /sessions                              | create session                       |
+| POST   | /sessions/{session_id}/messages        | add message                          |
+| GET    | /sessions/{session_id}/context         | get assembled context                |
+| POST   | /sessions/{session_id}/search          | semantic search                      |
+| PUT    | /sessions/{session_id}/core-memory     | add core memory fact                 |
+| DELETE | /sessions/{session_id}                 | delete session                       |
+| GET    | /cluster                               | cluster status (cluster mode only)   |
+| POST   | /cluster/init                          | initialize cluster                   |
+| POST   | /cluster/add-learner                   | add a learner node                   |
+| POST   | /cluster/change-membership            | promote learners to full members     |
 
 see [API.md](docs/API.md) for full details.
 
 ## configuration
 
-the application currently reads these environment variables directly:
+the application reads configuration from environment variables:
 
-| variable                | description                              | default                  |
-|-------------------------|------------------------------------------|--------------------------|
-| REDIS_URL               | Redis connection url                     | redis://localhost:6379   |
-| OPENAI_API_KEY          | OpenAI API key                           | required                 |
-| OPENAI_BASE_URL         | Optional OpenAI-compatible API base URL  | unset                    |
-| LANCE_DB_PATH           | LanceDB data path                        | ./data/lancedb           |
-| LANCEDB_PATH            | legacy alias for `LANCE_DB_PATH`         | unset                    |
-| EMBEDDING_DIMENSION     | embedding vector width                   | 1536                     |
-| SHORT_TERM_COUNT        | number of recent messages to keep        | 20                       |
-| EMBEDDING_MAX_CONCURRENCY | number of embedding workers            | 10                       |
-| MPSC_CHANNEL_SIZE       | embedding job queue size                 | 1000                     |
-| RUST_LOG                | tracing log filter                       | info                     |
-| LOG_FORMAT              | logging format (`pretty` or `json`)      | pretty                   |
+| variable                   | description                                             | default                  |
+|----------------------------|---------------------------------------------------------|--------------------------|
+| REDIS_URL                  | Redis connection url                                    | redis://localhost:6379   |
+| OPENAI_API_KEY             | OpenAI API key                                          | required                 |
+| OPENAI_BASE_URL            | optional OpenAI-compatible API base URL                 | unset                    |
+| LANCE_DB_PATH              | LanceDB data path                                       | ./data/lancedb           |
+| LANCEDB_PATH               | legacy alias for `LANCE_DB_PATH`                        | unset                    |
+| EMBEDDING_DIMENSION        | embedding vector width                                  | 1536                     |
+| SHORT_TERM_COUNT           | number of recent messages to keep                       | 20                       |
+| EMBEDDING_MAX_CONCURRENCY  | number of embedding workers                             | 10                       |
+| MPSC_CHANNEL_SIZE          | embedding job queue size                                | 1000                     |
+| RUST_LOG                   | tracing log filter                                      | info                     |
+| LOG_FORMAT                 | logging format (`pretty` or `json`)                     | pretty                   |
 
-values like `similarity_threshold` and `max_tokens` are currently controlled per request through query parameters on the context endpoint rather than startup environment variables.
+**cluster mode** (requires all of the below):
+
+| variable              | description                                                              | example                           |
+|-----------------------|--------------------------------------------------------------------------|-----------------------------------|
+| NODE_ID               | unique integer node identifier                                           | `1`                               |
+| RAFT_ADDR             | bind address for the gRPC Raft server                                    | `0.0.0.0:9001`                    |
+| RAFT_ADVERTISE_ADDR   | address other nodes route to (required when binding 0.0.0.0)            | `node-1:9001`                     |
+| CLUSTER_PEERS         | comma-separated gRPC peers as `id:host:port`                             | `2:node-2:9001,3:node-3:9001`     |
+| CLUSTER_HTTP_PEERS    | comma-separated HTTP peers as `id:host:port` (for leader redirect URLs)  | `2:node-2:3000,3:node-3:3000`     |
+
+values like `similarity_threshold` and `max_tokens` are controlled per request through query parameters on the context endpoint.
 
 ## features
 
-- short-term memory (recent messages)
-- long-term semantic search (vector store)
+- short-term memory (recent messages via Redis)
+- long-term semantic search (LanceDB vector store)
 - core memory (pinned facts)
 - context assembly with token budgeting
 - pair-preserving trim for dialogue
-- background embedding worker
-- idempotency for message ingestion
+- background embedding worker (bounded channel, configurable concurrency)
+- idempotent message ingestion
 - Prometheus metrics endpoint
+- Raft consensus for fault-tolerant distributed writes (OpenRaft 0.9)
+- gRPC inter-node transport for Raft (Vote + AppendEntries via tonic 0.12)
+- follower-to-leader HTTP redirect (307) in cluster mode
+- per-node LanceDB with eventual consistency via deterministic embeddings
+- cluster management REST API
 - OpenAPI docs and Swagger UI
-- generated benchmark report
 - LongMemEval and BEAM benchmark harnesses
-- optional authentication (future)
+
+## quickstart (3-node cluster)
+
+the cluster compose file runs three engram nodes, each with its own Redis instance, connected over a shared Docker network.
+
+```sh
+# copy and fill in your OpenAI key
+cp .env.example .env
+
+# build and start the cluster
+docker compose -f docker-compose.cluster.yml up -d --build
+
+# wait for all nodes to be healthy, then initialize the cluster
+./scripts/cluster-init.sh
+
+# verify all Stage 1 acceptance criteria
+./scripts/cluster-verify.sh
+```
+
+the verify script checks: leader election, write replication to all nodes, 307 redirect from followers, failover, and Prometheus metric presence. it exits 0 only if all five pass.
+
+see `docker-compose.cluster.yml` and the scripts in `scripts/` for details.
 
 ## quality benchmarking
 

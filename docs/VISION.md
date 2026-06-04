@@ -201,11 +201,13 @@ Each system contributes to and benefits from a shared cognitive substrate.
 
 # Development Trajectory
 
-## Stage 1: Distributed Memory
+## Stage 1: Distributed Memory ✅
 
 Goal:
 
 Create a fault-tolerant distributed memory system.
+
+Status: complete. Three nodes, Raft consensus (OpenRaft 0.9), gRPC transport (tonic 0.12), leader election, log replication, follower redirect, failover, and cluster observability. All five acceptance criteria pass.
 
 Learn:
 

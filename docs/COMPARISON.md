@@ -6,6 +6,7 @@
 |------------------------------- |:--------------:|:-------------:|:-------------:|:----------------:|:---------------------:|
 | **Language**                   | Rust           | Python        | Python        | Python           | Go                    |
 | **Deployment model**           | Single binary, Docker | Docker, cloud, pip | pip, Docker, cloud | pip, cloud           | Docker, cloud         |
+| **Fault-tolerant cluster**     | Yes (3-node Raft, OpenRaft 0.9) | No | No | No | ? |
 | **Embedding flexibility**      | Yes (trait, BYO) | Yes (BYO, OpenAI, Cohere, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) |
 | **Context visibility**         | Full (exact prompt shown) | Partial (debug endpoint) | Partial | Partial (depends on chain) | ? |
 | **Token budget control**       | Yes (per request) | Yes (configurable) | Yes (configurable) | Partial (depends on chain) | ? |
@@ -72,4 +73,4 @@ On the currently published numbers, engram's in-memory context assembly path is 
 
 ---
 
-*This matrix is maintained as of May 2026. Please open an issue or PR if you spot inaccuracies or want to add a new tool!*
+*This matrix is maintained as of June 2026. Please open an issue or PR if you spot inaccuracies or want to add a new tool!*

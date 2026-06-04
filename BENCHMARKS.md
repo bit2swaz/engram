@@ -2,6 +2,8 @@
 
 **Run date:** 2026-05-01
 
+> **Note:** All numbers below are for standalone mode (single node, no Raft). Cluster mode adds Raft replication latency on writes (one gRPC round trip to quorum before the response returns). Cluster-mode benchmark numbers will be published after Stage 2 hardens the log store.
+
 ## Context Assembly Latency
 
 | Scenario | Messages | Max Tokens | Median Latency | Unit |

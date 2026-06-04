@@ -72,35 +72,73 @@ The project serves two purposes:
 
 **Note:** Phase 2 is only partially implemented. OpenAPI spec generation is complete; other items are planned for future phases.
 
+### Stage 1: Distributed Memory ✅ **(Completed)**
+- 3-node Raft consensus cluster using OpenRaft 0.9
+- gRPC inter-node transport for Vote and AppendEntries RPCs (tonic 0.12 / prost 0.13)
+- Per-node Redis and LanceDB (no shared storage between nodes)
+- Follower-to-leader HTTP 307 redirect in cluster mode
+- Per-node LanceDB with eventual consistency via deterministic OpenAI embeddings
+- Cluster management REST API: `/cluster`, `/cluster/init`, `/cluster/add-learner`, `/cluster/change-membership`
+- 4 new Raft Prometheus metrics: `engram_raft_term`, `engram_raft_commit_index`, `engram_raft_is_leader`, `engram_raft_leader_changes_total`
+- 3-node Docker Compose cluster with `cluster-init.sh` and `cluster-verify.sh` acceptance scripts
+- `RAFT_ADVERTISE_ADDR` env var to fix failover panic when binding `0.0.0.0`
+
+**Completion criteria (all five pass in Docker Compose):**
+1. Three nodes start, elect a leader, and report healthy status via `/cluster`
+2. A write to the leader replicates to all followers (verified by reading from each node)
+3. A write to a follower returns HTTP 307 with a `Location` header pointing to the leader
+4. Kill the leader; a new leader is elected within 1 second; writes resume
+5. Prometheus metrics update correctly across all nodes
+
 ---
 
 ## 3. System Architecture (High-Level)
 
 ```mermaid
 graph TD
-    Client[AI Agent / User] -->|REST JSON| Axiom[Axum HTTP Server]
-    Axiom -->|Request| Router
-    Router --> SessionHandler[Session Handler]
-    Router --> MemoryHandler[Memory Handler]
-    MemoryHandler -->|Add message| ShortTerm[Short-Term Memory Trait]
-    MemoryHandler -->|Embedding job| EmbedQueue[Background Embedding Task]
-    EmbedQueue -->|Generate| EmbedProvider[Embedding Provider Trait]
-    EmbedProvider -->|Call API| OpenAI[OpenAI Embeddings]
-    EmbedQueue -->|Store vector| LongTerm[Vector Store Trait]
-    LongTerm --> LanceDB[(LanceDB)]
-    ShortTerm --> Redis[(Redis)]
-    ShortTerm --> InMem[In-Memory Fallback for tests]
-    ContextAssembler[Context Assembler Module] --> ShortTerm
-    ContextAssembler --> LongTerm
-    ContextAssembler --> CoreMem[Core Memory Store]
-    ContextAssembler --> TokenCounter[Token Counter Trait]
-    ContextAssembler --> AssembledContext[Final Prompt String]
-    Router --> ContextHandler[Context Handler] --> ContextAssembler
-    Router --> SearchHandler[Search Handler] --> LongTerm
-    Router --> CoreMemHandler[Core Memory Handler] --> CoreMem
-    Router --> HealthHandler[Health Handler]
-    Observability[Observability Layer] -->|Metrics & Traces| Prometheus[(Prometheus)]
+    client["ai agent / user"] -->|rest json| axum["axum http server"]
+    axum --> router["router"]
+
+    router --> sessionhandler["session handler"]
+    router --> memoryhandler["message handler"]
+    router --> contexthandler["context handler"]
+    router --> searchhandler["search handler"]
+    router --> corememhandler["core memory handler"]
+    router --> healthhandler["health handler"]
+
+    memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
+    corememhandler -->|write| raft
+    sessionhandler -->|delete| raft
+    raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
+    raft -->|state machine apply| shortterm["short-term memory trait"]
+    raft -->|state machine apply| coremem["core memory store trait"]
+    raft -->|embedding job| embedqueue["background worker pool\nbounded channel"]
+
+    shortterm --> redis[("redis")]
+    shortterm --> inmem["in-memory store\ntest fallback"]
+
+    embedqueue -->|generate| embedprovider["embedding provider trait"]
+    embedprovider -->|https| openai["openai embeddings"]
+    embedqueue -->|store vector| longterm["vector store trait"]
+    longterm --> lancedb[("lancedb")]
+
+    coremem --> redis
+
+    contexthandler --> assembler["context assembler"]
+    assembler --> shortterm
+    assembler --> longterm
+    assembler --> coremem
+    assembler --> tokencounter["token counter trait"]
+    tokencounter --> tiktoken["tiktoken cl100k base"]
+    assembler --> finalcontext["assembled prompt\ncore + long-term + short-term"]
+
+    searchhandler --> embedprovider
+    searchhandler --> longterm
+
+    observability["observability layer\ntracing + prometheus"] -->|metrics + logs| prometheus[("prometheus")]
 ```
+
+> In standalone mode (NODE_ID not set), write handlers reach the stores directly without the Raft layer.
 
 ### 3.1 Component Description
 - **Axum HTTP Server**: asynchronous request handling, shared state via `Arc`.
@@ -267,6 +305,20 @@ Response: `204 No Content`
 #### Swagger UI
 `GET /swagger-ui/` → Swagger UI _(200 OK)_
 
+#### Cluster Status _(cluster mode only)_
+`GET /cluster` → `{ node_id, role, leader_id, term, last_applied_index, members }` _(200 OK)_
+
+#### Initialize Cluster _(cluster mode only)_
+`POST /cluster/init` → `200 OK`
+
+#### Add Learner Node _(cluster mode only)_
+`POST /cluster/add-learner` → `200 OK`  
+Request body: `{ "node_id": 4, "addr": "node-4:9001" }`
+
+#### Change Membership _(cluster mode only)_
+`POST /cluster/change-membership` → `200 OK`  
+Request body: `{ "members": [1, 2, 3] }`
+
 _All endpoints verified against API.md and server.rs._
 ---
 ## Phase Completion Summary
@@ -274,9 +326,9 @@ _All endpoints verified against API.md and server.rs._
 - **Phase 0:** ✅ Completed
 - **Phase 1:** ✅ Completed
 - **Phase 2:** ⚠️ Incomplete, only OpenAPI spec generation is implemented; other items are future work.
+- **Stage 1 (Distributed Memory):** ✅ Completed — 3-node Raft cluster, gRPC transport, follower redirect, failover, cluster observability. All five acceptance criteria pass.
 
 ---
-**This document is now fully synchronized with the codebase and all supporting documentation as of this commit.**
 If any future changes are made to traits, endpoints, or architecture, update this SSOT accordingly.
 ---
 
@@ -443,6 +495,13 @@ services:
 - `RUST_LOG` (tracing filter)
 - `LOG_FORMAT` (default `pretty`, supports `json`)
 
+**Cluster mode** (all required when `NODE_ID` is set):
+- `NODE_ID` — unique integer node identifier (e.g. `1`)
+- `RAFT_ADDR` — bind address for the gRPC Raft server (e.g. `0.0.0.0:9001`)
+- `RAFT_ADVERTISE_ADDR` — address other nodes route to; required when binding `0.0.0.0` (e.g. `node-1:9001`)
+- `CLUSTER_PEERS` — comma-separated gRPC peers as `id:host:port` (e.g. `2:node-2:9001,3:node-3:9001`)
+- `CLUSTER_HTTP_PEERS` — comma-separated HTTP peers as `id:host:port`, used for leader redirect URLs
+
 Per-request context settings such as `max_tokens`, `similarity_threshold`, and `long_term_top_k` are currently controlled through query parameters on the context endpoint rather than startup environment variables.
 
 ---
@@ -456,6 +515,12 @@ Per-request context settings such as `max_tokens`, `similarity_threshold`, and `
 - `memory_vector_search_duration_seconds` (histogram)
 - `memory_short_term_store_errors_total`
 - `memory_embedding_queue_size` (gauge)
+
+**Raft cluster metrics** (only emitted in cluster mode):
+- `engram_raft_term` — current Raft term (gauge)
+- `engram_raft_commit_index` — index of last applied log entry (gauge)
+- `engram_raft_is_leader` — 1 if this node is the current leader, 0 otherwise (gauge)
+- `engram_raft_leader_changes_total` — number of leader changes observed by this node (counter)
 
 ### 10.2 Tracing
 - Each request gets a span.
@@ -483,8 +548,8 @@ In-memory store implementations of all traits allow testing without external dep
 - **Semantic chunking**: Split long assistant responses into paragraphs before embedding, so retrieval can pinpoint specific facts.
 - **Consolidation (summarization)**: Periodically summarize older messages and embed the summary.
 - **Evaluation harness**: Scripts that run known queries and measure recall/precision of long‑term memory retrieval.
-- **gRPC endpoint**: For streaming and efficiency.
-- **Multi‑tenancy**: Add `tenant_id` to partition data.
+- **gRPC endpoint for clients**: gRPC is now used for Raft inter-node transport (Stage 1). A public-facing gRPC API for agent clients is a future item.
+- **Multi‑tenancy**: Add `tenant_id` to partition data (Stage 2 auth layer).
 - **Backup to S3**: Nightly export of LanceDB data.
 - **Federated search**: Support multiple vector stores at once.
 - **Local embedding models**: Integrate `fastembed` or `ort` for offline use.

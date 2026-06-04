@@ -29,29 +29,43 @@ Welcome! Contributions of all kinds are encouraged and appreciated.
    cargo build
    ```
 
-## Running Tests
+## Running tests
 
-- **Unit tests:**
-  ```sh
-  cargo test
-  ```
-- **Integration tests (requires Docker):**
-  ```sh
-   cargo test --test integration_test
-   cargo test --test e2e_test
-  ```
-- **All tests:**
-  ```sh
-   cargo test --all
-  ```
-- **Benchmarks:**
-   ```sh
-   cargo bench --bench context_assembly_benchmark
-   cargo bench --bench e2e_throughput
-   cargo bench --bench real_store_latency
-   ./scripts/generate_benchmark_report.sh
-   ```
-- Note: Integration tests use `testcontainers` to spin up real dependencies such as Redis. The end-to-end and benchmark flows also create temporary LanceDB state during execution.
+Unit tests:
+```sh
+cargo test
+```
+
+Integration tests (requires Docker for Redis and LanceDB):
+```sh
+cargo test --test integration_test
+cargo test --test e2e_test
+```
+
+All tests:
+```sh
+cargo test --all
+```
+
+Benchmarks:
+```sh
+cargo bench --bench context_assembly_benchmark
+cargo bench --bench e2e_throughput
+cargo bench --bench real_store_latency
+./scripts/generate_benchmark_report.sh
+```
+
+Integration tests use `testcontainers` to spin up real Redis containers. End-to-end and benchmark flows create temporary LanceDB state during execution.
+
+Cluster acceptance tests (requires Docker):
+```sh
+docker compose -f docker-compose.cluster.yml up -d --build
+./scripts/cluster-init.sh
+./scripts/cluster-verify.sh
+docker compose -f docker-compose.cluster.yml down
+```
+
+The verify script checks leader election, write replication, follower redirect, failover, and Prometheus metrics. It exits 0 only when all five pass.
 
 ## TDD Workflow
 
