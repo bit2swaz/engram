@@ -48,6 +48,8 @@ pub struct Config {
     /// HTTP addresses of peer nodes keyed by node ID, parsed from CLUSTER_HTTP_PEERS.
     /// Format: "id:host:http_port,id:host:http_port"
     pub cluster_http_peers: HashMap<u64, String>,
+    pub knowledge_max_workers: usize,
+    pub knowledge_channel_size: usize,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +78,8 @@ impl Default for Config {
             raft_advertise_addr: None,
             cluster_peers: vec![],
             cluster_http_peers: HashMap::new(),
+            knowledge_max_workers: 4,
+            knowledge_channel_size: 500,
         }
     }
 }
@@ -115,6 +119,8 @@ impl Config {
             cluster_http_peers: Self::parse_http_peers(
                 &env::var("CLUSTER_HTTP_PEERS").unwrap_or_default(),
             ),
+            knowledge_max_workers:  positive_usize_env("KNOWLEDGE_MAX_WORKERS",  4)?,
+            knowledge_channel_size: positive_usize_env("KNOWLEDGE_CHANNEL_SIZE", 500)?,
         })
     }
 
