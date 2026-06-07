@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use crate::knowledge::handler::{export_knowledge, find_path, get_knowledge, get_related};
 use axum_prometheus::{PrometheusMetricLayer, PrometheusMetricLayerBuilder};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use chrono::Utc;
@@ -219,6 +220,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/context", get(get_context))
         .route("/sessions/{session_id}/search", post(search_session))
         .route("/sessions/{session_id}/core-memory", put(put_core_memory))
+        .route("/sessions/{session_id}/knowledge", get(get_knowledge))
+        .route("/sessions/{session_id}/knowledge/entities/{entity_name}", get(get_related))
+        .route("/sessions/{session_id}/knowledge/path", get(find_path))
+        .route("/sessions/{session_id}/knowledge/export", get(export_knowledge))
         .route("/cluster", get(crate::cluster::get_cluster_status))
         .route("/cluster/init", post(crate::cluster::init_cluster))
         .route("/cluster/add-learner", post(crate::cluster::add_learner))
