@@ -90,6 +90,64 @@ struct RawRelationship {
     relationship_type: String,
 }
 
+pub struct MockKnowledgeExtractor;
+
+fn push_unique_entity(entities: &mut Vec<Entity>, name: &str, entity_type: &str) {
+    if !entities.iter().any(|e| e.name == name) {
+        entities.push(Entity {
+            name: name.to_string(),
+            entity_type: entity_type.to_string(),
+            attributes: HashMap::new(),
+        });
+    }
+}
+
+#[async_trait]
+impl KnowledgeExtractor for MockKnowledgeExtractor {
+    async fn extract(&self, text: &str) -> Result<ExtractionResult, ExtractError> {
+        let mut entities: Vec<Entity> = Vec::new();
+        let mut relationships: Vec<Relationship> = Vec::new();
+
+        for sentence in text.split(['.', '!', '?']) {
+            let s = sentence.trim();
+            if s.is_empty() {
+                continue;
+            }
+            if let Some((left, right)) = s.split_once(" works at ") {
+                let (p, o) = (left.trim().to_string(), right.trim().to_string());
+                if !p.is_empty() && !o.is_empty() {
+                    push_unique_entity(&mut entities, &p, "Person");
+                    push_unique_entity(&mut entities, &o, "Organization");
+                    relationships.push(Relationship { from: p, to: o, relationship_type: "works_at".into() });
+                }
+            } else if let Some((left, right)) = s.split_once(" knows ") {
+                let (p1, p2) = (left.trim().to_string(), right.trim().to_string());
+                if !p1.is_empty() && !p2.is_empty() {
+                    push_unique_entity(&mut entities, &p1, "Person");
+                    push_unique_entity(&mut entities, &p2, "Person");
+                    relationships.push(Relationship { from: p1, to: p2, relationship_type: "knows".into() });
+                }
+            } else if let Some((left, right)) = s.split_once(" likes ") {
+                let (p, o) = (left.trim().to_string(), right.trim().to_string());
+                if !p.is_empty() && !o.is_empty() {
+                    push_unique_entity(&mut entities, &p, "Person");
+                    push_unique_entity(&mut entities, &o, "Thing");
+                    relationships.push(Relationship { from: p, to: o, relationship_type: "likes".into() });
+                }
+            } else if let Some((left, right)) = s.split_once(" lives in ") {
+                let (p, o) = (left.trim().to_string(), right.trim().to_string());
+                if !p.is_empty() && !o.is_empty() {
+                    push_unique_entity(&mut entities, &p, "Person");
+                    push_unique_entity(&mut entities, &o, "Place");
+                    relationships.push(Relationship { from: p, to: o, relationship_type: "lives_in".into() });
+                }
+            }
+        }
+
+        Ok(ExtractionResult { entities, relationships })
+    }
+}
+
 pub struct OpenAIKnowledgeExtractor {
     client: Client,
     api_key: String,
@@ -188,6 +246,79 @@ impl KnowledgeExtractor for OpenAIKnowledgeExtractor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_extracts_works_at_relationship() {
+        let result = MockKnowledgeExtractor.extract("Alice works at OpenAI").await.unwrap();
+        assert_eq!(result.entities.len(), 2);
+        let alice = result.entities.iter().find(|e| e.name == "Alice").unwrap();
+        assert_eq!(alice.entity_type, "Person");
+        let openai = result.entities.iter().find(|e| e.name == "OpenAI").unwrap();
+        assert_eq!(openai.entity_type, "Organization");
+        assert_eq!(result.relationships.len(), 1);
+        assert_eq!(result.relationships[0].from, "Alice");
+        assert_eq!(result.relationships[0].to, "OpenAI");
+        assert_eq!(result.relationships[0].relationship_type, "works_at");
+    }
+
+    #[tokio::test]
+    async fn mock_extracts_knows_relationship() {
+        let result = MockKnowledgeExtractor.extract("Bob knows Alice").await.unwrap();
+        assert_eq!(result.entities.len(), 2);
+        let bob = result.entities.iter().find(|e| e.name == "Bob").unwrap();
+        assert_eq!(bob.entity_type, "Person");
+        let alice = result.entities.iter().find(|e| e.name == "Alice").unwrap();
+        assert_eq!(alice.entity_type, "Person");
+        assert_eq!(result.relationships[0].relationship_type, "knows");
+    }
+
+    #[tokio::test]
+    async fn mock_extracts_likes_relationship() {
+        let result = MockKnowledgeExtractor.extract("Alice likes Rust").await.unwrap();
+        assert_eq!(result.relationships[0].relationship_type, "likes");
+        let thing = result.entities.iter().find(|e| e.name == "Rust").unwrap();
+        assert_eq!(thing.entity_type, "Thing");
+    }
+
+    #[tokio::test]
+    async fn mock_extracts_lives_in_relationship() {
+        let result = MockKnowledgeExtractor.extract("Bob lives in Paris").await.unwrap();
+        assert_eq!(result.relationships[0].relationship_type, "lives_in");
+        let place = result.entities.iter().find(|e| e.name == "Paris").unwrap();
+        assert_eq!(place.entity_type, "Place");
+    }
+
+    #[tokio::test]
+    async fn mock_returns_empty_for_unknown_input() {
+        let result = MockKnowledgeExtractor.extract("The sky is blue").await.unwrap();
+        assert!(result.entities.is_empty());
+        assert!(result.relationships.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_handles_multi_sentence_input() {
+        let result = MockKnowledgeExtractor
+            .extract("Alice works at OpenAI. Bob knows Alice.")
+            .await
+            .unwrap();
+        assert_eq!(result.entities.len(), 3); // Alice, OpenAI, Bob
+        assert_eq!(result.relationships.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_deduplicates_entities_across_sentences() {
+        let result = MockKnowledgeExtractor
+            .extract("Alice works at OpenAI. Bob knows Alice.")
+            .await
+            .unwrap();
+        let alice_count = result.entities.iter().filter(|e| e.name == "Alice").count();
+        assert_eq!(alice_count, 1);
     }
 }
 

@@ -11,7 +11,8 @@ use crate::core::{
     StoreError, TokenCounter, VectorStore,
 };
 use crate::embedding::OpenAIEmbedder;
-use crate::knowledge::extractor::OpenAIKnowledgeExtractor;
+use crate::config::KnowledgeExtractorType;
+use crate::knowledge::extractor::{MockKnowledgeExtractor, OpenAIKnowledgeExtractor};
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::knowledge::worker::{knowledge_job_channel, spawn_knowledge_workers};
 use crate::metrics::AppMetrics;
@@ -101,12 +102,16 @@ pub fn spawn_raft_metrics_watcher(
 }
 
 pub async fn build_real_app_state(config: &Config) -> Result<Arc<AppState>, AppBuildError> {
-    let embedding_provider: Arc<dyn EmbeddingProvider> = match &config.openai_base_url {
-        Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
-            config.openai_api_key.clone(),
-            base_url.clone(),
-        )?),
-        None => Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?),
+    let embedding_provider: Arc<dyn EmbeddingProvider> = if config.openai_api_key.is_empty() {
+        Arc::new(crate::core::RandomEmbeddingProvider)
+    } else {
+        match &config.openai_base_url {
+            Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
+                config.openai_api_key.clone(),
+                base_url.clone(),
+            )?),
+            None => Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?),
+        }
     };
 
     build_app_state_with_embedding_provider(config, embedding_provider).await
@@ -145,12 +150,15 @@ pub async fn build_app_state_with_embedding_provider(
     let (knowledge_job_sender, knowledge_receiver) = knowledge_job_channel(config.knowledge_channel_size);
 
     let knowledge_extractor: Arc<dyn crate::knowledge::extractor::KnowledgeExtractor> =
-        match &config.openai_base_url {
-            Some(base_url) => Arc::new(OpenAIKnowledgeExtractor::new_with_base_url(
-                config.openai_api_key.clone(),
-                base_url.clone(),
-            )),
-            None => Arc::new(OpenAIKnowledgeExtractor::new(config.openai_api_key.clone())),
+        match config.knowledge_extractor {
+            KnowledgeExtractorType::Mock => Arc::new(MockKnowledgeExtractor),
+            KnowledgeExtractorType::OpenAI => match &config.openai_base_url {
+                Some(base_url) => Arc::new(OpenAIKnowledgeExtractor::new_with_base_url(
+                    config.openai_api_key.clone(),
+                    base_url.clone(),
+                )),
+                None => Arc::new(OpenAIKnowledgeExtractor::new(config.openai_api_key.clone())),
+            },
         };
 
     let (raft, node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers) = if config.node_id.is_some() {

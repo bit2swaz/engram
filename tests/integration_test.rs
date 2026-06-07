@@ -93,6 +93,7 @@ async fn setup_test_app() -> TestApp {
         cluster_http_peers: std::collections::HashMap::new(),
         knowledge_max_workers: 4,
         knowledge_channel_size: 500,
+        knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
     };
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(

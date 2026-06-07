@@ -130,6 +130,7 @@ async fn e2e_flow_uses_real_stores_and_background_worker() {
         cluster_http_peers: std::collections::HashMap::new(),
         knowledge_max_workers: 4,
         knowledge_channel_size: 500,
+        knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
     };
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
         OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap(),
