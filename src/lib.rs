@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod config;
 pub mod core;
 pub mod embedding;
+pub mod knowledge;
 pub mod logging;
 pub mod metrics;
 pub mod models;
