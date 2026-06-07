@@ -36,6 +36,8 @@ pub async fn build_raft_node(
     core_memory: Arc<dyn CoreMemoryStore>,
     vector_store: Arc<dyn VectorStore>,
     embedding_tx: tokio::sync::mpsc::Sender<EmbeddingJob>,
+    knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+    knowledge_tx: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
 ) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
     use crate::raft::{
         log_store::EngRaftLogStore, network::EngRaftNetwork,
@@ -61,7 +63,7 @@ pub async fn build_raft_node(
         raft_config,
         EngRaftNetwork,
         EngRaftLogStore::default(),
-        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx),
+        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx),
     )
     .await?;
 
@@ -137,12 +139,17 @@ pub async fn build_app_state_with_embedding_provider(
     );
 
     let (raft, node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers) = if config.node_id.is_some() {
+        // Stub knowledge graph + channel until Task 8 wires up the full knowledge worker.
+        let knowledge_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::graph::KnowledgeGraph::new()));
+        let (knowledge_tx, _knowledge_rx) = tokio::sync::mpsc::channel(500);
         let raft = build_raft_node(
             config,
             short_term_memory.clone(),
             core_memory_store.clone(),
             vector_store.clone(),
             embedding_job_sender.clone(),
+            knowledge_graph,
+            knowledge_tx,
         )
         .await
         .map_err(|e| AppBuildError::Other(e.into()))?;

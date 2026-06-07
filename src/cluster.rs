@@ -202,12 +202,16 @@ mod tests {
     async fn build_test_app_with_single_node_raft() -> TestServer {
         let c = build_test_components();
         let config = Config { node_id: Some(1), ..Config::default() };
+        let knowledge_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::graph::KnowledgeGraph::new()));
+        let (knowledge_tx, _knowledge_rx) = tokio::sync::mpsc::channel(500);
         let raft = build_raft_node(
             &config,
             c.short_term.clone(),
             c.core_memory.clone(),
             c.vector_store.clone(),
             c.embedding_job_sender.clone(),
+            knowledge_graph,
+            knowledge_tx,
         )
         .await
         .unwrap();

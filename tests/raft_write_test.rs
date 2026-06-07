@@ -18,12 +18,16 @@ async fn single_node_raft_write_commits_to_state_machine() {
         node_id: Some(1),
         ..Config::default()
     };
+    let knowledge_graph = Arc::new(tokio::sync::RwLock::new(engram::knowledge::graph::KnowledgeGraph::new()));
+    let (knowledge_tx, _knowledge_rx) = mpsc::channel(500);
     let raft = build_raft_node(
         &config,
         short_term.clone(),
         Arc::new(InMemoryCoreMemoryStore::default()),
         Arc::new(InMemoryVectorStore::default()),
         tx,
+        knowledge_graph,
+        knowledge_tx,
     )
     .await
     .unwrap();
