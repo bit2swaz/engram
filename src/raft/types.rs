@@ -34,6 +34,15 @@ pub enum MemoryCommand {
     /// Deletes all Redis short-term + core memory for a session on all nodes.
     /// Also signals each node's embedding worker to delete from local LanceDB.
     DeleteSession { session_id: String },
+    /// Extract and store knowledge from a message. Idempotent by (session_id, message_id).
+    /// Only submitted by the leader's knowledge worker. All nodes receive this command
+    /// via Raft replication and apply it to their local KnowledgeGraph.
+    AddKnowledge {
+        session_id: String,
+        message_id: String,
+        entities: Vec<crate::knowledge::types::Entity>,
+        relationships: Vec<crate::knowledge::types::Relationship>,
+    },
     /// No-op placeholder. Applied by the state machine without side effects.
     /// Reserved for future cluster operations (e.g., leadership probes).
     NoOp,
@@ -59,6 +68,34 @@ pub type RaftHandle = openraft::Raft<TypeConfig>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_knowledge_command_round_trips() {
+        use crate::knowledge::types::{Entity, Relationship};
+        use std::collections::HashMap;
+
+        let cmd = MemoryCommand::AddKnowledge {
+            session_id: "s1".to_string(),
+            message_id: "m1".to_string(),
+            entities: vec![
+                Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+            ],
+            relationships: vec![
+                Relationship { from: "Alice".into(), to: "OpenAI".into(), relationship_type: "works_at".into() },
+            ],
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: MemoryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            MemoryCommand::AddKnowledge { session_id, message_id, entities, relationships } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(message_id, "m1");
+                assert_eq!(entities[0].name, "Alice");
+                assert_eq!(relationships[0].relationship_type, "works_at");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn memory_command_serializes_round_trip() {

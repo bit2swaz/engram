@@ -182,6 +182,9 @@ async fn apply_cmd(
             // Signal embedding worker to delete from local LanceDB.
             let _ = embedding_tx.try_send(EmbeddingJob::DeleteSession { session_id });
         }
+        MemoryCommand::AddKnowledge { .. } => {
+            // Handled in Task 7 when knowledge_graph is wired into the state machine.
+        }
         MemoryCommand::NoOp => {}
     }
 }
