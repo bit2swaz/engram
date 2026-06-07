@@ -1236,6 +1236,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn knowledge_routes_are_registered() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        server.get("/sessions/test-session/knowledge").await.assert_status_ok();
+        server
+            .get("/sessions/test-session/knowledge/export?format=json")
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn knowledge_metrics_appear_in_prometheus_scrape() {
+        let state = build_test_state();
+        // Observe each metric so the HistogramVec emits output (Vec types only appear
+        // in Prometheus text format once at least one label set has been recorded).
+        let timer = state.metrics.start_knowledge_extraction_timer();
+        drop(timer);
+        state.metrics.increment_knowledge_entities(1);
+        state.metrics.increment_knowledge_relationships(1);
+        state.metrics.set_knowledge_queue_size(0);
+        let server = TestServer::new(build_router(state)).unwrap();
+        let body = server.get("/metrics").await.text();
+        assert!(
+            body.contains("engram_knowledge_extraction_duration_seconds"),
+            "missing knowledge_extraction_duration_seconds"
+        );
+        assert!(
+            body.contains("engram_knowledge_entities_extracted_total"),
+            "missing knowledge_entities_extracted_total"
+        );
+        assert!(
+            body.contains("engram_knowledge_relationships_extracted_total"),
+            "missing knowledge_relationships_extracted_total"
+        );
+        assert!(
+            body.contains("engram_knowledge_queue_size"),
+            "missing knowledge_queue_size"
+        );
+    }
+
+    #[tokio::test]
     #[traced_test]
     async fn handler_spans_are_logged_without_content_fields() {
         let server = TestServer::new(build_router(build_test_state())).unwrap();
