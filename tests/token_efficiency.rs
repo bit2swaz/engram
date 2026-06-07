@@ -58,6 +58,8 @@ fn build_test_state() -> Arc<AppState> {
         core_memory_store.clone(),
     ));
 
+    let (knowledge_job_sender, mut krx) = tokio::sync::mpsc::channel::<engram::knowledge::types::KnowledgeJob>(16);
+    tokio::spawn(async move { while krx.recv().await.is_some() {} });
     Arc::new(AppState {
         short_term_memory,
         vector_store,
@@ -74,6 +76,10 @@ fn build_test_state() -> Arc<AppState> {
         raft_addr: None,
         raft_advertise_addr: None,
         cluster_peers: vec![],
+        knowledge_graph: Arc::new(tokio::sync::RwLock::new(
+            engram::knowledge::graph::KnowledgeGraph::new(),
+        )),
+        knowledge_job_sender,
     })
 }
 

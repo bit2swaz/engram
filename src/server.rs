@@ -123,6 +123,10 @@ pub struct AppState {
     pub raft_advertise_addr: Option<String>,
     /// gRPC addresses of peer nodes, used to build the initial cluster membership.
     pub cluster_peers: Vec<crate::config::PeerConfig>,
+    /// Per-session in-memory knowledge graph, shared with the Raft state machine.
+    pub knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+    /// Channel for sending knowledge extraction jobs to the worker pool.
+    pub knowledge_job_sender: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
 }
 
 
@@ -760,6 +764,14 @@ mod tests {
             raft_addr: None,
             raft_advertise_addr: None,
             cluster_peers: vec![],
+            knowledge_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::graph::KnowledgeGraph::new(),
+            )),
+            knowledge_job_sender: {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         })
     }
 
@@ -768,6 +780,14 @@ mod tests {
         let s = build_test_state();
         let _ = s.raft.is_none();
         let _ = s.node_id;
+    }
+
+    #[tokio::test]
+    async fn appstate_has_knowledge_fields() {
+        // If AppState is missing the new fields, this won't compile.
+        let state = build_test_state();
+        let _ = state.knowledge_graph.read().await;
+        let _ = state.knowledge_job_sender.capacity();
     }
 
     #[tokio::test]
