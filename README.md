@@ -25,6 +25,7 @@ graph TD
     router --> searchhandler["search handler"]
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
+    router --> knowledgehandler["knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
@@ -32,7 +33,8 @@ graph TD
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
-    raft -->|embedding job| embedqueue["background worker pool<br/>bounded channel"]
+    raft -->|embedding job| embedqueue["embedding worker pool<br/>bounded channel"]
+    raft -->|knowledge job| knowledgequeue["knowledge worker pool<br/>bounded channel"]
 
     shortterm --> redis[("redis<br/>volatile, fast")]
     shortterm --> inmem["in-memory store<br/>test fallback"]
@@ -43,6 +45,11 @@ graph TD
     longterm --> lancedb[("lancedb<br/>persistent ann search")]
 
     coremem --> redis
+
+    knowledgequeue -->|leader-only extraction| extractor["knowledge extractor trait"]
+    extractor -->|openai gpt-4o-mini / mock| extraction["entities + relationships"]
+    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    knowledgehandler --> knowledgegraph
 
     contexthandler --> assembler["context assembler"]
     assembler --> shortterm
@@ -133,22 +140,26 @@ docker compose up -d
 
 ## API overview
 
-| method | path                                   | description                          |
-|--------|----------------------------------------|--------------------------------------|
-| GET    | /health                                | health check                         |
-| GET    | /metrics                               | Prometheus metrics                   |
-| GET    | /api-docs/openapi.json                 | OpenAPI specification                |
-| GET    | /swagger-ui/                           | Swagger UI                           |
-| POST   | /sessions                              | create session                       |
-| POST   | /sessions/{session_id}/messages        | add message                          |
-| GET    | /sessions/{session_id}/context         | get assembled context                |
-| POST   | /sessions/{session_id}/search          | semantic search                      |
-| PUT    | /sessions/{session_id}/core-memory     | add core memory fact                 |
-| DELETE | /sessions/{session_id}                 | delete session                       |
-| GET    | /cluster                               | cluster status (cluster mode only)   |
-| POST   | /cluster/init                          | initialize cluster                   |
-| POST   | /cluster/add-learner                   | add a learner node                   |
-| POST   | /cluster/change-membership            | promote learners to full members     |
+| method | path                                                        | description                                  |
+|--------|-------------------------------------------------------------|----------------------------------------------|
+| GET    | /health                                                     | health check                                 |
+| GET    | /metrics                                                    | Prometheus metrics                           |
+| GET    | /api-docs/openapi.json                                      | OpenAPI specification                        |
+| GET    | /swagger-ui/                                                | Swagger UI                                   |
+| POST   | /sessions                                                   | create session                               |
+| POST   | /sessions/{session_id}/messages                             | add message                                  |
+| GET    | /sessions/{session_id}/context                              | get assembled context                        |
+| POST   | /sessions/{session_id}/search                               | semantic search                              |
+| PUT    | /sessions/{session_id}/core-memory                          | add core memory fact                         |
+| DELETE | /sessions/{session_id}                                      | delete session                               |
+| GET    | /sessions/{session_id}/knowledge                            | get knowledge graph (entities + edges)       |
+| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}     | get related entities for a given entity      |
+| GET    | /sessions/{session_id}/knowledge/path?from=X&to=Y           | find shortest path between two entities      |
+| GET    | /sessions/{session_id}/knowledge/export?format=json\|dot    | export knowledge graph (JSON or Graphviz)    |
+| GET    | /cluster                                                    | cluster status (cluster mode only)           |
+| POST   | /cluster/init                                               | initialize cluster                           |
+| POST   | /cluster/add-learner                                        | add a learner node                           |
+| POST   | /cluster/change-membership                                  | promote learners to full members             |
 
 see [API.md](docs/API.md) for full details.
 
@@ -159,7 +170,7 @@ the application reads configuration from environment variables:
 | variable                   | description                                             | default                  |
 |----------------------------|---------------------------------------------------------|--------------------------|
 | REDIS_URL                  | Redis connection url                                    | redis://localhost:6379   |
-| OPENAI_API_KEY             | OpenAI API key                                          | required                 |
+| OPENAI_API_KEY             | OpenAI API key                                          | required (unless mock)   |
 | OPENAI_BASE_URL            | optional OpenAI-compatible API base URL                 | unset                    |
 | LANCE_DB_PATH              | LanceDB data path                                       | ./data/lancedb           |
 | LANCEDB_PATH               | legacy alias for `LANCE_DB_PATH`                        | unset                    |
@@ -167,6 +178,9 @@ the application reads configuration from environment variables:
 | SHORT_TERM_COUNT           | number of recent messages to keep                       | 20                       |
 | EMBEDDING_MAX_CONCURRENCY  | number of embedding workers                             | 10                       |
 | MPSC_CHANNEL_SIZE          | embedding job queue size                                | 1000                     |
+| KNOWLEDGE_EXTRACTOR        | knowledge extractor backend (`openai` or `mock`)        | openai                   |
+| KNOWLEDGE_MAX_WORKERS      | number of knowledge extraction workers                  | 4                        |
+| KNOWLEDGE_CHANNEL_SIZE     | knowledge job queue size                                | 500                      |
 | RUST_LOG                   | tracing log filter                                      | info                     |
 | LOG_FORMAT                 | logging format (`pretty` or `json`)                     | pretty                   |
 
@@ -191,7 +205,11 @@ values like `similarity_threshold` and `max_tokens` are controlled per request t
 - pair-preserving trim for dialogue
 - background embedding worker (bounded channel, configurable concurrency)
 - idempotent message ingestion
-- Prometheus metrics endpoint
+- knowledge graph extraction (entities + relationships via OpenAI GPT-4o-mini or mock)
+- per-session in-memory knowledge graph with BFS path-finding
+- leader-only extraction with Raft-replicated `AddKnowledge` command (all nodes stay consistent)
+- knowledge graph export (JSON and Graphviz DOT)
+- Prometheus metrics endpoint (includes knowledge extraction metrics)
 - Raft consensus for fault-tolerant distributed writes (OpenRaft 0.9)
 - gRPC inter-node transport for Raft (Vote + AppendEntries via tonic 0.12)
 - follower-to-leader HTTP redirect (307) in cluster mode
@@ -218,7 +236,7 @@ docker compose -f docker-compose.cluster.yml up -d --build
 ./scripts/cluster-verify.sh
 ```
 
-the verify script checks: leader election, write replication to all nodes, 307 redirect from followers, failover, and Prometheus metric presence. it exits 0 only if all five pass.
+the verify script checks: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication across nodes, and delete-session cleanup. it exits 0 only if all criteria pass.
 
 see `docker-compose.cluster.yml` and the scripts in `scripts/` for details.
 

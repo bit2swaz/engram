@@ -23,6 +23,7 @@ graph TD
     router --> searchhandler["search handler"]
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
+    router --> knowledgehandler["knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
@@ -30,7 +31,8 @@ graph TD
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -->|state machine apply| shortterm["short-term memory (trait)"]
     raft -->|state machine apply| coremem["core memory store (trait)"]
-    raft -->|embedding job| embedqueue["background worker pool (bounded channel)"]
+    raft -->|embedding job| embedqueue["embedding worker pool (bounded channel)"]
+    raft -->|knowledge job| knowledgequeue["knowledge worker pool (bounded channel)"]
 
     shortterm --> redis[("redis")]
     shortterm --> inmem["in-memory store (test fallback)"]
@@ -42,6 +44,11 @@ graph TD
     longterm --> lancedb[("lancedb")]
 
     coremem --> redis
+
+    knowledgequeue -->|leader-only| extractor["knowledge extractor (trait)"]
+    extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
+    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    knowledgehandler --> knowledgegraph
 
     searchhandler --> embedprovider
     searchhandler --> longterm
@@ -73,6 +80,8 @@ All major components are behind trait abstractions, which lets implementations b
 
 `CoreMemoryStore` manages pinned session facts. Redis and in-memory implementations are both available.
 
+`KnowledgeExtractor` extracts named entities and typed relationships from text. The `OpenAIKnowledgeExtractor` calls GPT-4o-mini with a structured JSON prompt and exponential backoff on 429s. `MockKnowledgeExtractor` uses pattern matching against a fixed set of relationship phrases; this is the default in Docker Compose and CI to avoid OpenAI quota consumption.
+
 ## Design decisions
 
 | decision | alternatives | final choice & rationale |
@@ -83,6 +92,10 @@ All major components are behind trait abstractions, which lets implementations b
 | pair-preserving trim in context assembler | naive trim, no trim | preserves dialogue integrity, prevents LLM hallucinations |
 | idempotent embedding jobs | no idempotency | safe retries, prevents duplicate vectors on crash or retry |
 | observability from day 1 | add later | tracing and Prometheus from the start for reliability and debugging |
+| leader-only extraction for knowledge | all nodes extract | one LLM call per message vs N (one per node); non-determinism in extraction would cause divergent graphs across nodes |
+| AddKnowledge routed through Raft | apply directly on leader | ensures all nodes receive the same extraction result; graph stays consistent without extra sync |
+| in-memory knowledge graph per session | persistent DB | Stage 2 scope; fast, simple, no operational overhead; per-session isolation maps naturally to HashMap |
+| MockKnowledgeExtractor as default in Docker Compose | always OpenAI | decouples cluster verification from OpenAI API quota; pattern-matching mock is deterministic and offline-capable |
 
 ## Context assembly algorithm
 
@@ -106,6 +119,50 @@ Docker compose sets up:
 - Grafana: dashboard (optional)
 
 the application reads configuration from environment variables such as `REDIS_URL`, `OPENAI_API_KEY`, `LANCE_DB_PATH`, `SHORT_TERM_COUNT`, `EMBEDDING_MAX_CONCURRENCY`, `MPSC_CHANNEL_SIZE`, `RUST_LOG`, and `LOG_FORMAT`.
+
+## Stage 2: Knowledge Formation
+
+Stage 2 adds a knowledge graph pipeline that runs alongside the existing memory system. Every message that flows through the Raft state machine also produces a `KnowledgeJob` which is forwarded to a dedicated worker pool.
+
+### Knowledge pipeline
+
+1. State machine receives `AddMessage` command → enqueues `KnowledgeJob { session_id, message_id, text }` on a bounded channel (capacity 500 by default).
+2. Knowledge workers dequeue jobs. In cluster mode only the **current leader** calls the extractor; followers skip because they will receive the result via Raft replication. This prevents duplicate LLM calls and avoids non-deterministic divergence between nodes.
+3. The extractor calls GPT-4o-mini (or the mock) with a structured JSON prompt requesting named entities and typed relationships.
+4. The result is submitted as a `MemoryCommand::AddKnowledge` through `raft.client_write()`. OpenRaft replicates this to all nodes.
+5. Each node's state machine applies `AddKnowledge` to its local `KnowledgeGraph` (idempotent by `(session_id, message_id)` key).
+
+In standalone mode (no `NODE_ID`) the worker applies the extraction result directly to the local graph without going through Raft.
+
+### KnowledgeGraph internals
+
+`KnowledgeGraph` is a per-session directed graph backed by [`petgraph`](https://docs.rs/petgraph). Each session has its own `DiGraph<EntityNode, RelEdge>` plus a `HashMap<String, NodeIndex>` for O(1) name lookups. Deduplication is tracked in a `HashSet<String>` keyed on `"session_id\x00message_id"`.
+
+Key operations:
+- `apply_extraction` — upserts entities and adds edges; returns `false` if the `(session_id, message_id)` pair was already processed.
+- `get_related` — returns all neighbours (incoming and outgoing) for a named entity.
+- `find_path` — BFS shortest path following outgoing edges only; returns a `Vec<PathEdge>` or `None`.
+- `delete_session` — removes the session graph and all its dedup keys.
+
+### Knowledge REST endpoints
+
+| method | path | description |
+|--------|------|-------------|
+| GET | `/sessions/{id}/knowledge` | full graph: all entities and edges for the session |
+| GET | `/sessions/{id}/knowledge/entities/{entity}` | all entities connected to the named entity (incoming + outgoing) |
+| GET | `/sessions/{id}/knowledge/path?from=X&to=Y` | BFS shortest path between two named entities |
+| GET | `/sessions/{id}/knowledge/export?format=json\|dot` | export the graph as JSON or Graphviz DOT |
+
+### Knowledge metrics
+
+Four new Prometheus metrics are exposed alongside the existing Raft and embedding metrics:
+
+| metric | type | description |
+|--------|------|-------------|
+| `engram_knowledge_extraction_duration_seconds` | histogram | wall-clock time per extraction call (label: `extractor`) |
+| `engram_knowledge_entities_extracted_total` | counter | cumulative entities extracted |
+| `engram_knowledge_relationships_extracted_total` | counter | cumulative relationships extracted |
+| `engram_knowledge_queue_size` | gauge | pending jobs in the knowledge channel |
 
 ## Distributed cluster mode (Stage 1)
 
@@ -166,10 +223,12 @@ OpenAI text embeddings are deterministic for the same input. All nodes converge 
 | component | description |
 |-----------|-------------|
 | `EngRaftLogStore` | in-memory BTreeMap log store, implements `RaftLogStorage + RaftLogReader` |
-| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis; snapshot methods return `Unsupported` |
+| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis and the `KnowledgeGraph`; snapshot methods return `Unsupported` |
 | `EngRaftNetwork` | factory that creates per-peer gRPC connections using tonic channels |
 | `EngRaftNetworkConnection` | sends Vote and AppendEntries RPCs; `send_install_snapshot` returns `Unreachable` |
 | `RaftGrpcServer` | tonic service implementation that forwards incoming Raft RPCs to the local `RaftHandle` |
+
+`MemoryCommand` has four variants: `AddMessage`, `AddFact`, `DeleteSession`, and `AddKnowledge`. `AddMessage` now also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
 
 The log store is in-memory. It does not survive restarts. Stage 2 will replace it with a persistent store (sled or RocksDB).
 
@@ -186,11 +245,23 @@ Four additional metrics are exported when a node is in cluster mode:
 
 A background task watches the OpenRaft metrics channel and updates these gauges on every change.
 
-### Stage 2 deferred items
+### Knowledge metrics (all modes)
 
-The following are explicitly out of scope for Stage 1:
+Four additional metrics cover the knowledge extraction pipeline and are emitted in both standalone and cluster mode:
 
-- **Log snapshotting.** Nodes that fall too far behind the log cannot rejoin automatically. They must be manually removed and re-added. Stage 2 will implement `RaftSnapshotBuilder` and `install_snapshot`.
-- **Persistent log store.** Restarting a node clears its Raft log. Stage 2 replaces the in-memory BTreeMap with sled or RocksDB.
-- **LanceDB replication.** Stage 2 will route vector storage through Raft so only the leader calls OpenAI, then replicates the embedding payload to followers, eliminating redundant API calls at scale.
+| metric | type | description |
+|--------|------|-------------|
+| `engram_knowledge_extraction_duration_seconds` | histogram | wall-clock time per extraction call |
+| `engram_knowledge_entities_extracted_total` | counter | cumulative entities extracted |
+| `engram_knowledge_relationships_extracted_total` | counter | cumulative relationships extracted |
+| `engram_knowledge_queue_size` | gauge | pending jobs in the knowledge worker channel |
+
+### Stage 3+ deferred items
+
+The following remain out of scope after Stage 2:
+
+- **Log snapshotting.** Nodes that fall too far behind the log cannot rejoin automatically. They must be manually removed and re-added. A future stage will implement `RaftSnapshotBuilder` and `install_snapshot`.
+- **Persistent log store.** Restarting a node clears its Raft log. A future stage replaces the in-memory BTreeMap with sled or RocksDB.
+- **LanceDB replication.** Each node still calls the embedding API independently. A future stage will route vector storage through Raft so only the leader calls OpenAI, then replicates the embedding payload to followers, eliminating redundant API calls at scale.
+- **Persistent knowledge graph.** The knowledge graph is in-memory and lost on restart. A future stage will persist it via Raft snapshots or a dedicated embedded store.
 - **Multi-tenant auth.** Cluster-aware authentication routing.

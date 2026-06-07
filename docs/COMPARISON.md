@@ -11,9 +11,9 @@
 | **Context visibility**         | Full (exact prompt shown) | Partial (debug endpoint) | Partial | Partial (depends on chain) | ? |
 | **Token budget control**       | Yes (per request) | Yes (configurable) | Yes (configurable) | Partial (depends on chain) | ? |
 | **Trimming strategy**          | Pair-preserving | Naive/Configurable | Naive | Naive | ? |
-| **Memory types**               | Short-term, long-term, core | Short, long, episodic | Short, long | Short, long, summary | Short, long, KG? |
-| **Retrieval method**           | Semantic search | Semantic, BM25, hybrid | Semantic, hybrid | Semantic, retriever chain | Semantic, hybrid, KG |
-| **Knowledge graph**            | No              | No            | No            | No               | Yes                   |
+| **Memory types**               | Short-term, long-term, core, knowledge graph | Short, long, episodic | Short, long | Short, long, summary | Short, long, KG? |
+| **Retrieval method**           | Semantic search, knowledge graph traversal | Semantic, BM25, hybrid | Semantic, hybrid | Semantic, retriever chain | Semantic, hybrid, KG |
+| **Knowledge graph**            | Yes (Stage 2, in-memory, petgraph) | No | No | No | Yes |
 | **Idempotency / deduplication**| Yes (message_id, status) | Yes (message_id) | Partial | No | ? |
 | **Observability**              | Prometheus, tracing | Prometheus, logs | Logs | No (manual) | Prometheus, logs |
 | **Background processing**      | Async worker, bounded queue | Async worker | Async | No | Async worker |
@@ -60,10 +60,11 @@ On the currently published numbers, engram's in-memory context assembly path is 
 - **Token budget control:** Every context assembly is budgeted per request, not just globally.
 
 **Where engram falls short today:**
-- **No knowledge graph:** Unlike Hindsight, engram does not build or use a KG for retrieval.
+- **Knowledge graph is in-memory only:** The Stage 2 knowledge graph is per-session and does not survive restarts. Persistent graph storage is planned for a future stage.
+- **No KG-augmented retrieval yet:** The knowledge graph is queryable via REST but is not yet integrated into the context assembly pipeline to augment semantic search results.
 - **No managed cloud offering:** Self-hosted only; no SaaS or managed tier.
 - **Smaller community:** Newer and less widely adopted than Zep or LangChain.
-- **Retrieval is single-strategy:** Only semantic search is implemented; no hybrid or BM25 yet.
+- **Retrieval is single-strategy:** Only semantic search drives context assembly; no hybrid or BM25 yet.
 - **Preliminary retrieval evaluation is strong, but still tiny:** A 5-question `single-session-user` LongMemEval retrieval slice achieved perfect recall@5/10 plus MRR=0.767 and NDCG@10=0.826 with the local embedder, but the full 500-question run is still pending.
 
 **Who engram is best for:**

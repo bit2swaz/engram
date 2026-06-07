@@ -2,22 +2,26 @@
 
 This document describes every REST endpoint exposed by engram. All endpoints are served at `http://localhost:3000` by default.
 
-| method | path                                   | description                                 |
-|--------|----------------------------------------|---------------------------------------------|
-| POST   | /sessions                             | create a new session                        |
-| POST   | /sessions/{session_id}/messages        | add a message                               |
-| GET    | /sessions/{session_id}/context         | get assembled context                       |
-| POST   | /sessions/{session_id}/search          | semantic search over long-term memory       |
-| DELETE | /sessions/{session_id}                 | delete a session and all its memories       |
-| PUT    | /sessions/{session_id}/core-memory     | add a core memory fact                      |
-| GET    | /health                               | health check                                |
-| GET    | /metrics                              | Prometheus metrics                          |
-| GET    | /api-docs/openapi.json                 | OpenAPI specification                       |
-| GET    | /swagger-ui/                          | Swagger UI                                  |
-| GET    | /cluster                              | cluster status (cluster mode only)          |
-| POST   | /cluster/init                         | initialize the Raft cluster                 |
-| POST   | /cluster/add-learner                  | add a learner node                          |
-| POST   | /cluster/change-membership            | promote learners to full voting members     |
+| method | path                                                        | description                                           |
+|--------|-------------------------------------------------------------|-------------------------------------------------------|
+| POST   | /sessions                                                   | create a new session                                  |
+| POST   | /sessions/{session_id}/messages                             | add a message                                         |
+| GET    | /sessions/{session_id}/context                              | get assembled context                                 |
+| POST   | /sessions/{session_id}/search                               | semantic search over long-term memory                 |
+| DELETE | /sessions/{session_id}                                      | delete a session and all its memories                 |
+| PUT    | /sessions/{session_id}/core-memory                          | add a core memory fact                                |
+| GET    | /sessions/{session_id}/knowledge                            | get full knowledge graph for the session              |
+| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}     | get all entities connected to a named entity          |
+| GET    | /sessions/{session_id}/knowledge/path                       | find shortest path between two entities               |
+| GET    | /sessions/{session_id}/knowledge/export                     | export knowledge graph (JSON or Graphviz DOT)         |
+| GET    | /health                                                     | health check                                          |
+| GET    | /metrics                                                    | Prometheus metrics                                    |
+| GET    | /api-docs/openapi.json                                      | OpenAPI specification                                 |
+| GET    | /swagger-ui/                                                | Swagger UI                                            |
+| GET    | /cluster                                                    | cluster status (cluster mode only)                    |
+| POST   | /cluster/init                                               | initialize the Raft cluster                           |
+| POST   | /cluster/add-learner                                        | add a learner node                                    |
+| POST   | /cluster/change-membership                                  | promote learners to full voting members               |
 
 ---
 
@@ -371,4 +375,144 @@ changes the cluster membership to the given set of node IDs. nodes in the new se
 curl -X POST http://localhost:3000/cluster/change-membership \
   -H 'content-type: application/json' \
   -d '{"members":[1,2,3,4]}'
+```
+
+---
+
+## knowledge graph endpoints
+
+these endpoints query the per-session knowledge graph built by the background knowledge extraction pipeline. entities and relationships are extracted automatically from every message added to the session. results reflect all committed messages; there may be a brief delay while extraction jobs are processed.
+
+---
+
+## GET /sessions/{session_id}/knowledge
+
+returns all entities and edges in the session's knowledge graph.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "session_id": "abc123",
+  "entities": [
+    { "name": "Alice", "entity_type": "Person", "attributes": {} },
+    { "name": "OpenAI", "entity_type": "Organization", "attributes": {} }
+  ],
+  "edges": [
+    { "from": "Alice", "to": "OpenAI", "relationship_type": "works_at" }
+  ]
+}
+```
+
+**example:**
+```sh
+curl http://localhost:3000/sessions/{session_id}/knowledge
+```
+
+---
+
+## GET /sessions/{session_id}/knowledge/entities/{entity_name}
+
+returns all entities directly connected to the named entity, including both incoming and outgoing relationships.
+
+**path parameters:**
+- `session_id` (string): session identifier
+- `entity_name` (string): the entity to look up
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "entity_name": "Alice",
+  "related": [
+    {
+      "name": "OpenAI",
+      "entity_type": "Organization",
+      "relationship_type": "works_at",
+      "direction": "Outgoing"
+    }
+  ]
+}
+```
+
+**error responses:**
+- 404: entity not found in this session's graph
+
+**example:**
+```sh
+curl http://localhost:3000/sessions/{session_id}/knowledge/entities/Alice
+```
+
+---
+
+## GET /sessions/{session_id}/knowledge/path
+
+finds the shortest directed path (BFS over outgoing edges) between two named entities.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**query parameters:**
+- `from` (string, required): source entity name
+- `to` (string, required): target entity name
+
+**success response:**
+- status: 200
+- body (`path` is `null` if no path exists):
+```json
+{
+  "from": "Alice",
+  "to": "Bob",
+  "path": [
+    { "from": "Alice", "relationship_type": "works_at", "to": "OpenAI" },
+    { "from": "OpenAI", "relationship_type": "employs", "to": "Bob" }
+  ]
+}
+```
+
+**example:**
+```sh
+curl "http://localhost:3000/sessions/{session_id}/knowledge/path?from=Alice&to=Bob"
+```
+
+---
+
+## GET /sessions/{session_id}/knowledge/export
+
+exports the knowledge graph in JSON or Graphviz DOT format.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**query parameters:**
+- `format` (string, optional, default: `json`): `json` or `dot`
+
+**success response:**
+- status: 200
+- content-type: `application/json` for JSON, `text/vnd.graphviz` for DOT
+- body (JSON):
+```json
+{
+  "session_id": "abc123",
+  "entities": [...],
+  "edges": [...]
+}
+```
+- body (DOT):
+```
+digraph knowledge {
+  "Alice" [label="Alice\n(Person)"];
+  "OpenAI" [label="OpenAI\n(Organization)"];
+  "Alice" -> "OpenAI" [label="works_at"];
+}
+```
+
+**example:**
+```sh
+curl "http://localhost:3000/sessions/{session_id}/knowledge/export?format=dot"
 ```

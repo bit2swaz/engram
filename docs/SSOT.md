@@ -90,6 +90,27 @@ The project serves two purposes:
 4. Kill the leader; a new leader is elected within 1 second; writes resume
 5. Prometheus metrics update correctly across all nodes
 
+### Stage 2: Knowledge Formation ✅ **(Completed)**
+- Entity and relationship extraction from message text using OpenAI GPT-4o-mini or configurable mock
+- `KnowledgeExtractor` trait with `OpenAIKnowledgeExtractor` (exp backoff on 429) and `MockKnowledgeExtractor` (offline pattern-matching)
+- Per-session in-memory knowledge graph backed by petgraph `DiGraph`
+- Idempotent extraction deduplication by `(session_id, message_id)` key
+- Leader-only extraction: workers check Raft leadership before calling the extractor; extraction results are replicated via `MemoryCommand::AddKnowledge` so all nodes stay consistent
+- Standalone-mode support: extraction and graph updates applied directly when `NODE_ID` is not set
+- 4 new knowledge REST endpoints: `GET /knowledge`, `GET /knowledge/entities/{name}`, `GET /knowledge/path`, `GET /knowledge/export`
+- Graph export in JSON and Graphviz DOT format
+- 4 new Prometheus metrics: `engram_knowledge_extraction_duration_seconds`, `engram_knowledge_entities_extracted_total`, `engram_knowledge_relationships_extracted_total`, `engram_knowledge_queue_size`
+- `KNOWLEDGE_EXTRACTOR`, `KNOWLEDGE_MAX_WORKERS`, `KNOWLEDGE_CHANNEL_SIZE` configuration env vars
+- Docker Compose cluster defaults to `KNOWLEDGE_EXTRACTOR=mock` to decouple verification from OpenAI quota
+- 146 tests passing
+
+**Completion criteria (all pass in Docker Compose):**
+1. Leader-only extraction: only the leader node calls the extractor for any given message
+2. Knowledge replication: AddKnowledge commands replicate to all followers; graph is identical on every node
+3. REST endpoints respond correctly: get, related, path, export all return expected data
+4. Delete-session clears the knowledge graph on all nodes
+5. Prometheus metrics `engram_knowledge_*` are present in `/metrics` output
+
 ---
 
 ## 3. System Architecture (High-Level)
@@ -105,6 +126,7 @@ graph TD
     router --> searchhandler["search handler"]
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
+    router --> knowledgehandler["knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
@@ -112,7 +134,8 @@ graph TD
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
-    raft -->|embedding job| embedqueue["background worker pool\nbounded channel"]
+    raft -->|embedding job| embedqueue["embedding worker pool\nbounded channel"]
+    raft -->|knowledge job| knowledgequeue["knowledge worker pool\nbounded channel"]
 
     shortterm --> redis[("redis")]
     shortterm --> inmem["in-memory store\ntest fallback"]
@@ -123,6 +146,11 @@ graph TD
     longterm --> lancedb[("lancedb")]
 
     coremem --> redis
+
+    knowledgequeue -->|leader-only| extractor["knowledge extractor trait"]
+    extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
+    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    knowledgehandler --> knowledgegraph
 
     contexthandler --> assembler["context assembler"]
     assembler --> shortterm
@@ -319,6 +347,20 @@ Request body: `{ "node_id": 4, "addr": "node-4:9001" }`
 `POST /cluster/change-membership` → `200 OK`  
 Request body: `{ "members": [1, 2, 3] }`
 
+#### Knowledge Graph _(Stage 2)_
+`GET /sessions/{session_id}/knowledge` → `{ session_id, entities, edges }` _(200 OK)_
+
+#### Entity Relationships _(Stage 2)_
+`GET /sessions/{session_id}/knowledge/entities/{entity_name}` → `{ entity_name, related }` _(200 OK)_  
+Returns 404 if the entity is not in the graph.
+
+#### Knowledge Path _(Stage 2)_
+`GET /sessions/{session_id}/knowledge/path?from=X&to=Y` → `{ from, to, path }` _(200 OK)_  
+`path` is `null` when no directed path exists.
+
+#### Knowledge Export _(Stage 2)_
+`GET /sessions/{session_id}/knowledge/export?format=json|dot` → graph in JSON or Graphviz DOT _(200 OK)_
+
 _All endpoints verified against API.md and server.rs._
 ---
 ## Phase Completion Summary
@@ -327,6 +369,7 @@ _All endpoints verified against API.md and server.rs._
 - **Phase 1:** ✅ Completed
 - **Phase 2:** ⚠️ Incomplete, only OpenAPI spec generation is implemented; other items are future work.
 - **Stage 1 (Distributed Memory):** ✅ Completed — 3-node Raft cluster, gRPC transport, follower redirect, failover, cluster observability. All five acceptance criteria pass.
+- **Stage 2 (Knowledge Formation):** ✅ Completed — entity/relationship extraction, petgraph-backed per-session knowledge graph, leader-only extraction with Raft-replicated `AddKnowledge`, knowledge REST endpoints, graph export, 4 new Prometheus metrics, configurable extractor, 146 tests pass.
 
 ---
 If any future changes are made to traits, endpoints, or architecture, update this SSOT accordingly.
@@ -495,6 +538,11 @@ services:
 - `RUST_LOG` (tracing filter)
 - `LOG_FORMAT` (default `pretty`, supports `json`)
 
+**Knowledge pipeline** (Stage 2):
+- `KNOWLEDGE_EXTRACTOR` — `openai` (default) or `mock`; use `mock` to avoid OpenAI quota consumption in CI/testing
+- `KNOWLEDGE_MAX_WORKERS` — number of knowledge extraction workers (default `4`)
+- `KNOWLEDGE_CHANNEL_SIZE` — knowledge job queue capacity (default `500`)
+
 **Cluster mode** (all required when `NODE_ID` is set):
 - `NODE_ID` — unique integer node identifier (e.g. `1`)
 - `RAFT_ADDR` — bind address for the gRPC Raft server (e.g. `0.0.0.0:9001`)
@@ -521,6 +569,12 @@ Per-request context settings such as `max_tokens`, `similarity_threshold`, and `
 - `engram_raft_commit_index` — index of last applied log entry (gauge)
 - `engram_raft_is_leader` — 1 if this node is the current leader, 0 otherwise (gauge)
 - `engram_raft_leader_changes_total` — number of leader changes observed by this node (counter)
+
+**Knowledge pipeline metrics** (Stage 2, all modes):
+- `engram_knowledge_extraction_duration_seconds` — duration of extraction calls (histogram, label: extractor)
+- `engram_knowledge_entities_extracted_total` — cumulative entities extracted (counter)
+- `engram_knowledge_relationships_extracted_total` — cumulative relationships extracted (counter)
+- `engram_knowledge_queue_size` — pending knowledge jobs (gauge)
 
 ### 10.2 Tracing
 - Each request gets a span.

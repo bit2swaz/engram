@@ -218,11 +218,13 @@ Learn:
 
 ---
 
-## Stage 2: Knowledge Formation
+## Stage 2: Knowledge Formation ✅
 
 Goal:
 
 Transform memories into structured knowledge.
+
+Status: complete. Entity and relationship extraction from message text (OpenAI GPT-4o-mini or offline mock), per-session in-memory knowledge graph backed by petgraph, leader-only extraction with Raft-replicated `AddKnowledge` command for consistency across all nodes, four knowledge REST endpoints, Graphviz DOT export, four new Prometheus metrics, 146 tests pass.
 
 Learn:
 

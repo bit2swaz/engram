@@ -65,7 +65,7 @@ docker compose -f docker-compose.cluster.yml up -d --build
 docker compose -f docker-compose.cluster.yml down
 ```
 
-The verify script checks leader election, write replication, follower redirect, failover, and Prometheus metrics. It exits 0 only when all five pass.
+The verify script checks leader election, write replication, follower redirect, failover, Prometheus metrics, knowledge graph replication across nodes, entity graph traversal, and delete-session cleanup. It exits 0 only when all criteria pass.
 
 ## TDD Workflow
 
