@@ -15,6 +15,12 @@ pub struct PeerConfig {
     pub addr: String, // "host:grpc_port"
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnowledgeExtractorType {
+    OpenAI,
+    Mock,
+}
+
 const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
 const DEFAULT_LANCE_DB_PATH: &str = "./data/lancedb";
 const DEFAULT_EMBEDDING_DIMENSION: usize = 1536;
@@ -48,6 +54,9 @@ pub struct Config {
     /// HTTP addresses of peer nodes keyed by node ID, parsed from CLUSTER_HTTP_PEERS.
     /// Format: "id:host:http_port,id:host:http_port"
     pub cluster_http_peers: HashMap<u64, String>,
+    pub knowledge_max_workers: usize,
+    pub knowledge_channel_size: usize,
+    pub knowledge_extractor: KnowledgeExtractorType,
 }
 
 #[derive(Debug, Error)]
@@ -76,18 +85,29 @@ impl Default for Config {
             raft_advertise_addr: None,
             cluster_peers: vec![],
             cluster_http_peers: HashMap::new(),
+            knowledge_max_workers: 4,
+            knowledge_channel_size: 500,
+            knowledge_extractor: KnowledgeExtractorType::OpenAI,
         }
     }
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let knowledge_extractor = match env::var("KNOWLEDGE_EXTRACTOR").as_deref() {
+            Ok("mock") => KnowledgeExtractorType::Mock,
+            _ => KnowledgeExtractorType::OpenAI,
+        };
         Ok(Self {
             redis_url: env::var("REDIS_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
-            openai_api_key: required_env("OPENAI_API_KEY")?,
+            openai_api_key: if knowledge_extractor == KnowledgeExtractorType::Mock {
+                env::var("OPENAI_API_KEY").unwrap_or_default()
+            } else {
+                required_env("OPENAI_API_KEY")?
+            },
             openai_base_url: optional_env("OPENAI_BASE_URL")?,
             lance_db_path: PathBuf::from(optional_lance_db_path()?),
             embedding_dimension: positive_usize_env(
@@ -115,6 +135,9 @@ impl Config {
             cluster_http_peers: Self::parse_http_peers(
                 &env::var("CLUSTER_HTTP_PEERS").unwrap_or_default(),
             ),
+            knowledge_max_workers:  positive_usize_env("KNOWLEDGE_MAX_WORKERS",  4)?,
+            knowledge_channel_size: positive_usize_env("KNOWLEDGE_CHANNEL_SIZE", 500)?,
+            knowledge_extractor,
         })
     }
 
@@ -214,7 +237,7 @@ mod tests {
     use std::env;
     use std::sync::{Mutex, OnceLock};
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, KnowledgeExtractorType};
 
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -340,6 +363,51 @@ mod tests {
                 name: "OPENAI_API_KEY"
             }
         ));
+    }
+
+    #[test]
+    fn knowledge_extractor_defaults_to_openai() {
+        let _guard = env_lock().lock().unwrap();
+        let old_key = env::var("OPENAI_API_KEY").ok();
+        let old_extractor = env::var("KNOWLEDGE_EXTRACTOR").ok();
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "test-key");
+            env::remove_var("KNOWLEDGE_EXTRACTOR");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.knowledge_extractor, KnowledgeExtractorType::OpenAI);
+        restore_env("OPENAI_API_KEY", old_key);
+        restore_env("KNOWLEDGE_EXTRACTOR", old_extractor);
+    }
+
+    #[test]
+    fn knowledge_extractor_mock_parsed_from_env() {
+        let _guard = env_lock().lock().unwrap();
+        let old_key = env::var("OPENAI_API_KEY").ok();
+        let old_extractor = env::var("KNOWLEDGE_EXTRACTOR").ok();
+        unsafe {
+            env::remove_var("OPENAI_API_KEY");
+            env::set_var("KNOWLEDGE_EXTRACTOR", "mock");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.knowledge_extractor, KnowledgeExtractorType::Mock);
+        restore_env("OPENAI_API_KEY", old_key);
+        restore_env("KNOWLEDGE_EXTRACTOR", old_extractor);
+    }
+
+    #[test]
+    fn mock_mode_does_not_require_openai_api_key() {
+        let _guard = env_lock().lock().unwrap();
+        let old_key = env::var("OPENAI_API_KEY").ok();
+        let old_extractor = env::var("KNOWLEDGE_EXTRACTOR").ok();
+        unsafe {
+            env::remove_var("OPENAI_API_KEY");
+            env::set_var("KNOWLEDGE_EXTRACTOR", "mock");
+        }
+        let result = Config::from_env();
+        assert!(result.is_ok(), "mock mode should not require OPENAI_API_KEY");
+        restore_env("OPENAI_API_KEY", old_key);
+        restore_env("KNOWLEDGE_EXTRACTOR", old_extractor);
     }
 
     fn restore_env(name: &str, value: Option<String>) {

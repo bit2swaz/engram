@@ -18,6 +18,10 @@ pub struct AppMetrics {
     pub raft_commit_index: IntGauge,
     pub raft_is_leader: IntGauge,
     pub raft_leader_changes_total: IntCounter,
+    knowledge_extraction_duration_seconds: HistogramVec,
+    knowledge_entities_extracted_total: IntCounter,
+    knowledge_relationships_extracted_total: IntCounter,
+    knowledge_queue_size: IntGauge,
 }
 
 impl AppMetrics {
@@ -96,6 +100,33 @@ impl AppMetrics {
         ))?;
         registry.register(Box::new(raft_leader_changes_total.clone()))?;
 
+        let knowledge_extraction_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "knowledge_extraction_duration_seconds",
+                "Duration of knowledge extraction calls in seconds.",
+            ),
+            &["model"],
+        )?;
+        registry.register(Box::new(knowledge_extraction_duration_seconds.clone()))?;
+
+        let knowledge_entities_extracted_total = IntCounter::with_opts(Opts::new(
+            "knowledge_entities_extracted_total",
+            "Total entities extracted from messages.",
+        ))?;
+        registry.register(Box::new(knowledge_entities_extracted_total.clone()))?;
+
+        let knowledge_relationships_extracted_total = IntCounter::with_opts(Opts::new(
+            "knowledge_relationships_extracted_total",
+            "Total relationships extracted from messages.",
+        ))?;
+        registry.register(Box::new(knowledge_relationships_extracted_total.clone()))?;
+
+        let knowledge_queue_size = IntGauge::with_opts(Opts::new(
+            "knowledge_queue_size",
+            "Current number of pending knowledge extraction jobs.",
+        ))?;
+        registry.register(Box::new(knowledge_queue_size.clone()))?;
+
         Ok(Self {
             registry,
             messages_added_total,
@@ -108,6 +139,10 @@ impl AppMetrics {
             raft_commit_index,
             raft_is_leader,
             raft_leader_changes_total,
+            knowledge_extraction_duration_seconds,
+            knowledge_entities_extracted_total,
+            knowledge_relationships_extracted_total,
+            knowledge_queue_size,
         })
     }
 
@@ -155,6 +190,22 @@ impl AppMetrics {
 
     pub fn embedding_queue_size(&self) -> i64 {
         self.embedding_queue_size.get()
+    }
+
+    pub fn start_knowledge_extraction_timer(&self) -> HistogramTimer {
+        self.knowledge_extraction_duration_seconds.with_label_values(&["gpt-4o-mini"]).start_timer()
+    }
+
+    pub fn increment_knowledge_entities(&self, count: u64) {
+        self.knowledge_entities_extracted_total.inc_by(count);
+    }
+
+    pub fn increment_knowledge_relationships(&self, count: u64) {
+        self.knowledge_relationships_extracted_total.inc_by(count);
+    }
+
+    pub fn set_knowledge_queue_size(&self, size: usize) {
+        self.knowledge_queue_size.set(size as i64);
     }
 
     pub fn render(&self) -> Result<String, String> {

@@ -25,7 +25,8 @@ services:
       REDIS_URL: "redis://redis-1:6379"
       LANCE_DB_PATH: "/data/lancedb"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3000:3000"
@@ -45,7 +46,8 @@ services:
       REDIS_URL: "redis://redis-2:6379"
       LANCE_DB_PATH: "/data/lancedb"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3001:3000"
@@ -65,7 +67,8 @@ services:
       REDIS_URL: "redis://redis-3:6379"
       LANCE_DB_PATH: "/data/lancedb"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3002:3000"

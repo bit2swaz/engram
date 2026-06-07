@@ -175,6 +175,8 @@ impl BenchmarkHarness {
         ));
         let (embedding_job_sender, receiver) = embedding_job_channel(config.channel_size);
 
+        let (knowledge_job_sender, mut krx) = tokio::sync::mpsc::channel::<engram::knowledge::types::KnowledgeJob>(16);
+        tokio::spawn(async move { while krx.recv().await.is_some() {} });
         let state = Arc::new(AppState {
             short_term_memory: short_term_memory.clone(),
             vector_store: vector_store.clone(),
@@ -191,6 +193,10 @@ impl BenchmarkHarness {
             raft_addr: None,
             raft_advertise_addr: None,
             cluster_peers: vec![],
+            knowledge_graph: Arc::new(tokio::sync::RwLock::new(
+                engram::knowledge::graph::KnowledgeGraph::new(),
+            )),
+            knowledge_job_sender,
         });
 
         let _worker_handles = spawn_embedding_workers(

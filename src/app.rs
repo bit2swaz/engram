@@ -11,6 +11,10 @@ use crate::core::{
     StoreError, TokenCounter, VectorStore,
 };
 use crate::embedding::OpenAIEmbedder;
+use crate::config::KnowledgeExtractorType;
+use crate::knowledge::extractor::{MockKnowledgeExtractor, OpenAIKnowledgeExtractor};
+use crate::knowledge::graph::KnowledgeGraph;
+use crate::knowledge::worker::{knowledge_job_channel, spawn_knowledge_workers};
 use crate::metrics::AppMetrics;
 use crate::server::AppState;
 use crate::stores::{LanceDBStore, RedisCoreMemoryStore, RedisShortTermMemory};
@@ -36,6 +40,8 @@ pub async fn build_raft_node(
     core_memory: Arc<dyn CoreMemoryStore>,
     vector_store: Arc<dyn VectorStore>,
     embedding_tx: tokio::sync::mpsc::Sender<EmbeddingJob>,
+    knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+    knowledge_tx: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
 ) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
     use crate::raft::{
         log_store::EngRaftLogStore, network::EngRaftNetwork,
@@ -61,7 +67,7 @@ pub async fn build_raft_node(
         raft_config,
         EngRaftNetwork,
         EngRaftLogStore::default(),
-        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx),
+        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx),
     )
     .await?;
 
@@ -96,12 +102,16 @@ pub fn spawn_raft_metrics_watcher(
 }
 
 pub async fn build_real_app_state(config: &Config) -> Result<Arc<AppState>, AppBuildError> {
-    let embedding_provider: Arc<dyn EmbeddingProvider> = match &config.openai_base_url {
-        Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
-            config.openai_api_key.clone(),
-            base_url.clone(),
-        )?),
-        None => Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?),
+    let embedding_provider: Arc<dyn EmbeddingProvider> = if config.openai_api_key.is_empty() {
+        Arc::new(crate::core::RandomEmbeddingProvider)
+    } else {
+        match &config.openai_base_url {
+            Some(base_url) => Arc::new(OpenAIEmbedder::new_with_base_url(
+                config.openai_api_key.clone(),
+                base_url.clone(),
+            )?),
+            None => Arc::new(OpenAIEmbedder::new_with_api_key(config.openai_api_key.clone())?),
+        }
     };
 
     build_app_state_with_embedding_provider(config, embedding_provider).await
@@ -136,6 +146,21 @@ pub async fn build_app_state_with_embedding_provider(
         config.embedding_max_concurrency,
     );
 
+    let knowledge_graph = Arc::new(tokio::sync::RwLock::new(KnowledgeGraph::new()));
+    let (knowledge_job_sender, knowledge_receiver) = knowledge_job_channel(config.knowledge_channel_size);
+
+    let knowledge_extractor: Arc<dyn crate::knowledge::extractor::KnowledgeExtractor> =
+        match config.knowledge_extractor {
+            KnowledgeExtractorType::Mock => Arc::new(MockKnowledgeExtractor),
+            KnowledgeExtractorType::OpenAI => match &config.openai_base_url {
+                Some(base_url) => Arc::new(OpenAIKnowledgeExtractor::new_with_base_url(
+                    config.openai_api_key.clone(),
+                    base_url.clone(),
+                )),
+                None => Arc::new(OpenAIKnowledgeExtractor::new(config.openai_api_key.clone())),
+            },
+        };
+
     let (raft, node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers) = if config.node_id.is_some() {
         let raft = build_raft_node(
             config,
@@ -143,6 +168,8 @@ pub async fn build_app_state_with_embedding_provider(
             core_memory_store.clone(),
             vector_store.clone(),
             embedding_job_sender.clone(),
+            knowledge_graph.clone(),
+            knowledge_job_sender.clone(),
         )
         .await
         .map_err(|e| AppBuildError::Other(e.into()))?;
@@ -160,6 +187,16 @@ pub async fn build_app_state_with_embedding_provider(
         spawn_raft_metrics_watcher(raft_handle.clone(), metrics.clone());
     }
 
+    let _knowledge_worker_handles = spawn_knowledge_workers(
+        knowledge_extractor,
+        raft.clone(),
+        config.node_id.unwrap_or(0),
+        knowledge_graph.clone(),
+        metrics.clone(),
+        knowledge_receiver,
+        config.knowledge_max_workers,
+    );
+
     Ok(Arc::new(AppState {
         short_term_memory,
         vector_store,
@@ -176,5 +213,7 @@ pub async fn build_app_state_with_embedding_provider(
         raft_addr,
         raft_advertise_addr,
         cluster_peers,
+        knowledge_graph,
+        knowledge_job_sender,
     }))
 }

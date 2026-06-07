@@ -91,6 +91,9 @@ async fn setup_test_app() -> TestApp {
         raft_advertise_addr: None,
         cluster_peers: vec![],
         cluster_http_peers: std::collections::HashMap::new(),
+        knowledge_max_workers: 4,
+        knowledge_channel_size: 500,
+        knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
     };
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(

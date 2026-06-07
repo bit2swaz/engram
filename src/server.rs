@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use crate::knowledge::handler::{export_knowledge, find_path, get_knowledge, get_related};
 use axum_prometheus::{PrometheusMetricLayer, PrometheusMetricLayerBuilder};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use chrono::Utc;
@@ -123,6 +124,10 @@ pub struct AppState {
     pub raft_advertise_addr: Option<String>,
     /// gRPC addresses of peer nodes, used to build the initial cluster membership.
     pub cluster_peers: Vec<crate::config::PeerConfig>,
+    /// Per-session in-memory knowledge graph, shared with the Raft state machine.
+    pub knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+    /// Channel for sending knowledge extraction jobs to the worker pool.
+    pub knowledge_job_sender: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
 }
 
 
@@ -215,6 +220,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/context", get(get_context))
         .route("/sessions/{session_id}/search", post(search_session))
         .route("/sessions/{session_id}/core-memory", put(put_core_memory))
+        .route("/sessions/{session_id}/knowledge", get(get_knowledge))
+        .route("/sessions/{session_id}/knowledge/entities/{entity_name}", get(get_related))
+        .route("/sessions/{session_id}/knowledge/path", get(find_path))
+        .route("/sessions/{session_id}/knowledge/export", get(export_knowledge))
         .route("/cluster", get(crate::cluster::get_cluster_status))
         .route("/cluster/init", post(crate::cluster::init_cluster))
         .route("/cluster/add-learner", post(crate::cluster::add_learner))
@@ -760,6 +769,14 @@ mod tests {
             raft_addr: None,
             raft_advertise_addr: None,
             cluster_peers: vec![],
+            knowledge_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::graph::KnowledgeGraph::new(),
+            )),
+            knowledge_job_sender: {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         })
     }
 
@@ -768,6 +785,14 @@ mod tests {
         let s = build_test_state();
         let _ = s.raft.is_none();
         let _ = s.node_id;
+    }
+
+    #[tokio::test]
+    async fn appstate_has_knowledge_fields() {
+        // If AppState is missing the new fields, this won't compile.
+        let state = build_test_state();
+        let _ = state.knowledge_graph.read().await;
+        let _ = state.knowledge_job_sender.capacity();
     }
 
     #[tokio::test]
@@ -1208,6 +1233,46 @@ mod tests {
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn knowledge_routes_are_registered() {
+        let server = TestServer::new(build_router(build_test_state())).unwrap();
+        server.get("/sessions/test-session/knowledge").await.assert_status_ok();
+        server
+            .get("/sessions/test-session/knowledge/export?format=json")
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn knowledge_metrics_appear_in_prometheus_scrape() {
+        let state = build_test_state();
+        // Observe each metric so the HistogramVec emits output (Vec types only appear
+        // in Prometheus text format once at least one label set has been recorded).
+        let timer = state.metrics.start_knowledge_extraction_timer();
+        drop(timer);
+        state.metrics.increment_knowledge_entities(1);
+        state.metrics.increment_knowledge_relationships(1);
+        state.metrics.set_knowledge_queue_size(0);
+        let server = TestServer::new(build_router(state)).unwrap();
+        let body = server.get("/metrics").await.text();
+        assert!(
+            body.contains("engram_knowledge_extraction_duration_seconds"),
+            "missing knowledge_extraction_duration_seconds"
+        );
+        assert!(
+            body.contains("engram_knowledge_entities_extracted_total"),
+            "missing knowledge_entities_extracted_total"
+        );
+        assert!(
+            body.contains("engram_knowledge_relationships_extracted_total"),
+            "missing knowledge_relationships_extracted_total"
+        );
+        assert!(
+            body.contains("engram_knowledge_queue_size"),
+            "missing knowledge_queue_size"
+        );
     }
 
     #[tokio::test]

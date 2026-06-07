@@ -202,12 +202,17 @@ mod tests {
     async fn build_test_app_with_single_node_raft() -> TestServer {
         let c = build_test_components();
         let config = Config { node_id: Some(1), ..Config::default() };
+        let knowledge_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::graph::KnowledgeGraph::new()));
+        let (knowledge_tx, mut knowledge_rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(500);
+        tokio::spawn(async move { while knowledge_rx.recv().await.is_some() {} });
         let raft = build_raft_node(
             &config,
             c.short_term.clone(),
             c.core_memory.clone(),
             c.vector_store.clone(),
             c.embedding_job_sender.clone(),
+            knowledge_graph.clone(),
+            knowledge_tx.clone(),
         )
         .await
         .unwrap();
@@ -234,12 +239,16 @@ mod tests {
             raft_addr: Some("127.0.0.1:0".to_string()),
             raft_advertise_addr: None,
             cluster_peers: vec![],
+            knowledge_graph,
+            knowledge_job_sender: knowledge_tx,
         });
         TestServer::new(build_router(state)).unwrap()
     }
 
     fn build_test_app_standalone() -> TestServer {
         let c = build_test_components();
+        let (knowledge_job_sender, mut krx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(16);
+        tokio::spawn(async move { while krx.recv().await.is_some() {} });
         let state = Arc::new(AppState {
             short_term_memory: c.short_term,
             vector_store: c.vector_store,
@@ -256,6 +265,10 @@ mod tests {
             raft_addr: None,
             raft_advertise_addr: None,
             cluster_peers: vec![],
+            knowledge_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::graph::KnowledgeGraph::new(),
+            )),
+            knowledge_job_sender,
         });
         TestServer::new(build_router(state)).unwrap()
     }

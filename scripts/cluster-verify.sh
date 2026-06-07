@@ -96,5 +96,97 @@ echo "$METRICS" | grep -q "engram_raft_term"         && pass "engram_raft_term p
 echo "$METRICS" | grep -q "engram_raft_commit_index" && pass "engram_raft_commit_index present" || fail "engram_raft_commit_index missing"
 echo "$METRICS" | grep -q "engram_raft_is_leader"    && pass "engram_raft_is_leader present"    || fail "engram_raft_is_leader missing"
 
+
+echo "[6] Knowledge replication (deterministic mock extraction)"
+# Find current leader — may have changed after failover in check [4]
+WRITE_LEADER="$N1"
+for port in 3000 3001 3002; do
+  ROLE=$(curl -sf "http://localhost:$port/cluster" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+  if [ "$ROLE" = "Leader" ]; then
+    WRITE_LEADER="http://localhost:$port"
+    break
+  fi
+done
+
+SESSION_K=$(curl -sf -X POST "$WRITE_LEADER/sessions" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+
+# Three separate messages: one pattern per message so the mock extractor handles each cleanly
+curl -sf -X POST "$WRITE_LEADER/sessions/$SESSION_K/messages" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"user","content":"Alice works at OpenAI"}' > /dev/null
+curl -sf -X POST "$WRITE_LEADER/sessions/$SESSION_K/messages" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"user","content":"Bob works at OpenAI"}' > /dev/null
+curl -sf -X POST "$WRITE_LEADER/sessions/$SESSION_K/messages" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"user","content":"Alice knows Bob"}' > /dev/null
+
+echo "  Waiting 3 seconds for extraction and Raft replication..."
+sleep 3
+
+LEADER_PORT=""
+for port in 3000 3001 3002; do
+  ROLE=$(curl -sf "http://localhost:$port/cluster" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+  if [ "$ROLE" = "Leader" ]; then
+    LEADER_PORT="$port"
+    break
+  fi
+done
+
+[ -z "$LEADER_PORT" ] && fail "no leader found for knowledge check"
+
+LEADER_ENTITIES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
+  python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+
+[ "$LEADER_ENTITIES" -ge 3 ] \
+  && pass "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities" \
+  || fail "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities (expected >= 3)"
+
+LEADER_EDGES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
+  python3 -c "import sys,json; print(len(json.load(sys.stdin)['edges']))" 2>/dev/null || echo "-1")
+
+[ "$LEADER_EDGES" -ge 3 ] \
+  && pass "leader (:$LEADER_PORT) has $LEADER_EDGES relationships" \
+  || fail "leader (:$LEADER_PORT) has $LEADER_EDGES relationships (expected >= 3)"
+
+for port in 3000 3001 3002; do
+  [ "$port" -eq "$LEADER_PORT" ] && continue
+  FOLLOWER_ENTITIES=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" | \
+    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  [ "$FOLLOWER_ENTITIES" -eq "$LEADER_ENTITIES" ] \
+    && pass "follower :$port converged to $FOLLOWER_ENTITIES entities (matches leader)" \
+    || fail "follower :$port has $FOLLOWER_ENTITIES entities (leader has $LEADER_ENTITIES)"
+done
+
+echo "[6b] Capability criterion: graph answers questions without LLM or vector search"
+RELATED=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge/entities/OpenAI" | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print([r['name'] for r in d['related']])" 2>/dev/null || echo "[]")
+echo "$RELATED" | grep -q "Alice" \
+  && pass "OpenAI is related to Alice (works_at)" \
+  || fail "OpenAI not related to Alice"
+echo "$RELATED" | grep -q "Bob" \
+  && pass "OpenAI is related to Bob (works_at)" \
+  || fail "OpenAI not related to Bob"
+
+PATH_RESP=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge/path?from=Alice&to=Bob" | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('path'))" 2>/dev/null || echo "None")
+[ "$PATH_RESP" != "None" ] && [ "$PATH_RESP" != "null" ] \
+  && pass "shortest path Alice→Bob found via graph traversal" \
+  || fail "no path found from Alice to Bob"
+
+echo "[6c] Delete-session removes knowledge graph state from all nodes"
+curl -sf -X DELETE "$WRITE_LEADER/sessions/$SESSION_K" > /dev/null
+sleep 1
+for port in 3000 3001 3002; do
+  ENTITIES_AFTER=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" | \
+    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  [ "$ENTITIES_AFTER" -eq 0 ] \
+    && pass "node :$port knowledge graph empty after delete" \
+    || fail "node :$port still has $ENTITIES_AFTER entities after delete"
+done
+
 echo ""
-echo "=== All Stage 1 criteria PASSED ==="
+echo "=== All Stage 1 + Stage 2 criteria PASSED ==="
