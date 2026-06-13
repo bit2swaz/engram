@@ -27,6 +27,8 @@ const DEFAULT_EMBEDDING_DIMENSION: usize = 1536;
 const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 10;
 const DEFAULT_MPSC_CHANNEL_SIZE: usize = 1_000;
 const DEFAULT_SHORT_TERM_COUNT: usize = 20;
+const DEFAULT_RAFT_DB_PATH: &str = "./data/raft/engram.redb";
+const DEFAULT_SNAPSHOT_LOG_THRESHOLD: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -57,6 +59,12 @@ pub struct Config {
     pub knowledge_max_workers: usize,
     pub knowledge_channel_size: usize,
     pub knowledge_extractor: KnowledgeExtractorType,
+    /// Path to the redb file backing the persistent Raft log + snapshot store.
+    /// Set via RAFT_DB_PATH. Each node needs its own path/volume.
+    pub raft_db_path: std::path::PathBuf,
+    /// Build a snapshot every N committed log entries (openraft SnapshotPolicy::LogsSinceLast).
+    /// Set via SNAPSHOT_LOG_THRESHOLD.
+    pub snapshot_log_threshold: u64,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +96,8 @@ impl Default for Config {
             knowledge_max_workers: 4,
             knowledge_channel_size: 500,
             knowledge_extractor: KnowledgeExtractorType::OpenAI,
+            raft_db_path: std::path::PathBuf::from(DEFAULT_RAFT_DB_PATH),
+            snapshot_log_threshold: DEFAULT_SNAPSHOT_LOG_THRESHOLD,
         }
     }
 }
@@ -138,6 +148,13 @@ impl Config {
             knowledge_max_workers:  positive_usize_env("KNOWLEDGE_MAX_WORKERS",  4)?,
             knowledge_channel_size: positive_usize_env("KNOWLEDGE_CHANNEL_SIZE", 500)?,
             knowledge_extractor,
+            raft_db_path: PathBuf::from(
+                optional_env("RAFT_DB_PATH")?.unwrap_or_else(|| DEFAULT_RAFT_DB_PATH.to_string()),
+            ),
+            snapshot_log_threshold: positive_u64_env(
+                "SNAPSHOT_LOG_THRESHOLD",
+                DEFAULT_SNAPSHOT_LOG_THRESHOLD,
+            )?,
         })
     }
 
@@ -218,6 +235,18 @@ fn optional_lance_db_path() -> Result<String, ConfigError> {
     }
 
     Ok(DEFAULT_LANCE_DB_PATH.to_string())
+}
+
+fn positive_u64_env(name: &'static str, default: u64) -> Result<u64, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(ConfigError::InvalidPositiveInteger { name }),
+        Err(_) => Ok(default),
+    }
 }
 
 fn positive_usize_env(name: &'static str, default: usize) -> Result<usize, ConfigError> {
@@ -450,5 +479,12 @@ mod cluster_config_tests {
         let peers = Config::parse_cluster_peers("bad-entry,1:node1:9001");
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].id, 1);
+    }
+
+    #[test]
+    fn defaults_persistence_paths_and_threshold() {
+        let cfg = Config::default();
+        assert_eq!(cfg.raft_db_path.to_string_lossy(), "./data/raft/engram.redb");
+        assert_eq!(cfg.snapshot_log_threshold, 1000);
     }
 }

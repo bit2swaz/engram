@@ -32,6 +32,7 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 petgraph = "0.6"
 tonic = "0.12"
 prost = "0.13"
+redb = "2"
 tokio-stream = "0.1"
 
 [dev-dependencies]
