@@ -209,6 +209,11 @@ impl Default for KnowledgeGraph {
     fn default() -> Self { Self::new() }
 }
 
+/// Portable snapshot of the knowledge graph for inclusion in Raft snapshots.
+/// Expanded in Task 6 with full entity/relationship serialization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphSnapshot;
+
 #[cfg(test)]
 mod tests {
     use super::*;
