@@ -62,11 +62,16 @@ pub async fn build_raft_node(
         .validate()?,
     );
 
+    if let Some(parent) = config.raft_db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = Arc::new(redb::Database::create(&config.raft_db_path)?);
+
     let raft = openraft::Raft::<TypeConfig>::new(
         node_id,
         raft_config,
         EngRaftNetwork,
-        EngRaftLogStore::default(),
+        EngRaftLogStore::new(db),
         EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx),
     )
     .await?;

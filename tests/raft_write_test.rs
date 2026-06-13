@@ -9,13 +9,16 @@ use engram::app::build_raft_node;
 use engram::config::Config;
 use engram::core::{InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, ShortTermMemory};
 use engram::raft::types::{MemoryCommand, MessagePayload};
+use tempfile;
 
 #[tokio::test]
 async fn single_node_raft_write_commits_to_state_machine() {
     let short_term = Arc::new(InMemoryStore::default());
     let (tx, _rx) = mpsc::channel(10);
+    let raft_dir = tempfile::tempdir().unwrap();
     let config = Config {
         node_id: Some(1),
+        raft_db_path: raft_dir.path().join("engram.redb"),
         ..Config::default()
     };
     let knowledge_graph = Arc::new(tokio::sync::RwLock::new(engram::knowledge::graph::KnowledgeGraph::new()));
