@@ -134,6 +134,14 @@ pub trait ShortTermMemory: Send + Sync {
     ) -> Result<Option<Message>, MemoryError> {
         Ok(None)
     }
+
+    async fn dump_all(&self) -> Result<Vec<(String, Vec<Message>)>, MemoryError> {
+        Ok(vec![])
+    }
+
+    async fn restore_all(&self, _sessions: Vec<(String, Vec<Message>)>) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 pub trait TokenCounter: Send + Sync {
@@ -147,6 +155,14 @@ pub trait CoreMemoryStore: Send + Sync {
     async fn get_facts(&self, session_id: &str) -> Result<Vec<String>, MemoryError>;
 
     async fn delete_session(&self, _session_id: &str) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    async fn dump_all(&self) -> Result<Vec<(String, Vec<String>)>, MemoryError> {
+        Ok(vec![])
+    }
+
+    async fn restore_all(&self, _sessions: Vec<(String, Vec<String>)>) -> Result<(), MemoryError> {
         Ok(())
     }
 }
@@ -377,6 +393,20 @@ impl ShortTermMemory for InMemoryStore {
             .into_iter()
             .find(|message| message.id.as_deref() == Some(message_id)))
     }
+
+    async fn dump_all(&self) -> Result<Vec<(String, Vec<Message>)>, MemoryError> {
+        let messages = self.messages.lock().map_err(|e| MemoryError::Message(e.to_string()))?;
+        Ok(messages.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    async fn restore_all(&self, sessions: Vec<(String, Vec<Message>)>) -> Result<(), MemoryError> {
+        let mut messages = self.messages.lock().map_err(|e| MemoryError::Message(e.to_string()))?;
+        messages.clear();
+        for (session_id, msgs) in sessions {
+            messages.insert(session_id, msgs);
+        }
+        Ok(())
+    }
 }
 
 pub struct OpenAITokenCounter {
@@ -433,6 +463,20 @@ impl CoreMemoryStore for InMemoryCoreMemoryStore {
             .map_err(|error| MemoryError::Message(error.to_string()))?;
 
         facts.remove(session_id);
+        Ok(())
+    }
+
+    async fn dump_all(&self) -> Result<Vec<(String, Vec<String>)>, MemoryError> {
+        let facts = self.facts.lock().map_err(|e| MemoryError::Message(e.to_string()))?;
+        Ok(facts.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    async fn restore_all(&self, sessions: Vec<(String, Vec<String>)>) -> Result<(), MemoryError> {
+        let mut facts = self.facts.lock().map_err(|e| MemoryError::Message(e.to_string()))?;
+        facts.clear();
+        for (session_id, list) in sessions {
+            facts.insert(session_id, list);
+        }
         Ok(())
     }
 }
@@ -721,6 +765,45 @@ mod tests {
 
         let facts = store.get_facts("session-1").await.unwrap();
         assert!(facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_dump_and_restore_all_sessions() {
+        let store = InMemoryStore::default();
+        store.add_message("s1", message("user", "hi")).await.unwrap();
+        store.add_message("s2", message("user", "yo")).await.unwrap();
+
+        let dump = store.dump_all().await.unwrap();
+        assert_eq!(dump.len(), 2);
+
+        let fresh = InMemoryStore::default();
+        // Pre-existing data in `fresh` must be wiped by restore_all.
+        fresh.add_message("stale", message("user", "old")).await.unwrap();
+        fresh.restore_all(dump).await.unwrap();
+
+        assert!(fresh.get_recent("stale", 10).await.unwrap().is_empty());
+        assert_eq!(fresh.get_recent("s1", 10).await.unwrap()[0].content, "hi");
+        assert_eq!(fresh.get_recent("s2", 10).await.unwrap()[0].content, "yo");
+    }
+
+    #[tokio::test]
+    async fn restore_all_empty_clears_everything() {
+        let store = InMemoryStore::default();
+        store.add_message("s1", message("user", "hi")).await.unwrap();
+        store.restore_all(vec![]).await.unwrap();
+        assert!(store.get_recent("s1", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_core_memory_dump_and_restore() {
+        let store = InMemoryCoreMemoryStore::default();
+        store.add_fact("s1", "a").await.unwrap();
+        store.add_fact("s1", "b").await.unwrap();
+        let dump = store.dump_all().await.unwrap();
+
+        let fresh = InMemoryCoreMemoryStore::default();
+        fresh.restore_all(dump).await.unwrap();
+        assert_eq!(fresh.get_facts("s1").await.unwrap(), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

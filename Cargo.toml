@@ -28,10 +28,11 @@ utoipa = { version = "5.4", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
 petgraph = "0.6"
 tonic = "0.12"
 prost = "0.13"
+redb = "2"
 tokio-stream = "0.1"
 
 [dev-dependencies]

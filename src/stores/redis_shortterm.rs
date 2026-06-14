@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 
 use crate::core::{MemoryError, ShortTermMemory, TokenCounter, trim_messages_to_token_budget};
@@ -197,8 +198,119 @@ impl ShortTermMemory for RedisShortTermMemory {
             .into_iter()
             .find(|message| message.id.as_deref() == Some(message_id)))
     }
+
+    async fn dump_all(&self) -> Result<Vec<(String, Vec<Message>)>, MemoryError> {
+        let mut connection = self.connection.clone();
+        let keys: Vec<String> = {
+            let mut iter = connection
+                .scan_match::<_, String>("session:*:messages")
+                .await
+                .map_err(memory_error)?;
+            let mut collected = Vec::new();
+            while let Some(key) = iter.next().await {
+                collected.push(key);
+            }
+            collected
+        };
+        let mut out = Vec::new();
+        for key in keys {
+            let session_id = session_id_from_key(&key);
+            let raw: Vec<String> = connection.lrange(key.as_str(), 0, -1).await.map_err(memory_error)?;
+            let messages = raw
+                .into_iter()
+                .map(|r| serde_json::from_str(&r).map_err(memory_error))
+                .collect::<Result<Vec<Message>, _>>()?;
+            out.push((session_id, messages));
+        }
+        Ok(out)
+    }
+
+    async fn restore_all(&self, sessions: Vec<(String, Vec<Message>)>) -> Result<(), MemoryError> {
+        let mut connection = self.connection.clone();
+        let existing: Vec<String> = {
+            let mut iter = connection
+                .scan_match::<_, String>("session:*:messages")
+                .await
+                .map_err(memory_error)?;
+            let mut collected = Vec::new();
+            while let Some(key) = iter.next().await {
+                collected.push(key);
+            }
+            collected
+        };
+        for key in existing {
+            let _: usize = connection.del(key.as_str()).await.map_err(memory_error)?;
+        }
+        for (session_id, messages) in sessions {
+            self.write_messages(&session_id, &messages).await?;
+        }
+        Ok(())
+    }
+}
+
+fn session_id_from_key(key: &str) -> String {
+    key.strip_prefix("session:")
+        .and_then(|s| s.strip_suffix(":messages"))
+        .unwrap_or(key)
+        .to_string()
 }
 
 fn memory_error(error: impl StdError + Send + Sync + 'static) -> MemoryError {
     MemoryError::Other(Box::new(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ShortTermMemory;
+    use crate::models::Message;
+    use testcontainers::{
+        GenericImage,
+        core::{IntoContainerPort, WaitFor},
+        runners::AsyncRunner,
+    };
+
+    const REDIS_PORT: u16 = 6379;
+
+    async fn test_store() -> (RedisShortTermMemory, testcontainers::ContainerAsync<GenericImage>) {
+        let node = GenericImage::new("redis", "7.2.4")
+            .with_exposed_port(REDIS_PORT.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+            .start()
+            .await
+            .unwrap();
+        let host = node.get_host().await.unwrap();
+        let port = node.get_host_port_ipv4(REDIS_PORT.tcp()).await.unwrap();
+        let url = format!("redis://{host}:{port}/");
+        let store = RedisShortTermMemory::connect(&url).await.unwrap();
+        (store, node)
+    }
+
+    fn sample_message(content: &str) -> Message {
+        Message {
+            id: None,
+            role: "user".to_string(),
+            content: content.to_string(),
+            timestamp: None,
+            embedding_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dump_all_and_restore_all_round_trip() {
+        let (store, _node) = test_store().await;
+        store.add_message("s1", sample_message("hi")).await.unwrap();
+        store.add_message("s2", sample_message("yo")).await.unwrap();
+
+        let dump = store.dump_all().await.unwrap();
+        assert_eq!(dump.len(), 2);
+
+        // Wipe and restore into the same Redis.
+        store.add_message("stale", sample_message("old")).await.unwrap();
+        store.restore_all(dump).await.unwrap();
+
+        assert!(store.get_recent("stale", 10).await.unwrap().is_empty());
+        assert_eq!(store.get_recent("s1", 10).await.unwrap().len(), 1);
+        assert_eq!(store.get_recent("s2", 10).await.unwrap().len(), 1);
+    }
 }

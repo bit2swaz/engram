@@ -188,10 +188,89 @@ impl TryFrom<p::AppendEntriesResponse> for AppendEntriesResponse<u64> {
     }
 }
 
+// --- InstallSnapshotRequest ---
+
+impl From<&openraft::raft::InstallSnapshotRequest<TypeConfig>> for p::InstallSnapshotRequest {
+    fn from(r: &openraft::raft::InstallSnapshotRequest<TypeConfig>) -> Self {
+        p::InstallSnapshotRequest {
+            vote: Some((&r.vote).into()),
+            meta: serde_json::to_vec(&r.meta).unwrap_or_default(),
+            offset: r.offset,
+            data: r.data.clone(),
+            done: r.done,
+        }
+    }
+}
+
+impl TryFrom<p::InstallSnapshotRequest> for openraft::raft::InstallSnapshotRequest<TypeConfig> {
+    type Error = String;
+    fn try_from(r: p::InstallSnapshotRequest) -> Result<Self, String> {
+        let meta = serde_json::from_slice(&r.meta)
+            .map_err(|e| format!("install_snapshot meta decode error: {e}"))?;
+        Ok(openraft::raft::InstallSnapshotRequest {
+            vote: r.vote.ok_or("install_snapshot_request missing vote")?.into(),
+            meta,
+            offset: r.offset,
+            data: r.data,
+            done: r.done,
+        })
+    }
+}
+
+// --- InstallSnapshotResponse ---
+
+impl From<&openraft::raft::InstallSnapshotResponse<u64>> for p::InstallSnapshotResponse {
+    fn from(r: &openraft::raft::InstallSnapshotResponse<u64>) -> Self {
+        p::InstallSnapshotResponse { vote: Some((&r.vote).into()) }
+    }
+}
+
+impl TryFrom<p::InstallSnapshotResponse> for openraft::raft::InstallSnapshotResponse<u64> {
+    type Error = String;
+    fn try_from(r: p::InstallSnapshotResponse) -> Result<Self, String> {
+        Ok(openraft::raft::InstallSnapshotResponse {
+            vote: r.vote.ok_or("install_snapshot_response missing vote")?.into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::proto::raft as proto;
     use openraft::raft::{AppendEntriesResponse, VoteRequest};
+
+    #[test]
+    fn install_snapshot_request_round_trips() {
+        use openraft::raft::InstallSnapshotRequest;
+        use openraft::{SnapshotMeta, StoredMembership};
+        let req = InstallSnapshotRequest::<crate::raft::types::TypeConfig> {
+            vote: openraft::Vote::new_committed(2, 1),
+            meta: SnapshotMeta {
+                last_log_id: Some(openraft::LogId::new(openraft::CommittedLeaderId::new(2, 1), 9)),
+                last_membership: StoredMembership::default(),
+                snapshot_id: "snap-1".into(),
+            },
+            offset: 0,
+            data: vec![1, 2, 3],
+            done: true,
+        };
+        let p: proto::InstallSnapshotRequest = (&req).into();
+        let back: InstallSnapshotRequest<crate::raft::types::TypeConfig> = p.try_into().unwrap();
+        assert_eq!(back.offset, 0);
+        assert!(back.done);
+        assert_eq!(back.data, vec![1, 2, 3]);
+        assert_eq!(back.meta.snapshot_id, "snap-1");
+        assert_eq!(back.meta.last_log_id.unwrap().index, 9);
+    }
+
+    #[test]
+    fn install_snapshot_response_round_trips() {
+        use openraft::raft::InstallSnapshotResponse;
+        let resp = InstallSnapshotResponse::<u64> { vote: openraft::Vote::new_committed(3, 2) };
+        let p: proto::InstallSnapshotResponse = (&resp).into();
+        let back: InstallSnapshotResponse<u64> = p.try_into().unwrap();
+        assert_eq!(back.vote.leader_id().term, 3);
+    }
 
     #[test]
     fn vote_round_trips() {

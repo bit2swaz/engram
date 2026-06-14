@@ -199,9 +199,14 @@ mod tests {
         }
     }
 
-    async fn build_test_app_with_single_node_raft() -> TestServer {
+    async fn build_test_app_with_single_node_raft() -> (TestServer, tempfile::TempDir) {
         let c = build_test_components();
-        let config = Config { node_id: Some(1), ..Config::default() };
+        let raft_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            node_id: Some(1),
+            raft_db_path: raft_dir.path().join("engram.redb"),
+            ..Config::default()
+        };
         let knowledge_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::graph::KnowledgeGraph::new()));
         let (knowledge_tx, mut knowledge_rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(500);
         tokio::spawn(async move { while knowledge_rx.recv().await.is_some() {} });
@@ -242,7 +247,7 @@ mod tests {
             knowledge_graph,
             knowledge_job_sender: knowledge_tx,
         });
-        TestServer::new(build_router(state)).unwrap()
+        (TestServer::new(build_router(state)).unwrap(), raft_dir)
     }
 
     fn build_test_app_standalone() -> TestServer {
@@ -275,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_endpoint_returns_200_with_node_info() {
-        let app = build_test_app_with_single_node_raft().await;
+        let (app, _dir) = build_test_app_with_single_node_raft().await;
         let resp = app.get("/cluster").await;
         assert_eq!(resp.status_code(), 200);
         let body: Value = resp.json();
@@ -293,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_metrics_appear_in_prometheus_scrape() {
-        let app = build_test_app_with_single_node_raft().await;
+        let (app, _dir) = build_test_app_with_single_node_raft().await;
         tokio::time::sleep(Duration::from_millis(700)).await;
         let resp = app.get("/metrics").await;
         let body = resp.text();

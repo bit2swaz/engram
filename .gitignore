@@ -6,9 +6,11 @@ benchmarks/deps/
 benchmarks/results/
 data/benchmarks-lancedb-local/
 data/lancedb-bench/
+data/raft/
 tools/__pycache__/
 CLAUDE.md
 *PLAN.md
+LESSONS.md
 
 # Added by cargo
 
