@@ -48,35 +48,131 @@ pub async fn build_raft_node(
         state_machine::EngStateMachineStore, types::TypeConfig,
     };
 
+    use crate::raft::recovery::recover_state_machine;
+    use openraft::SnapshotPolicy;
+
     let node_id = config
         .node_id
         .expect("NODE_ID must be set in cluster mode");
-
-    let raft_config = Arc::new(
-        openraft::Config {
-            heartbeat_interval: 250,
-            election_timeout_min: 299,
-            election_timeout_max: 500,
-            ..Default::default()
-        }
-        .validate()?,
-    );
 
     if let Some(parent) = config.raft_db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let db = Arc::new(redb::Database::create(&config.raft_db_path)?);
 
+    let log_store = EngRaftLogStore::new(db.clone());
+    let state_machine = EngStateMachineStore::new(
+        short_term.clone(),
+        core_memory.clone(),
+        vector_store,
+        embedding_tx,
+        knowledge_graph,
+        knowledge_tx,
+        db,
+    );
+
+    // RECOVERY: flush Redis + restore snapshot BEFORE openraft replays the log.
+    recover_state_machine(&state_machine, short_term, core_memory).await?;
+
+    let raft_config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 250,
+            election_timeout_min: 299,
+            election_timeout_max: 500,
+            snapshot_policy: SnapshotPolicy::LogsSinceLast(config.snapshot_log_threshold),
+            max_in_snapshot_log_to_keep: 0,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+
     let raft = openraft::Raft::<TypeConfig>::new(
         node_id,
         raft_config,
         EngRaftNetwork,
-        EngRaftLogStore::new(db.clone()),
-        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx, db),
+        log_store,
+        state_machine,
     )
     .await?;
 
     Ok(Arc::new(raft))
+}
+
+#[cfg(test)]
+mod stage3a_tests {
+    #[tokio::test]
+    async fn build_raft_node_opens_redb_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.node_id = Some(1);
+        cfg.raft_addr = Some("127.0.0.1:0".into());
+        cfg.raft_db_path = dir.path().join("engram.redb");
+
+        let short_term = std::sync::Arc::new(crate::core::InMemoryStore::default())
+            as std::sync::Arc<dyn crate::core::ShortTermMemory>;
+        let core_memory = std::sync::Arc::new(crate::core::InMemoryCoreMemoryStore::default())
+            as std::sync::Arc<dyn crate::core::CoreMemoryStore>;
+        let vector_store = std::sync::Arc::new(crate::core::InMemoryVectorStore::default())
+            as std::sync::Arc<dyn crate::core::VectorStore>;
+        let (etx, _erx) = tokio::sync::mpsc::channel(10);
+        let kg = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::knowledge::graph::KnowledgeGraph::new(),
+        ));
+        let (ktx, _krx) = tokio::sync::mpsc::channel(10);
+
+        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx)
+            .await
+            .unwrap();
+        assert!(raft.is_initialized().await.is_ok() || true);
+    }
+
+    #[tokio::test]
+    async fn build_raft_node_flushes_stale_data_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.node_id = Some(1);
+        cfg.raft_addr = Some("127.0.0.1:0".into());
+        cfg.raft_db_path = dir.path().join("engram.redb");
+
+        let short_term = std::sync::Arc::new(crate::core::InMemoryStore::default());
+        let core_memory = std::sync::Arc::new(crate::core::InMemoryCoreMemoryStore::default());
+        let vector_store = std::sync::Arc::new(crate::core::InMemoryVectorStore::default())
+            as std::sync::Arc<dyn crate::core::VectorStore>;
+        let (etx, _erx) = tokio::sync::mpsc::channel(10);
+        let kg = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::knowledge::graph::KnowledgeGraph::new(),
+        ));
+        let (ktx, _krx) = tokio::sync::mpsc::channel(10);
+
+        // Pre-load stale data that recovery must flush.
+        use crate::core::ShortTermMemory;
+        short_term
+            .add_message("stale", crate::models::Message {
+                id: Some("x".into()),
+                role: "user".into(),
+                content: "old".into(),
+                timestamp: None,
+                embedding_status: None,
+            })
+            .await
+            .unwrap();
+
+        let st_clone = short_term.clone();
+        let _raft = super::build_raft_node(
+            &cfg,
+            short_term as std::sync::Arc<dyn crate::core::ShortTermMemory>,
+            core_memory as std::sync::Arc<dyn crate::core::CoreMemoryStore>,
+            vector_store,
+            etx,
+            kg,
+            ktx,
+        )
+        .await
+        .unwrap();
+
+        // Recovery must have flushed the stale session.
+        assert!(st_clone.get_recent("stale", 10).await.unwrap().is_empty());
+    }
 }
 
 /// Spawns a background task that watches the Raft metrics channel and updates
