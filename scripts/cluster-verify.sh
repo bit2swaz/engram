@@ -190,3 +190,149 @@ done
 
 echo ""
 echo "=== All Stage 1 + Stage 2 criteria PASSED ==="
+
+# ---------------------------------------------------------------------------
+# Stage 3A helpers
+# ---------------------------------------------------------------------------
+
+# STAGE3A_SESSION: shared session for all Stage 3A writes.
+STAGE3A_SESSION=""
+
+node_port() {
+    case "$1" in
+        node-1) echo "3000" ;;
+        node-2) echo "3001" ;;
+        node-3) echo "3002" ;;
+        *) echo "3000" ;;
+    esac
+}
+
+find_leader_port() {
+    for p in 3000 3001 3002; do
+        local role
+        role=$(curl -sf "http://localhost:$p/cluster" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+        if [ "$role" = "Leader" ]; then
+            echo "$p"
+            return
+        fi
+    done
+}
+
+wait_for_leader() {
+    local i
+    for i in $(seq 1 30); do
+        local lport
+        lport=$(find_leader_port)
+        [ -n "${lport:-}" ] && return
+        sleep 1
+    done
+    fail "no leader found after 30 seconds"
+}
+
+wait_for_health() {
+    local node=$1
+    local port
+    port=$(node_port "$node")
+    local i
+    for i in $(seq 1 30); do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/health" 2>/dev/null || echo "0")
+        [ "$code" = "200" ] && return
+        sleep 1
+    done
+    fail "$node not healthy after 30 seconds"
+}
+
+entity_count_on() {
+    local node=$1
+    local port
+    port=$(node_port "$node")
+    curl -sf "http://localhost:$port/sessions/$STAGE3A_SESSION/knowledge" 2>/dev/null | \
+        python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "0"
+}
+
+write_message_to_leader() {
+    local content=$1
+    local lport
+    lport=$(find_leader_port)
+    [ -z "${lport:-}" ] && { echo "  WARN: no leader found for write"; return; }
+    curl -sf -X POST "http://localhost:$lport/sessions/$STAGE3A_SESSION/messages" \
+        -H "Content-Type: application/json" \
+        -d "{\"role\":\"user\",\"content\":\"$content\"}" > /dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3A setup: create a dedicated session on the current leader
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Stage 3A: Persistence & Recovery ==="
+echo ""
+
+STAGE3A_LEADER_PORT=$(find_leader_port)
+[ -z "${STAGE3A_LEADER_PORT:-}" ] && fail "no leader for Stage 3A setup"
+STAGE3A_SESSION=$(curl -sf -X POST "http://localhost:$STAGE3A_LEADER_PORT/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+[ -z "${STAGE3A_SESSION:-}" ] && fail "could not create Stage 3A session"
+
+# [7] Single-node restart recovery
+echo "[7] restart recovery..."
+write_message_to_leader "Charlie works at Acme"
+echo "  Waiting 3 seconds for extraction and replication..."
+sleep 3
+ENTITIES_BEFORE=$(entity_count_on node-2)
+docker compose -f docker-compose.cluster.yml restart node-2
+wait_for_health node-2
+sleep 3
+ENTITIES_AFTER=$(entity_count_on node-2)
+[ "$ENTITIES_BEFORE" = "$ENTITIES_AFTER" ] \
+    && pass "node-2 retained $ENTITIES_AFTER entities after restart (was $ENTITIES_BEFORE)" \
+    || fail "[7]: entity count changed after restart ($ENTITIES_BEFORE -> $ENTITIES_AFTER)"
+
+# [8] Snapshot catch-up: wipe a node's raft dir, restart, it catches up
+echo "[8] snapshot catch-up..."
+docker compose -f docker-compose.cluster.yml stop node-3
+docker compose -f docker-compose.cluster.yml run --rm --no-deps --entrypoint sh node-3 -c 'rm -rf /data/raft/*'
+docker compose -f docker-compose.cluster.yml start node-3
+wait_for_health node-3
+sleep 5
+ENTITIES_NODE1=$(entity_count_on node-1)
+ENTITIES_NODE3=$(entity_count_on node-3)
+[ "$ENTITIES_NODE3" = "$ENTITIES_NODE1" ] \
+    && pass "node-3 converged to $ENTITIES_NODE3 entities (matches node-1: $ENTITIES_NODE1)" \
+    || fail "[8]: node-3 has $ENTITIES_NODE3 entities, node-1 has $ENTITIES_NODE1"
+
+# [9] Log compaction: snapshot_last_index metric advances past 0 after threshold is crossed
+echo "[9] log compaction..."
+COMPACTION_LEADER=$(find_leader_port)
+[ -z "${COMPACTION_LEADER:-}" ] && fail "no leader for check [9]"
+echo "  Writing 1100 messages to cross snapshot threshold..."
+for i in $(seq 1 1100); do
+    curl -sf -X POST "http://localhost:$COMPACTION_LEADER/sessions/$STAGE3A_SESSION/messages" \
+        -H "Content-Type: application/json" \
+        -d "{\"role\":\"user\",\"content\":\"msg $i\"}" > /dev/null || true
+done
+echo "  Waiting 5 seconds for snapshot to be built..."
+sleep 5
+LAST_IDX=$(curl -s "http://localhost:3001/metrics" | grep '^engram_snapshot_last_index ' | awk '{print $2}')
+[ "${LAST_IDX:-0}" -gt 0 ] \
+    && pass "snapshot_last_index=$LAST_IDX (log compaction confirmed)" \
+    || fail "[9]: snapshot_last_index=${LAST_IDX:-0} (expected > 0 after 1100 writes)"
+
+# [10] Full cluster recovery: all nodes stop and restart, knowledge survives
+echo "[10] full cluster recovery..."
+write_message_to_leader "Dana knows Eve"
+echo "  Waiting 3 seconds for replication..."
+sleep 3
+ALL_BEFORE=$(entity_count_on node-1)
+docker compose -f docker-compose.cluster.yml stop node-1 node-2 node-3
+docker compose -f docker-compose.cluster.yml start node-1 node-2 node-3
+wait_for_leader
+sleep 5
+ALL_AFTER=$(entity_count_on node-1)
+[ "$ALL_AFTER" = "$ALL_BEFORE" ] \
+    && pass "full cluster recovery: $ALL_AFTER entities survived (was $ALL_BEFORE)" \
+    || fail "[10]: entity count changed after full cluster restart ($ALL_BEFORE -> $ALL_AFTER)"
+
+echo ""
+echo "=== All Stage 3A criteria PASSED ==="

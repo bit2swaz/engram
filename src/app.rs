@@ -198,6 +198,9 @@ pub fn spawn_raft_metrics_watcher(
                 metrics.raft_leader_changes_total.inc();
                 last_leader = m.current_leader;
             }
+            if let Some(snap) = &m.snapshot {
+                metrics.set_snapshot_last_index(snap.index);
+            }
         }
     });
 }

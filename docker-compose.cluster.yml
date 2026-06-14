@@ -24,6 +24,8 @@ services:
       CLUSTER_HTTP_PEERS: "2:node-2:3000,3:node-3:3000"
       REDIS_URL: "redis://redis-1:6379"
       LANCE_DB_PATH: "/data/lancedb"
+      RAFT_DB_PATH: "/data/raft/engram.redb"
+      SNAPSHOT_LOG_THRESHOLD: "${SNAPSHOT_LOG_THRESHOLD:-1000}"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
@@ -32,7 +34,9 @@ services:
       - "3000:3000"
       - "9001:9001"
     depends_on: [redis-1]
-    volumes: [lancedb-1:/data/lancedb]
+    volumes:
+      - lancedb-1:/data/lancedb
+      - node_1_raft:/data/raft
     networks: [engram-cluster]
 
   node-2:
@@ -45,6 +49,8 @@ services:
       CLUSTER_HTTP_PEERS: "1:node-1:3000,3:node-3:3000"
       REDIS_URL: "redis://redis-2:6379"
       LANCE_DB_PATH: "/data/lancedb"
+      RAFT_DB_PATH: "/data/raft/engram.redb"
+      SNAPSHOT_LOG_THRESHOLD: "${SNAPSHOT_LOG_THRESHOLD:-1000}"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
@@ -53,7 +59,9 @@ services:
       - "3001:3000"
       - "9002:9001"
     depends_on: [redis-2]
-    volumes: [lancedb-2:/data/lancedb]
+    volumes:
+      - lancedb-2:/data/lancedb
+      - node_2_raft:/data/raft
     networks: [engram-cluster]
 
   node-3:
@@ -66,6 +74,8 @@ services:
       CLUSTER_HTTP_PEERS: "1:node-1:3000,2:node-2:3000"
       REDIS_URL: "redis://redis-3:6379"
       LANCE_DB_PATH: "/data/lancedb"
+      RAFT_DB_PATH: "/data/raft/engram.redb"
+      SNAPSHOT_LOG_THRESHOLD: "${SNAPSHOT_LOG_THRESHOLD:-1000}"
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
@@ -74,13 +84,18 @@ services:
       - "3002:3000"
       - "9003:9001"
     depends_on: [redis-3]
-    volumes: [lancedb-3:/data/lancedb]
+    volumes:
+      - lancedb-3:/data/lancedb
+      - node_3_raft:/data/raft
     networks: [engram-cluster]
 
 volumes:
   lancedb-1:
   lancedb-2:
   lancedb-3:
+  node_1_raft:
+  node_2_raft:
+  node_3_raft:
 
 networks:
   engram-cluster:
