@@ -209,10 +209,58 @@ impl Default for KnowledgeGraph {
     fn default() -> Self { Self::new() }
 }
 
-/// Portable snapshot of the knowledge graph for inclusion in Raft snapshots.
-/// Expanded in Task 6 with full entity/relationship serialization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GraphSnapshot;
+pub struct SessionGraphSnapshot {
+    pub session_id: String,
+    pub entities: Vec<Entity>,
+    pub relationships: Vec<Relationship>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphSnapshot {
+    pub sessions: Vec<SessionGraphSnapshot>,
+    /// Dedup keys ("session_id\x00message_id") so re-applied commands stay idempotent.
+    pub processed: Vec<String>,
+}
+
+impl KnowledgeGraph {
+    pub fn session_ids(&self) -> Vec<String> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    pub fn to_snapshot(&self) -> GraphSnapshot {
+        let sessions = self
+            .sessions
+            .keys()
+            .map(|sid| SessionGraphSnapshot {
+                session_id: sid.clone(),
+                entities: self.all_entities(sid),
+                relationships: self.all_relationships(sid),
+            })
+            .collect();
+        GraphSnapshot {
+            sessions,
+            processed: self.processed.iter().cloned().collect(),
+        }
+    }
+
+    pub fn from_snapshot(snap: GraphSnapshot) -> Self {
+        let mut kg = KnowledgeGraph::new();
+        for s in snap.sessions {
+            let session = kg.sessions.entry(s.session_id.clone()).or_insert_with(SessionGraph::new);
+            for e in &s.entities {
+                session.ensure_entity(&e.name, &e.entity_type, e.attributes.clone());
+            }
+            for r in &s.relationships {
+                let from = session.ensure_entity(&r.from, "Other", HashMap::new());
+                let to = session.ensure_entity(&r.to, "Other", HashMap::new());
+                session.graph.add_edge(from, to, RelEdge { relationship_type: r.relationship_type.clone() });
+            }
+        }
+        kg.processed = snap.processed.into_iter().collect();
+        kg
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -331,5 +379,36 @@ mod tests {
         let mut kg = KnowledgeGraph::new();
         kg.apply_extraction("s1", "m1", vec![entity("Alice","Person")], vec![]);
         assert!(kg.all_entities("s2").is_empty());
+    }
+
+    #[test]
+    fn graph_snapshot_round_trips_entities_relationships_and_dedup() {
+        let mut kg = KnowledgeGraph::new();
+        kg.apply_extraction("s1", "m1",
+            vec![entity("Alice","Person"), entity("OpenAI","Organization")],
+            vec![rel("Alice","OpenAI","works_at")]);
+        kg.apply_extraction("s2", "m9", vec![entity("Bob","Person")], vec![]);
+
+        let snap = kg.to_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back_snap: GraphSnapshot = serde_json::from_str(&json).unwrap();
+
+        let restored = KnowledgeGraph::from_snapshot(back_snap);
+        assert_eq!(restored.all_entities("s1").len(), 2);
+        assert_eq!(restored.all_relationships("s1").len(), 1);
+        assert_eq!(restored.all_entities("s2").len(), 1);
+        assert!(restored.is_processed("s1", "m1"));
+    }
+
+    #[test]
+    fn restored_graph_answers_capability_queries() {
+        let mut kg = KnowledgeGraph::new();
+        kg.apply_extraction("s1", "m1",
+            vec![entity("Alice","Person"), entity("Bob","Person")],
+            vec![rel("Alice","Bob","knows")]);
+        let restored = KnowledgeGraph::from_snapshot(kg.to_snapshot());
+        let path = restored.find_path("s1", "Alice", "Bob").unwrap();
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].relationship_type, "knows");
     }
 }
