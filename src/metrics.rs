@@ -22,6 +22,9 @@ pub struct AppMetrics {
     knowledge_entities_extracted_total: IntCounter,
     knowledge_relationships_extracted_total: IntCounter,
     knowledge_queue_size: IntGauge,
+    snapshot_build_total: IntCounter,
+    snapshot_install_total: IntCounter,
+    snapshot_last_index: IntGauge,
 }
 
 impl AppMetrics {
@@ -127,6 +130,24 @@ impl AppMetrics {
         ))?;
         registry.register(Box::new(knowledge_queue_size.clone()))?;
 
+        let snapshot_build_total = IntCounter::with_opts(Opts::new(
+            "snapshot_build_total",
+            "Total Raft snapshots built on this node.",
+        ))?;
+        registry.register(Box::new(snapshot_build_total.clone()))?;
+
+        let snapshot_install_total = IntCounter::with_opts(Opts::new(
+            "snapshot_install_total",
+            "Total Raft snapshots installed on this node.",
+        ))?;
+        registry.register(Box::new(snapshot_install_total.clone()))?;
+
+        let snapshot_last_index = IntGauge::with_opts(Opts::new(
+            "snapshot_last_index",
+            "Log index of the most recent snapshot.",
+        ))?;
+        registry.register(Box::new(snapshot_last_index.clone()))?;
+
         Ok(Self {
             registry,
             messages_added_total,
@@ -143,6 +164,9 @@ impl AppMetrics {
             knowledge_entities_extracted_total,
             knowledge_relationships_extracted_total,
             knowledge_queue_size,
+            snapshot_build_total,
+            snapshot_install_total,
+            snapshot_last_index,
         })
     }
 
@@ -208,6 +232,18 @@ impl AppMetrics {
         self.knowledge_queue_size.set(size as i64);
     }
 
+    pub fn increment_snapshot_build(&self) {
+        self.snapshot_build_total.inc();
+    }
+
+    pub fn increment_snapshot_install(&self) {
+        self.snapshot_install_total.inc();
+    }
+
+    pub fn set_snapshot_last_index(&self, index: u64) {
+        self.snapshot_last_index.set(index as i64);
+    }
+
     pub fn render(&self) -> Result<String, String> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();
@@ -216,5 +252,22 @@ impl AppMetrics {
             .map_err(|error| error.to_string())?;
 
         String::from_utf8(buffer).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_snapshot_metrics() {
+        let metrics = AppMetrics::new().unwrap();
+        metrics.increment_snapshot_build();
+        metrics.increment_snapshot_install();
+        metrics.set_snapshot_last_index(42);
+        let text = metrics.render().unwrap();
+        assert!(text.contains("engram_snapshot_build_total"));
+        assert!(text.contains("engram_snapshot_install_total"));
+        assert!(text.contains("engram_snapshot_last_index"));
     }
 }
