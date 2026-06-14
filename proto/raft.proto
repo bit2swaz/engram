@@ -62,12 +62,28 @@ message AppendEntriesResponse {
   LogId last_log_id = 3;
 }
 
+// ---- InstallSnapshot RPC ----
+//
+// Snapshot meta is JSON-serialized openraft SnapshotMeta<u64, BasicNode>.
+// Stage 3A transmits the snapshot in a single chunk (done = true); the chunked
+// fields (offset/done) are kept for protocol compatibility with openraft.
+
+message InstallSnapshotRequest {
+  Vote   vote      = 1;
+  bytes  meta      = 2;  // JSON SnapshotMeta
+  uint64 offset    = 3;
+  bytes  data      = 4;  // snapshot payload chunk
+  bool   done      = 5;
+}
+
+message InstallSnapshotResponse {
+  Vote vote = 1;
+}
+
 // ---- Service ----
 
-// InstallSnapshot is intentionally omitted from Stage 1.
-// Nodes that fall too far behind must be manually removed and re-added to the cluster.
-// Stage 2 will add log compaction and the InstallSnapshot RPC.
 service RaftService {
   rpc Vote(VoteRequest) returns (VoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
