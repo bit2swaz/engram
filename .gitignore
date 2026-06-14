@@ -10,6 +10,7 @@ data/raft/
 tools/__pycache__/
 CLAUDE.md
 *PLAN.md
+LESSONS.md
 
 # Added by cargo
 

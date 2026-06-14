@@ -314,16 +314,23 @@ for i in $(seq 1 1100); do
 done
 echo "  Waiting 5 seconds for snapshot to be built..."
 sleep 5
-LAST_IDX=$(curl -s "http://localhost:3001/metrics" | grep '^engram_snapshot_last_index ' | awk '{print $2}')
+# Check the leader's metric — only the snapshot-building node (leader) has snapshot_last_index > 0.
+SNAP_LEADER=$(find_leader_port)
+LAST_IDX=$(curl -s "http://localhost:$SNAP_LEADER/metrics" | grep '^engram_snapshot_last_index ' | awk '{print $2}')
 [ "${LAST_IDX:-0}" -gt 0 ] \
     && pass "snapshot_last_index=$LAST_IDX (log compaction confirmed)" \
     || fail "[9]: snapshot_last_index=${LAST_IDX:-0} (expected > 0 after 1100 writes)"
 
 # [10] Full cluster recovery: all nodes stop and restart, knowledge survives
 echo "[10] full cluster recovery..."
+BEFORE_WRITE=$(entity_count_on node-1)
 write_message_to_leader "Dana knows Eve"
-echo "  Waiting 3 seconds for replication..."
-sleep 3
+echo "  Waiting for extraction + replication to complete..."
+for _i in $(seq 1 20); do
+    sleep 1
+    NEW_COUNT=$(entity_count_on node-1)
+    [ "$NEW_COUNT" -gt "$BEFORE_WRITE" ] && break
+done
 ALL_BEFORE=$(entity_count_on node-1)
 docker compose -f docker-compose.cluster.yml stop node-1 node-2 node-3
 docker compose -f docker-compose.cluster.yml start node-1 node-2 node-3
