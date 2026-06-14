@@ -31,10 +31,13 @@ graph TD
     corememhandler -->|write| raft
     sessionhandler -->|delete| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
+    raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
     raft -->|embedding job| embedqueue["embedding worker pool<br/>bounded channel"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool<br/>bounded channel"]
+    raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
+    redb -.->|"startup recovery"| raft
 
     shortterm --> redis[("redis<br/>volatile, fast")]
     shortterm --> inmem["in-memory store<br/>test fallback"]
@@ -193,6 +196,8 @@ the application reads configuration from environment variables:
 | RAFT_ADVERTISE_ADDR   | address other nodes route to (required when binding 0.0.0.0)            | `node-1:9001`                     |
 | CLUSTER_PEERS         | comma-separated gRPC peers as `id:host:port`                             | `2:node-2:9001,3:node-3:9001`     |
 | CLUSTER_HTTP_PEERS    | comma-separated HTTP peers as `id:host:port` (for leader redirect URLs)  | `2:node-2:3000,3:node-3:3000`     |
+| RAFT_DB_PATH          | path to the redb file for the persistent Raft log and snapshot store     | `./data/raft/engram.redb`         |
+| SNAPSHOT_LOG_THRESHOLD| number of committed log entries after which the leader compacts the log  | `1000`                            |
 
 values like `similarity_threshold` and `max_tokens` are controlled per request through query parameters on the context endpoint.
 
@@ -206,14 +211,19 @@ values like `similarity_threshold` and `max_tokens` are controlled per request t
 - background embedding worker (bounded channel, configurable concurrency)
 - idempotent message ingestion
 - knowledge graph extraction (entities + relationships via OpenAI GPT-4o-mini or mock)
-- per-session in-memory knowledge graph with BFS path-finding
+- per-session knowledge graph with BFS path-finding, persisted via snapshots
 - leader-only extraction with Raft-replicated `AddKnowledge` command (all nodes stay consistent)
 - knowledge graph export (JSON and Graphviz DOT)
-- Prometheus metrics endpoint (includes knowledge extraction metrics)
+- Prometheus metrics endpoint (includes knowledge and snapshot metrics)
 - Raft consensus for fault-tolerant distributed writes (OpenRaft 0.9)
-- gRPC inter-node transport for Raft (Vote + AppendEntries via tonic 0.12)
+- gRPC inter-node transport for Raft (Vote, AppendEntries, and InstallSnapshot via tonic 0.12)
 - follower-to-leader HTTP redirect (307) in cluster mode
 - per-node LanceDB with eventual consistency via deterministic embeddings
+- persistent redb-backed Raft log and snapshot store (survives restarts)
+- full state machine snapshots covering short-term memory, core memory, and knowledge graph
+- startup recovery from the latest snapshot followed by Raft log replay
+- InstallSnapshot RPC so lagging followers catch up without manual re-initialization
+- automatic log compaction after every `SNAPSHOT_LOG_THRESHOLD` committed entries
 - cluster management REST API
 - OpenAPI docs and Swagger UI
 - LongMemEval and BEAM benchmark harnesses
@@ -236,7 +246,7 @@ docker compose -f docker-compose.cluster.yml up -d --build
 ./scripts/cluster-verify.sh
 ```
 
-the verify script checks: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication across nodes, and delete-session cleanup. it exits 0 only if all criteria pass.
+the verify script checks 10 criteria: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication, delete-session cleanup, node restart and recovery from the Raft log, snapshot compaction, and restart-then-verify that state is fully restored from the latest snapshot. it exits 0 only if all criteria pass.
 
 see `docker-compose.cluster.yml` and the scripts in `scripts/` for details.
 

@@ -111,6 +111,23 @@ The project serves two purposes:
 4. Delete-session clears the knowledge graph on all nodes
 5. Prometheus metrics `engram_knowledge_*` are present in `/metrics` output
 
+### Stage 3A: Persistence and recovery ✅ **(Completed)**
+- `EngRaftLogStore` replaced with a redb v2-backed persistent store; Raft log and snapshot table survive process restarts
+- `EngSnapshotBuilder` serializes the full state machine (short-term memory, core memory, knowledge graph) into an `EngramSnapshot` payload stored in redb
+- `recover_state_machine()` runs at startup: flushes Redis, loads the latest persisted snapshot, restores all stores, advances `last_applied` and `last_membership` so OpenRaft can replay the log tail
+- `EngRaftNetworkConnection.send_install_snapshot` fully implemented; lagging followers receive the snapshot over gRPC and restore without manual re-initialization
+- `loosen-follower-log-revert` openraft feature flag enabled; required when a snapshot install would revert a follower's log past entries from a previous term
+- Automatic log compaction after every `SNAPSHOT_LOG_THRESHOLD` committed entries (default 1000)
+- 3 new snapshot Prometheus metrics: `engram_snapshot_build_total`, `engram_snapshot_install_total`, `engram_snapshot_last_index`
+- 2 new cluster environment variables: `RAFT_DB_PATH` and `SNAPSHOT_LOG_THRESHOLD`
+- 169 tests passing; all 10 cluster-verify acceptance criteria pass
+
+**Completion criteria (all pass in Docker Compose):**
+1. Node restart: a node wiped and restarted catches up to the cluster without manual re-initialization
+2. Snapshot compaction: after enough writes, the leader builds a snapshot; `engram_snapshot_last_index` is non-zero on the leader
+3. Install snapshot: a follower wiped after compaction catches up via InstallSnapshot, not full log replay
+4. Full restart recovery: all three nodes stopped and restarted; state is fully restored from the latest snapshot
+
 ---
 
 ## 3. System Architecture (High-Level)
@@ -367,9 +384,10 @@ _All endpoints verified against API.md and server.rs._
 
 - **Phase 0:** ✅ Completed
 - **Phase 1:** ✅ Completed
-- **Phase 2:** ⚠️ Incomplete, only OpenAPI spec generation is implemented; other items are future work.
-- **Stage 1 (Distributed Memory):** ✅ Completed — 3-node Raft cluster, gRPC transport, follower redirect, failover, cluster observability. All five acceptance criteria pass.
-- **Stage 2 (Knowledge Formation):** ✅ Completed — entity/relationship extraction, petgraph-backed per-session knowledge graph, leader-only extraction with Raft-replicated `AddKnowledge`, knowledge REST endpoints, graph export, 4 new Prometheus metrics, configurable extractor, 146 tests pass.
+- **Phase 2:** ⚠️ Incomplete; only OpenAPI spec generation is implemented. Other items are future work.
+- **Stage 1 (Distributed Memory):** ✅ Completed. 3-node Raft cluster, gRPC transport, follower redirect, failover, cluster observability. All five acceptance criteria pass.
+- **Stage 2 (Knowledge Formation):** ✅ Completed. Entity/relationship extraction, petgraph-backed per-session knowledge graph, leader-only extraction with Raft-replicated `AddKnowledge`, knowledge REST endpoints, graph export, 4 new Prometheus metrics, configurable extractor, 146 tests pass.
+- **Stage 3A (Persistence and Recovery):** ✅ Completed. redb-backed persistent Raft log and snapshot store, full state machine snapshots, startup recovery, InstallSnapshot over gRPC, automatic log compaction, 3 new snapshot Prometheus metrics, 169 tests pass. All 10 cluster-verify criteria pass.
 
 ---
 If any future changes are made to traits, endpoints, or architecture, update this SSOT accordingly.
@@ -549,6 +567,8 @@ services:
 - `RAFT_ADVERTISE_ADDR` — address other nodes route to; required when binding `0.0.0.0` (e.g. `node-1:9001`)
 - `CLUSTER_PEERS` — comma-separated gRPC peers as `id:host:port` (e.g. `2:node-2:9001,3:node-3:9001`)
 - `CLUSTER_HTTP_PEERS` — comma-separated HTTP peers as `id:host:port`, used for leader redirect URLs
+- `RAFT_DB_PATH` — path to the redb file for the persistent Raft log and snapshot store (default `./data/raft/engram.redb`)
+- `SNAPSHOT_LOG_THRESHOLD` — number of committed log entries after which the leader builds a new snapshot (default `1000`)
 
 Per-request context settings such as `max_tokens`, `similarity_threshold`, and `long_term_top_k` are currently controlled through query parameters on the context endpoint rather than startup environment variables.
 
@@ -575,6 +595,11 @@ Per-request context settings such as `max_tokens`, `similarity_threshold`, and `
 - `engram_knowledge_entities_extracted_total` — cumulative entities extracted (counter)
 - `engram_knowledge_relationships_extracted_total` — cumulative relationships extracted (counter)
 - `engram_knowledge_queue_size` — pending knowledge jobs (gauge)
+
+**Snapshot metrics** (Stage 3A, cluster mode):
+- `engram_snapshot_build_total` — number of snapshots built by this node (counter)
+- `engram_snapshot_install_total` — number of snapshots installed from the leader (counter)
+- `engram_snapshot_last_index` — log index of the most recent snapshot; 0 if none exists (gauge)
 
 ### 10.2 Tracing
 - Each request gets a span.

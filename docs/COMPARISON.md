@@ -6,14 +6,14 @@
 |------------------------------- |:--------------:|:-------------:|:-------------:|:----------------:|:---------------------:|
 | **Language**                   | Rust           | Python        | Python        | Python           | Go                    |
 | **Deployment model**           | Single binary, Docker | Docker, cloud, pip | pip, Docker, cloud | pip, cloud           | Docker, cloud         |
-| **Fault-tolerant cluster**     | Yes (3-node Raft, OpenRaft 0.9) | No | No | No | ? |
+| **Fault-tolerant cluster**     | Yes (3-node Raft, OpenRaft 0.9, persistent log + snapshots, startup recovery) | No | No | No | ? |
 | **Embedding flexibility**      | Yes (trait, BYO) | Yes (BYO, OpenAI, Cohere, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) |
 | **Context visibility**         | Full (exact prompt shown) | Partial (debug endpoint) | Partial | Partial (depends on chain) | ? |
 | **Token budget control**       | Yes (per request) | Yes (configurable) | Yes (configurable) | Partial (depends on chain) | ? |
 | **Trimming strategy**          | Pair-preserving | Naive/Configurable | Naive | Naive | ? |
 | **Memory types**               | Short-term, long-term, core, knowledge graph | Short, long, episodic | Short, long | Short, long, summary | Short, long, KG? |
 | **Retrieval method**           | Semantic search, knowledge graph traversal | Semantic, BM25, hybrid | Semantic, hybrid | Semantic, retriever chain | Semantic, hybrid, KG |
-| **Knowledge graph**            | Yes (Stage 2, in-memory, petgraph) | No | No | No | Yes |
+| **Knowledge graph**            | Yes (petgraph, per-session, persisted via snapshots) | No | No | No | Yes |
 | **Idempotency / deduplication**| Yes (message_id, status) | Yes (message_id) | Partial | No | ? |
 | **Observability**              | Prometheus, tracing | Prometheus, logs | Logs | No (manual) | Prometheus, logs |
 | **Background processing**      | Async worker, bounded queue | Async worker | Async | No | Async worker |
@@ -54,13 +54,13 @@ On the currently published numbers, engram's in-memory context assembly path is 
 - **Transparency:** Developers can inspect the exact assembled context returned by the API rather than relying on hidden chain state.
 - **Rust performance:** High concurrency, low memory overhead, and strong type safety.
 - **Single-binary deployment:** Easy to run locally or in production; Docker and Compose supported.
+- **Durability:** The Raft log, snapshots, and full state machine (including the knowledge graph) survive node restarts via the redb-backed persistent store and startup recovery.
 - **Pair-preserving trim:** Prevents broken dialogue, a common source of LLM hallucination in naive memory engines.
 - **Idempotent workers:** Message ingestion and embedding are robust to retries and crashes.
-- **Observability:** Prometheus metrics and structured tracing from day one.
+- **Observability:** Prometheus metrics and structured tracing from day one; snapshot build and install metrics included.
 - **Token budget control:** Every context assembly is budgeted per request, not just globally.
 
 **Where engram falls short today:**
-- **Knowledge graph is in-memory only:** The Stage 2 knowledge graph is per-session and does not survive restarts. Persistent graph storage is planned for a future stage.
 - **No KG-augmented retrieval yet:** The knowledge graph is queryable via REST but is not yet integrated into the context assembly pipeline to augment semantic search results.
 - **No managed cloud offering:** Self-hosted only; no SaaS or managed tier.
 - **Smaller community:** Newer and less widely adopted than Zep or LangChain.

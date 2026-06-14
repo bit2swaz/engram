@@ -29,10 +29,13 @@ graph TD
     corememhandler -->|write| raft
     sessionhandler -->|delete| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
+    raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory (trait)"]
     raft -->|state machine apply| coremem["core memory store (trait)"]
     raft -->|embedding job| embedqueue["embedding worker pool (bounded channel)"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool (bounded channel)"]
+    raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
+    redb -.->|"startup recovery"| raft
 
     shortterm --> redis[("redis")]
     shortterm --> inmem["in-memory store (test fallback)"]
@@ -94,8 +97,10 @@ All major components are behind trait abstractions, which lets implementations b
 | observability from day 1 | add later | tracing and Prometheus from the start for reliability and debugging |
 | leader-only extraction for knowledge | all nodes extract | one LLM call per message vs N (one per node); non-determinism in extraction would cause divergent graphs across nodes |
 | AddKnowledge routed through Raft | apply directly on leader | ensures all nodes receive the same extraction result; graph stays consistent without extra sync |
-| in-memory knowledge graph per session | persistent DB | Stage 2 scope; fast, simple, no operational overhead; per-session isolation maps naturally to HashMap |
+| knowledge graph snapshotted with full state | separate persistent store | keeps snapshot boundary clean; a single lock held across all `dump_all` calls guarantees the snapshot reflects exactly one `last_applied` index |
 | MockKnowledgeExtractor as default in Docker Compose | always OpenAI | decouples cluster verification from OpenAI API quota; pattern-matching mock is deterministic and offline-capable |
+| redb v2 for Raft log and snapshot store | sled, RocksDB, file-based log | redb is pure Rust, ACID, embedded, and simple to use; the key constraint is that tables must be pre-created in a write transaction before any read transaction touches them on a fresh database |
+| Redis as a projection, not the source of truth | reconcile Redis with Raft log on recovery | flushing Redis unconditionally on startup and restoring from the snapshot avoids a maze of reconciliation edge cases; one authoritative source (Raft log plus latest snapshot) with all volatile state derived from it |
 
 ## Context assembly algorithm
 
@@ -139,10 +144,10 @@ In standalone mode (no `NODE_ID`) the worker applies the extraction result direc
 `KnowledgeGraph` is a per-session directed graph backed by [`petgraph`](https://docs.rs/petgraph). Each session has its own `DiGraph<EntityNode, RelEdge>` plus a `HashMap<String, NodeIndex>` for O(1) name lookups. Deduplication is tracked in a `HashSet<String>` keyed on `"session_id\x00message_id"`.
 
 Key operations:
-- `apply_extraction` — upserts entities and adds edges; returns `false` if the `(session_id, message_id)` pair was already processed.
-- `get_related` — returns all neighbours (incoming and outgoing) for a named entity.
-- `find_path` — BFS shortest path following outgoing edges only; returns a `Vec<PathEdge>` or `None`.
-- `delete_session` — removes the session graph and all its dedup keys.
+- `apply_extraction`: upserts entities and adds edges; returns `false` if the `(session_id, message_id)` pair was already processed.
+- `get_related`: returns all neighbours (incoming and outgoing) for a named entity.
+- `find_path`: BFS shortest path following outgoing edges only; returns a `Vec<PathEdge>` or `None`.
+- `delete_session`: removes the session graph and all its dedup keys.
 
 ### Knowledge REST endpoints
 
@@ -191,6 +196,7 @@ In cluster mode, every write goes through Raft before a response is returned:
 flowchart TD
     client["client"]
     follower["follower\nhttp :3000 / grpc :9001"]
+    lagging["lagging follower\nhttp :3000 / grpc :9001"]
     leader["leader\nhttp :3000 / grpc :9001"]
     r1["node 1 redis"]
     r2["node 2 redis"]
@@ -198,16 +204,23 @@ flowchart TD
     l1["node 1 lancedb"]
     l2["node 2 lancedb"]
     l3["node 3 lancedb"]
+    db1["node 1 redb\nraft log + snapshots"]
+    db2["node 2 redb\nraft log + snapshots"]
+    db3["node 3 redb\nraft log + snapshots"]
 
     client -->|"write to follower"| follower
     follower -->|"307 redirect"| client
     client -->|"write to leader"| leader
-    leader -->|"raft append entries (grpc)"| r1
-    leader -->|"raft append entries (grpc)"| r2
-    leader -->|"raft append entries (grpc)"| r3
+    leader -->|"append entries (grpc)"| r1
+    leader -->|"append entries (grpc)"| r2
+    leader -->|"install snapshot (grpc)"| lagging
+    lagging -->|"restore from snapshot"| r3
+    lagging --> db3
     r1 -.->|"embed async"| l1
     r2 -.->|"embed async"| l2
     r3 -.->|"embed async"| l3
+    leader --> db1
+    r2 -.-> db2
 ```
 
 The cluster also exposes management endpoints at `/cluster`, `/cluster/init`, `/cluster/add-learner`, and `/cluster/change-membership`.
@@ -222,19 +235,21 @@ OpenAI text embeddings are deterministic for the same input. All nodes converge 
 
 | component | description |
 |-----------|-------------|
-| `EngRaftLogStore` | in-memory BTreeMap log store, implements `RaftLogStorage + RaftLogReader` |
-| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis and the `KnowledgeGraph`; snapshot methods return `Unsupported` |
+| `EngRaftLogStore` | redb-backed persistent log store; implements `RaftLogStorage + RaftLogReader`; pre-creates tables on init so read transactions never fail on a fresh database |
+| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis and the knowledge graph; hosts `EngSnapshotBuilder`, which serializes the full state to an `EngramSnapshot` payload and persists it in redb |
 | `EngRaftNetwork` | factory that creates per-peer gRPC connections using tonic channels |
-| `EngRaftNetworkConnection` | sends Vote and AppendEntries RPCs; `send_install_snapshot` returns `Unreachable` |
-| `RaftGrpcServer` | tonic service implementation that forwards incoming Raft RPCs to the local `RaftHandle` |
+| `EngRaftNetworkConnection` | sends Vote, AppendEntries, and InstallSnapshot RPCs over gRPC; the snapshot payload is a serialized `EngramSnapshot` |
+| `RaftGrpcServer` | tonic service that forwards incoming Raft RPCs to the local `RaftHandle`; handles `InstallSnapshotRequest` so lagging followers can restore a leader snapshot over gRPC |
 
-`MemoryCommand` has four variants: `AddMessage`, `AddFact`, `DeleteSession`, and `AddKnowledge`. `AddMessage` now also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
+`MemoryCommand` has four variants: `AddMessage`, `AddFact`, `DeleteSession`, and `AddKnowledge`. `AddMessage` also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
 
-The log store is in-memory. It does not survive restarts. Stage 2 will replace it with a persistent store (sled or RocksDB).
+`EngramSnapshot` is the versioned payload serialized into every snapshot. It contains `short_term`, `core_memory`, `knowledge_graph`, and a reserved `global_graph` field. Adding `version: 1` and `#[serde(default)]` on optional fields means future stages can extend the payload without breaking existing snapshots.
+
+`recover_state_machine()` in `src/raft/recovery.rs` runs at node startup before Raft is initialized. It flushes Redis, loads the latest persisted snapshot from redb, restores the payload into the live stores, and advances `last_applied` and `last_membership`. OpenRaft then replays any committed log entries that sit past the snapshot index.
 
 ### Prometheus metrics in cluster mode
 
-Four additional metrics are exported when a node is in cluster mode:
+Seven metrics are exported when a node is in cluster mode. Four cover the Raft consensus state, and three cover the snapshot subsystem:
 
 | metric | type | description |
 |--------|------|-------------|
@@ -242,8 +257,11 @@ Four additional metrics are exported when a node is in cluster mode:
 | `engram_raft_commit_index` | gauge | index of the last applied log entry |
 | `engram_raft_is_leader` | gauge | 1 if this node is the current leader, 0 otherwise |
 | `engram_raft_leader_changes_total` | counter | number of leader changes observed by this node |
+| `engram_snapshot_build_total` | counter | number of snapshots built by this node |
+| `engram_snapshot_install_total` | counter | number of snapshots installed from the leader |
+| `engram_snapshot_last_index` | gauge | log index of the most recent snapshot; 0 if no snapshot exists |
 
-A background task watches the OpenRaft metrics channel and updates these gauges on every change.
+A background task watches the OpenRaft metrics channel and updates all seven gauges and counters on every change.
 
 ### Knowledge metrics (all modes)
 
@@ -256,12 +274,49 @@ Four additional metrics cover the knowledge extraction pipeline and are emitted 
 | `engram_knowledge_relationships_extracted_total` | counter | cumulative relationships extracted |
 | `engram_knowledge_queue_size` | gauge | pending jobs in the knowledge worker channel |
 
-### Stage 3+ deferred items
+## Stage 3A: Persistence and recovery
 
-The following remain out of scope after Stage 2:
+Stage 3A replaced the in-memory Raft log store with a persistent redb-backed store, implemented full state machine snapshots, and added startup recovery. A cluster can now survive complete restarts without losing committed state, and lagging followers can catch up via snapshot install rather than requiring manual re-initialization.
 
-- **Log snapshotting.** Nodes that fall too far behind the log cannot rejoin automatically. They must be manually removed and re-added. A future stage will implement `RaftSnapshotBuilder` and `install_snapshot`.
-- **Persistent log store.** Restarting a node clears its Raft log. A future stage replaces the in-memory BTreeMap with sled or RocksDB.
-- **LanceDB replication.** Each node still calls the embedding API independently. A future stage will route vector storage through Raft so only the leader calls OpenAI, then replicates the embedding payload to followers, eliminating redundant API calls at scale.
-- **Persistent knowledge graph.** The knowledge graph is in-memory and lost on restart. A future stage will persist it via Raft snapshots or a dedicated embedded store.
+### Snapshot architecture
+
+The leader builds a snapshot by serializing the entire state machine under the `SmInner` lock. Holding the lock continuously across all `dump_all` calls (short-term memory, core memory, knowledge graph) guarantees that the snapshot represents exactly the state at `last_applied` index N rather than a mix of states from different moments.
+
+The snapshot payload is `EngramSnapshot`: a versioned struct with `version: 1`, three store snapshots, and a reserved `global_graph` field marked `#[serde(default)]` so Stage 3B can add it without breaking existing snapshots.
+
+Snapshots are stored in redb in the same database file as the Raft log (`RAFT_DB_PATH`). Log compaction runs automatically when the number of committed entries since the last snapshot exceeds `SNAPSHOT_LOG_THRESHOLD` (default 1000).
+
+### Recovery sequence
+
+At startup, before OpenRaft is initialized, `recover_state_machine()` runs:
+
+1. Flush Redis completely. This is unconditional; Redis is always treated as a projection, never as a source of truth.
+2. Load the latest `EngramSnapshot` from the redb snapshot table.
+3. Restore `short_term`, `core_memory`, and `knowledge_graph` from the snapshot payload.
+4. Set `last_applied` and `last_membership` so OpenRaft knows where the state machine is.
+5. OpenRaft reads the persistent log and replays any committed entries past the snapshot index.
+
+If no snapshot exists (fresh node), the flush still runs, and OpenRaft starts from index 0.
+
+### InstallSnapshot
+
+When a follower falls too far behind the leader's log, OpenRaft triggers the `InstallSnapshot` path. The leader serializes the current `EngramSnapshot`, sends it over gRPC via `send_install_snapshot`, and the follower's `RaftGrpcServer` handler restores the payload: flush Redis, restore stores, update `last_applied` and `last_membership`. The `loosen-follower-log-revert` openraft feature flag is required; without it, openraft panics when a snapshot install would revert a follower's log past entries from a previous term.
+
+### Snapshot metrics
+
+Three Prometheus metrics are exported in cluster mode alongside the existing Raft metrics:
+
+| metric | type | description |
+|--------|------|-------------|
+| `engram_snapshot_build_total` | counter | number of snapshots built by this node |
+| `engram_snapshot_install_total` | counter | number of snapshots installed (received from leader) |
+| `engram_snapshot_last_index` | gauge | log index of the most recent snapshot; 0 if no snapshot exists |
+
+`engram_snapshot_last_index` is updated from the OpenRaft `RaftMetrics.snapshot` field in the background metrics watcher task in `app.rs`.
+
+## Deferred items
+
+The following remain out of scope after Stage 3A:
+
+- **LanceDB replication.** Each node still calls the embedding API independently. Routing vector storage through Raft (leader-only embedding, follower payload replication) is a future item.
 - **Multi-tenant auth.** Cluster-aware authentication routing.

@@ -19,3 +19,4 @@ Current status:
 - LongMemEval data must be downloaded separately before running the harness.
 - Retrieval-only benchmark slices can also run against the bundled local OpenAI-compatible embedding helper in `tools/local_embed_server.py`.
 - BEAM supports the repository-style `chats/100K`, `chats/500K`, and `chats/1M` layouts.
+- The Raft log store is now persistent (redb-backed as of Stage 3A). Cluster-mode performance numbers will be published in a future run once the benchmark harness is updated to target the cluster compose setup.

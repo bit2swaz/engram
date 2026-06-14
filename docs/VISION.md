@@ -236,6 +236,12 @@ Learn:
 
 ## Stage 3: Collective Memory
 
+### Stage 3A: Persistence and recovery ✅
+
+Status: complete. Persistent redb-backed Raft log and snapshot store, full state machine snapshots (short-term memory, core memory, knowledge graph), startup recovery, InstallSnapshot over gRPC for lagging followers, automatic log compaction. All 10 cluster-verify criteria pass.
+
+### Stage 3B: Collective memory
+
 Goal:
 
 Allow multiple autonomous systems to share knowledge.
