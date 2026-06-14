@@ -7,13 +7,19 @@ use openraft::{
     StorageError, StoredMembership, RaftSnapshotBuilder,
     storage::RaftStateMachine,
 };
+use redb::{Database, TableDefinition};
 
 use crate::core::{CoreMemoryStore, ShortTermMemory};
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::knowledge::types::KnowledgeJob;
 use crate::models::{EmbeddingStatus, Message};
+use crate::raft::snapshot::{EngramSnapshot, SessionFacts, SessionMessages};
 use crate::raft::types::{CommandResponse, MemoryCommand, TypeConfig};
 use crate::worker::EmbeddingJob;
+
+const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_snapshot");
+const SNAPSHOT_META_KEY: &str = "meta";
+const SNAPSHOT_DATA_KEY: &str = "data";
 
 pub struct EngStateMachineStore {
     inner: Arc<Mutex<SmInner>>,
@@ -27,6 +33,8 @@ struct SmInner {
     embedding_tx: mpsc::Sender<EmbeddingJob>,
     knowledge_graph: Arc<RwLock<KnowledgeGraph>>,
     knowledge_tx: mpsc::Sender<KnowledgeJob>,
+    db: Arc<Database>,
+    snapshot_idx: u64,
 }
 
 impl EngStateMachineStore {
@@ -39,7 +47,13 @@ impl EngStateMachineStore {
         embedding_tx: mpsc::Sender<EmbeddingJob>,
         knowledge_graph: Arc<RwLock<KnowledgeGraph>>,
         knowledge_tx: mpsc::Sender<KnowledgeJob>,
+        db: Arc<Database>,
     ) -> Self {
+        {
+            let txn = db.begin_write().expect("redb begin_write sm init");
+            { let _ = txn.open_table(SNAPSHOT_TABLE).expect("open SNAPSHOT_TABLE"); }
+            txn.commit().expect("redb commit sm init");
+        }
         Self {
             inner: Arc::new(Mutex::new(SmInner {
                 last_applied: None,
@@ -49,15 +63,110 @@ impl EngStateMachineStore {
                 embedding_tx,
                 knowledge_graph,
                 knowledge_tx,
+                db,
+                snapshot_idx: 0,
             })),
         }
+    }
+
+    pub(crate) fn inner_handle(&self) -> Arc<Mutex<SmInner>> {
+        self.inner.clone()
+    }
+}
+
+fn sm_io_err(verb: ErrorVerb, msg: String) -> StorageError<u64> {
+    StorageError::from_io_error(
+        ErrorSubject::StateMachine,
+        verb,
+        io::Error::new(io::ErrorKind::Other, msg),
+    )
+}
+
+async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<u64, BasicNode>), StorageError<u64>> {
+    let short_term = inner
+        .short_term
+        .dump_all()
+        .await
+        .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?
+        .into_iter()
+        .map(|(session_id, messages)| SessionMessages { session_id, messages })
+        .collect();
+    let core_memory = inner
+        .core_memory
+        .dump_all()
+        .await
+        .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?
+        .into_iter()
+        .map(|(session_id, facts)| SessionFacts { session_id, facts })
+        .collect();
+    let knowledge_graph = inner.knowledge_graph.read().await.to_snapshot();
+
+    let payload = EngramSnapshot {
+        version: crate::raft::snapshot::SNAPSHOT_VERSION,
+        short_term,
+        core_memory,
+        knowledge_graph,
+        global_graph: None,
+    };
+    let snapshot_id = format!(
+        "{}-{}",
+        inner.last_applied.as_ref().map(|l| l.index).unwrap_or(0),
+        inner.snapshot_idx
+    );
+    let meta = SnapshotMeta {
+        last_log_id: inner.last_applied.clone(),
+        last_membership: inner.last_membership.clone(),
+        snapshot_id,
+    };
+    Ok((payload, meta))
+}
+
+fn persist_snapshot(db: &Database, meta: &SnapshotMeta<u64, BasicNode>, data: &[u8]) -> Result<(), StorageError<u64>> {
+    let meta_bytes = serde_json::to_vec(meta).map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+    let txn = db.begin_write().map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+    {
+        let mut table = txn.open_table(SNAPSHOT_TABLE).map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+        table.insert(SNAPSHOT_META_KEY, meta_bytes.as_slice()).map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+        table.insert(SNAPSHOT_DATA_KEY, data).map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+    }
+    txn.commit().map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+    Ok(())
+}
+
+pub(crate) fn load_persisted_snapshot(db: &Database) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+    let txn = db.begin_read().map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
+    let table = txn.open_table(SNAPSHOT_TABLE).map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
+    let (Some(meta_g), Some(data_g)) = (
+        table.get(SNAPSHOT_META_KEY).map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?,
+        table.get(SNAPSHOT_DATA_KEY).map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?,
+    ) else {
+        return Ok(None);
+    };
+    let meta: SnapshotMeta<u64, BasicNode> =
+        serde_json::from_slice(meta_g.value()).map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
+    Ok(Some(Snapshot {
+        meta,
+        snapshot: Box::new(Cursor::new(data_g.value().to_vec())),
+    }))
+}
+
+pub struct EngSnapshotBuilder {
+    inner: Arc<Mutex<SmInner>>,
+}
+
+impl RaftSnapshotBuilder<TypeConfig> for EngSnapshotBuilder {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+        let mut inner = self.inner.lock().await;
+        inner.snapshot_idx += 1;
+        let (payload, meta) = build_payload(&inner).await?;
+        let data = payload.to_bytes().map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+        persist_snapshot(&inner.db, &meta, &data)?;
+        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data)) })
     }
 }
 
 impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
-    // Snapshot not implemented in Stage 1. Nodes that fall too far behind must
-    // be manually removed and re-added to the cluster. Stage 2 adds compaction.
-    type SnapshotBuilder = NoOpSnapshotBuilder;
+    type SnapshotBuilder = EngSnapshotBuilder;
 
     async fn applied_state(
         &mut self,
@@ -113,7 +222,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        NoOpSnapshotBuilder
+        EngSnapshotBuilder { inner: self.inner.clone() }
     }
 
     async fn begin_receiving_snapshot(
@@ -122,7 +231,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         Err(StorageError::from_io_error(
             ErrorSubject::None,
             ErrorVerb::Read,
-            io::Error::new(io::ErrorKind::Unsupported, "snapshots not implemented in Stage 1"),
+            io::Error::new(io::ErrorKind::Unsupported, "install_snapshot not implemented until Task 8"),
         ))
     }
 
@@ -134,27 +243,15 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         Err(StorageError::from_io_error(
             ErrorSubject::None,
             ErrorVerb::Write,
-            io::Error::new(io::ErrorKind::Unsupported, "snapshots not implemented in Stage 1"),
+            io::Error::new(io::ErrorKind::Unsupported, "install_snapshot not implemented until Task 8"),
         ))
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        Ok(None)
-    }
-}
-
-/// Stub snapshot builder. Stage 2 will replace this with a real implementation.
-pub struct NoOpSnapshotBuilder;
-
-impl RaftSnapshotBuilder<TypeConfig> for NoOpSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        Err(StorageError::from_io_error(
-            ErrorSubject::None,
-            ErrorVerb::Read,
-            io::Error::new(io::ErrorKind::Unsupported, "snapshot building not implemented in Stage 1"),
-        ))
+        let inner = self.inner.lock().await;
+        load_persisted_snapshot(&inner.db)
     }
 }
 
@@ -230,6 +327,8 @@ mod tests {
         mpsc::Receiver<EmbeddingJob>,
         mpsc::Receiver<KnowledgeJob>,
         Arc<RwLock<KnowledgeGraph>>,
+        Arc<InMemoryCoreMemoryStore>,
+        tempfile::TempDir,
     ) {
         let short_term = Arc::new(InMemoryStore::default());
         let core_memory = Arc::new(InMemoryCoreMemoryStore::default());
@@ -237,15 +336,18 @@ mod tests {
         let (embed_tx, embed_rx) = mpsc::channel(10);
         let (know_tx, know_rx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("sm.redb")).unwrap());
         let sm = EngStateMachineStore::new(
             short_term.clone(),
-            core_memory,
+            core_memory.clone(),
             vector_store as Arc<dyn crate::core::VectorStore>,
             embed_tx,
             kg.clone(),
             know_tx,
+            db,
         );
-        (sm, short_term, embed_rx, know_rx, kg)
+        (sm, short_term, embed_rx, know_rx, kg, core_memory, dir)
     }
 
     fn make_entry(index: u64, cmd: MemoryCommand) -> openraft::Entry<TypeConfig> {
@@ -257,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_writes_to_short_term() {
-        let (mut sm, short_term, _embed, _know, _kg) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -279,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_embedding_job() {
-        let (mut sm, _st, mut embed_rx, _know, _kg) = make_sm();
+        let (mut sm, _st, mut embed_rx, _know, _kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -300,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_redis_and_enqueues_lancedb_delete() {
-        let (mut sm, short_term, mut embed_rx, _know, _kg) = make_sm();
+        let (mut sm, short_term, mut embed_rx, _know, _kg, _cm, _dir) = make_sm();
         sm.apply(vec![
             make_entry(
                 0,
@@ -327,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn noop_command_is_ignored() {
-        let (mut sm, short_term, _embed, _know, _kg) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::NoOp)]).await.unwrap();
         let msgs = short_term.get_recent("any", 10).await.unwrap();
         assert_eq!(msgs.len(), 0);
@@ -335,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_knowledge_job() {
-        let (mut sm, _st, _embed, mut know_rx, _kg) = make_sm();
+        let (mut sm, _st, _embed, mut know_rx, _kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddMessage {
             session_id: "s1".into(),
             message: MessagePayload {
@@ -352,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_knowledge_updates_graph() {
-        let (mut sm, _st, _embed, _know, kg) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(),
             message_id: "m1".into(),
@@ -373,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_knowledge_graph() {
-        let (mut sm, _st, _embed, _know, kg) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -383,5 +485,50 @@ mod tests {
 
         let kg = kg.read().await;
         assert!(kg.all_entities("s1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_snapshot_meta_index_equals_last_applied() {
+        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        for i in 0..=4u64 {
+            sm.apply(vec![make_entry(i, MemoryCommand::AddFact {
+                session_id: "s1".into(), fact: format!("f{i}"),
+            })]).await.unwrap();
+        }
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        assert_eq!(snap.meta.last_log_id.unwrap().index, 4);
+    }
+
+    #[tokio::test]
+    async fn build_then_get_current_snapshot_returns_same_index() {
+        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::AddFact {
+            session_id: "s1".into(), fact: "f".into(),
+        })]).await.unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let built = builder.build_snapshot().await.unwrap();
+        let current = sm.get_current_snapshot().await.unwrap().expect("snapshot persisted");
+        assert_eq!(current.meta.last_log_id, built.meta.last_log_id);
+    }
+
+    #[tokio::test]
+    async fn snapshot_payload_contains_applied_state() {
+        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(1, MemoryCommand::AddFact {
+            session_id: "s1".into(), fact: "likes coffee".into(),
+        })]).await.unwrap();
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let payload = crate::raft::snapshot::EngramSnapshot::from_bytes(snap.snapshot.get_ref()).unwrap();
+        assert_eq!(payload.version, 1);
+        assert!(payload.knowledge_graph.sessions.iter().any(|s| s.session_id == "s1"));
+        assert!(payload.core_memory.iter().any(|s| s.facts.contains(&"likes coffee".to_string())));
     }
 }

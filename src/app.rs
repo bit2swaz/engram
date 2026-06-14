@@ -71,8 +71,8 @@ pub async fn build_raft_node(
         node_id,
         raft_config,
         EngRaftNetwork,
-        EngRaftLogStore::new(db),
-        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx),
+        EngRaftLogStore::new(db.clone()),
+        EngStateMachineStore::new(short_term, core_memory, vector_store, embedding_tx, knowledge_graph, knowledge_tx, db),
     )
     .await?;
 
