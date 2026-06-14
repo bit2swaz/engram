@@ -228,23 +228,37 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Err(StorageError::from_io_error(
-            ErrorSubject::None,
-            ErrorVerb::Read,
-            io::Error::new(io::ErrorKind::Unsupported, "install_snapshot not implemented until Task 8"),
-        ))
+        Ok(Box::new(Cursor::new(Vec::new())))
     }
 
     async fn install_snapshot(
         &mut self,
-        _meta: &SnapshotMeta<u64, BasicNode>,
-        _snapshot: Box<Cursor<Vec<u8>>>,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        Err(StorageError::from_io_error(
-            ErrorSubject::None,
-            ErrorVerb::Write,
-            io::Error::new(io::ErrorKind::Unsupported, "install_snapshot not implemented until Task 8"),
-        ))
+        let payload = EngramSnapshot::from_bytes(snapshot.get_ref())
+            .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
+
+        // Clone store/graph handles under a short lock so we don't hold it across awaits.
+        let (short_term, core_memory, knowledge_graph, db) = {
+            let inner = self.inner.lock().await;
+            (inner.short_term.clone(), inner.core_memory.clone(), inner.knowledge_graph.clone(), inner.db.clone())
+        };
+
+        let st_sessions = payload.short_term.into_iter().map(|s| (s.session_id, s.messages)).collect();
+        short_term.restore_all(st_sessions).await.map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+        let cm_sessions = payload.core_memory.into_iter().map(|s| (s.session_id, s.facts)).collect();
+        core_memory.restore_all(cm_sessions).await.map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
+        *knowledge_graph.write().await = KnowledgeGraph::from_snapshot(payload.knowledge_graph);
+
+        persist_snapshot(&db, meta, snapshot.get_ref())?;
+
+        {
+            let mut inner = self.inner.lock().await;
+            inner.last_applied = meta.last_log_id.clone();
+            inner.last_membership = meta.last_membership.clone();
+        }
+        Ok(())
     }
 
     async fn get_current_snapshot(
@@ -485,6 +499,55 @@ mod tests {
 
         let kg = kg.read().await;
         assert!(kg.all_entities("s1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_sets_last_applied_to_meta_log_id() {
+        let (mut src, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        src.apply(vec![make_entry(7, MemoryCommand::AddFact {
+            session_id: "s1".into(), fact: "f".into(),
+        })]).await.unwrap();
+        let mut builder = src.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let (mut dst, dst_st, _e2, _k2, dst_kg, _cm2, _dir2) = make_sm();
+        let mut buf = dst.begin_receiving_snapshot().await.unwrap();
+        *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
+        dst.install_snapshot(&snap.meta, buf).await.unwrap();
+
+        let (applied, _membership) = dst.applied_state().await.unwrap();
+        assert_eq!(applied.unwrap().index, 7);
+        assert_eq!(dst_st.get_recent("s1", 10).await.unwrap().len(), 0);
+        let _ = dst_kg.read().await;
+    }
+
+    #[tokio::test]
+    async fn apply_build_install_reproduces_state() {
+        let (mut src, _st, _e, _k, _kg, src_cm, _dir) = make_sm();
+        src.apply(vec![
+            make_entry(0, MemoryCommand::AddKnowledge {
+                session_id: "s1".into(), message_id: "m1".into(),
+                entities: vec![
+                    Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+                    Entity { name: "Bob".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+                ],
+                relationships: vec![Relationship { from: "Alice".into(), to: "Bob".into(), relationship_type: "knows".into() }],
+            }),
+            make_entry(1, MemoryCommand::AddFact { session_id: "s1".into(), fact: "likes tea".into() }),
+        ]).await.unwrap();
+        let src_facts = src_cm.get_facts("s1").await.unwrap();
+
+        let mut builder = src.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let (mut dst, _st2, _e2, _k2, dst_kg, dst_cm, _dir2) = make_sm();
+        let mut buf = dst.begin_receiving_snapshot().await.unwrap();
+        *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
+        dst.install_snapshot(&snap.meta, buf).await.unwrap();
+
+        assert_eq!(dst_cm.get_facts("s1").await.unwrap(), src_facts);
+        let path = dst_kg.read().await.find_path("s1", "Alice", "Bob").unwrap();
+        assert_eq!(path.len(), 1);
     }
 
     #[tokio::test]
