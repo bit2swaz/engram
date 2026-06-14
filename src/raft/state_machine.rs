@@ -72,6 +72,47 @@ impl EngStateMachineStore {
     pub(crate) fn inner_handle(&self) -> Arc<Mutex<SmInner>> {
         self.inner.clone()
     }
+
+    /// Returns `(meta, payload_bytes)` of the persisted snapshot, if any.
+    /// Called at startup before the Raft node starts (uncontended).
+    pub(crate) fn load_snapshot_for_recovery(
+        &self,
+    ) -> anyhow::Result<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>> {
+        let db = {
+            let inner = self.inner.try_lock().expect("uncontended at startup");
+            inner.db.clone()
+        };
+        match load_persisted_snapshot(&db).map_err(|e| anyhow::anyhow!(e.to_string()))? {
+            Some(s) => Ok(Some((s.meta, s.snapshot.into_inner()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Overwrites the knowledge graph and advances applied bookkeeping to the
+    /// recovered snapshot's index. Called at startup before `Raft::new`.
+    pub(crate) async fn restore_applied_for_recovery(
+        &self,
+        meta: SnapshotMeta<u64, BasicNode>,
+        graph: KnowledgeGraph,
+    ) {
+        let mut inner = self.inner.lock().await;
+        *inner.knowledge_graph.write().await = graph;
+        inner.last_applied = meta.last_log_id;
+        inner.last_membership = meta.last_membership;
+    }
+}
+
+#[cfg(test)]
+impl EngStateMachineStore {
+    pub async fn apply_for_test(&mut self, index: u64, cmd: MemoryCommand) {
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+        self.apply(vec![Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(cmd),
+        }])
+        .await
+        .unwrap();
+    }
 }
 
 fn sm_io_err(verb: ErrorVerb, msg: String) -> StorageError<u64> {
