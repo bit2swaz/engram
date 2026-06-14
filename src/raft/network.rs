@@ -77,22 +77,29 @@ impl RaftNetwork<TypeConfig> for EngRaftNetworkConnection {
         resp.into_inner().try_into().map_err(proto_decode_err)
     }
 
-    // Stage 1: InstallSnapshot is not implemented.
-    // If OpenRaft calls this, it means a follower has fallen too far behind for
-    // log-based catch-up. The operator must manually remove and re-add the node.
-    // Stage 2 will implement snapshot transport.
     async fn install_snapshot(
         &mut self,
-        _rpc: InstallSnapshotRequest<TypeConfig>,
+        rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
-            io::ErrorKind::Unsupported,
-            "InstallSnapshot not implemented in Stage 1; re-add the node manually",
-        ))))
+        let endpoint = format!("http://{}", self.target_addr)
+            .parse::<tonic::transport::Uri>()
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let channel = Channel::builder(endpoint)
+            .connect()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        let mut client = RaftServiceClient::new(channel);
+        let resp = client
+            .install_snapshot(crate::proto::raft::InstallSnapshotRequest::from(&rpc))
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        resp.into_inner()
+            .try_into()
+            .map_err(|e: String| RPCError::Network(NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e))))
     }
 }
 
@@ -107,5 +114,24 @@ mod tests {
         let node = openraft::BasicNode::new("127.0.0.1:19000");
         // Tonic uses lazy channels so new_client must not attempt a real connection.
         let _conn = factory.new_client(1u64, &node).await;
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_attempts_connection_and_errors_when_unreachable() {
+        let mut conn = EngRaftNetworkConnection { target_addr: "127.0.0.1:1".to_string() };
+        let req = openraft::raft::InstallSnapshotRequest::<crate::raft::types::TypeConfig> {
+            vote: openraft::Vote::new_committed(1, 1),
+            meta: openraft::SnapshotMeta {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "x".into(),
+            },
+            offset: 0,
+            data: vec![],
+            done: true,
+        };
+        // Port 1 is unreachable: must return an RPCError, not the Stage-1 "Unsupported".
+        let res = conn.install_snapshot(req, openraft::network::RPCOption::new(std::time::Duration::from_millis(100))).await;
+        assert!(res.is_err());
     }
 }
