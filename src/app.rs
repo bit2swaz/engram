@@ -42,6 +42,7 @@ pub async fn build_raft_node(
     embedding_tx: tokio::sync::mpsc::Sender<EmbeddingJob>,
     knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
     knowledge_tx: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
+    global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
 ) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
     use crate::raft::{
         log_store::EngRaftLogStore, network::EngRaftNetwork,
@@ -69,6 +70,7 @@ pub async fn build_raft_node(
         knowledge_graph,
         knowledge_tx,
         db,
+        global_graph,
     );
 
     // RECOVERY: flush Redis + restore snapshot BEFORE openraft replays the log.
@@ -119,8 +121,11 @@ mod stage3a_tests {
             crate::knowledge::graph::KnowledgeGraph::new(),
         ));
         let (ktx, _krx) = tokio::sync::mpsc::channel(10);
+        let gg = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::knowledge::global::GlobalGraph::new(),
+        ));
 
-        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx)
+        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx, gg)
             .await
             .unwrap();
         assert!(raft.is_initialized().await.is_ok() || true);
@@ -143,6 +148,9 @@ mod stage3a_tests {
             crate::knowledge::graph::KnowledgeGraph::new(),
         ));
         let (ktx, _krx) = tokio::sync::mpsc::channel(10);
+        let gg = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::knowledge::global::GlobalGraph::new(),
+        ));
 
         // Pre-load stale data that recovery must flush.
         use crate::core::ShortTermMemory;
@@ -166,6 +174,7 @@ mod stage3a_tests {
             etx,
             kg,
             ktx,
+            gg,
         )
         .await
         .unwrap();
@@ -251,6 +260,7 @@ pub async fn build_app_state_with_embedding_provider(
     );
 
     let knowledge_graph = Arc::new(tokio::sync::RwLock::new(KnowledgeGraph::new()));
+    let global_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::global::GlobalGraph::new()));
     let (knowledge_job_sender, knowledge_receiver) = knowledge_job_channel(config.knowledge_channel_size);
 
     let knowledge_extractor: Arc<dyn crate::knowledge::extractor::KnowledgeExtractor> =
@@ -274,6 +284,7 @@ pub async fn build_app_state_with_embedding_provider(
             embedding_job_sender.clone(),
             knowledge_graph.clone(),
             knowledge_job_sender.clone(),
+            global_graph.clone(),
         )
         .await
         .map_err(|e| AppBuildError::Other(e.into()))?;
