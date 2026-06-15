@@ -330,5 +330,6 @@ pub async fn build_app_state_with_embedding_provider(
         cluster_peers,
         knowledge_graph,
         knowledge_job_sender,
+        global_graph,
     }))
 }

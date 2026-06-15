@@ -155,6 +155,9 @@ mod tests {
             cluster_peers: vec![],
             knowledge_graph: kg,
             knowledge_job_sender,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         })
     }
 

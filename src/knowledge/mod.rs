@@ -1,6 +1,7 @@
 pub mod extractor;
 pub mod export;
 pub mod global;
+pub mod global_handler;
 pub mod graph;
 pub mod handler;
 pub mod types;

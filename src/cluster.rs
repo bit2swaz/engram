@@ -248,6 +248,9 @@ mod tests {
             cluster_peers: vec![],
             knowledge_graph,
             knowledge_job_sender: knowledge_tx,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         });
         (TestServer::new(build_router(state)).unwrap(), raft_dir)
     }
@@ -276,6 +279,9 @@ mod tests {
                 crate::knowledge::graph::KnowledgeGraph::new(),
             )),
             knowledge_job_sender,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         });
         TestServer::new(build_router(state)).unwrap()
     }

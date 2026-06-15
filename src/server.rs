@@ -10,6 +10,10 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use crate::knowledge::global_handler::{
+    get_global, get_global_conflicts, get_global_entity, get_global_entity_sources,
+    get_global_export, get_global_path, set_visibility,
+};
 use crate::knowledge::handler::{export_knowledge, find_path, get_knowledge, get_related};
 use axum_prometheus::{PrometheusMetricLayer, PrometheusMetricLayerBuilder};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
@@ -128,6 +132,8 @@ pub struct AppState {
     pub knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
     /// Channel for sending knowledge extraction jobs to the worker pool.
     pub knowledge_job_sender: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
+    /// Cluster-wide knowledge graph aggregating all Shared sessions.
+    pub global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
 }
 
 
@@ -224,6 +230,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/knowledge/entities/{entity_name}", get(get_related))
         .route("/sessions/{session_id}/knowledge/path", get(find_path))
         .route("/sessions/{session_id}/knowledge/export", get(export_knowledge))
+        .route("/sessions/{session_id}/visibility", put(set_visibility))
+        .route("/knowledge/global", get(get_global))
+        .route("/knowledge/global/entities/{name}", get(get_global_entity))
+        .route("/knowledge/global/entities/{name}/sources", get(get_global_entity_sources))
+        .route("/knowledge/global/path", get(get_global_path))
+        .route("/knowledge/global/export", get(get_global_export))
+        .route("/knowledge/global/conflicts", get(get_global_conflicts))
         .route("/cluster", get(crate::cluster::get_cluster_status))
         .route("/cluster/init", post(crate::cluster::init_cluster))
         .route("/cluster/add-learner", post(crate::cluster::add_learner))
@@ -777,6 +790,9 @@ mod tests {
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
                 tx
             },
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         })
     }
 
@@ -1233,6 +1249,21 @@ mod tests {
             .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_visibility_route_exists_and_validates_body() {
+        let state = build_test_state();
+        let server = TestServer::new(build_router(state)).unwrap();
+        let resp = server
+            .put("/sessions/s1/visibility")
+            .json(&json!({ "visibility": "Shared" }))
+            .await;
+        assert!(
+            resp.status_code().is_success() || resp.status_code().as_u16() == 307,
+            "expected 2xx or 307 but got {}",
+            resp.status_code()
+        );
     }
 
     #[tokio::test]

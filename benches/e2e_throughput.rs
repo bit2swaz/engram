@@ -197,6 +197,9 @@ impl BenchmarkHarness {
                 engram::knowledge::graph::KnowledgeGraph::new(),
             )),
             knowledge_job_sender,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                engram::knowledge::global::GlobalGraph::new(),
+            )),
         });
 
         let _worker_handles = spawn_embedding_workers(
