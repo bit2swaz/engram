@@ -6,5 +6,5 @@ pub mod handler;
 pub mod types;
 pub mod worker;
 
-pub use global::Visibility;
+pub use global::{GlobalGraph, GlobalGraphSnapshot, Visibility};
 pub use types::{Entity, ExtractionResult, KnowledgeJob, Relationship};
