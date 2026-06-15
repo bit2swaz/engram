@@ -361,6 +361,9 @@ async fn apply_cmd(
         MemoryCommand::AddKnowledge { session_id, message_id, entities, relationships } => {
             knowledge_graph.write().await.apply_extraction(&session_id, &message_id, entities, relationships);
         }
+        MemoryCommand::SetSessionVisibility { .. } => {
+            // Handled in Task 3 when global_graph and visibility map are wired in.
+        }
         MemoryCommand::NoOp => {}
     }
 }
