@@ -1277,6 +1277,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_endpoints_return_aggregated_view() {
+        use crate::knowledge::types::{Entity, Relationship};
+        use std::collections::HashMap;
+
+        let state = build_test_state();
+        {
+            let mut g = state.global_graph.write().await;
+            g.merge(
+                "s1",
+                0,
+                vec![
+                    Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+                    Entity { name: "OpenAI".into(), entity_type: "Organization".into(), attributes: HashMap::new() },
+                ],
+                vec![Relationship { from: "Alice".into(), to: "OpenAI".into(), relationship_type: "works_at".into() }],
+            );
+        }
+        let server = TestServer::new(build_router(state)).unwrap();
+
+        let all = server.get("/knowledge/global").await;
+        all.assert_status_ok();
+
+        let neighbors = server.get("/knowledge/global/entities/OpenAI").await;
+        neighbors.assert_status_ok();
+        assert!(neighbors.text().contains("Alice"));
+
+        let sources = server.get("/knowledge/global/entities/OpenAI/sources").await;
+        assert!(sources.text().contains("s1"));
+
+        let path = server.get("/knowledge/global/path?from=Alice&to=OpenAI").await;
+        path.assert_status_ok();
+        assert!(path.text().contains("works_at"));
+
+        let dot = server.get("/knowledge/global/export?format=dot").await;
+        assert!(dot.text().contains("digraph"));
+    }
+
+    #[tokio::test]
     async fn knowledge_metrics_appear_in_prometheus_scrape() {
         let state = build_test_state();
         // Observe each metric so the HistogramVec emits output (Vec types only appear

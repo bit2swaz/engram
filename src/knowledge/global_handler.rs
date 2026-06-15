@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::MemoryServerError;
-use crate::knowledge::global::Visibility;
+use crate::knowledge::export::{GraphExport, to_dot};
+use crate::knowledge::global::{Conflict, Visibility};
+use crate::knowledge::graph::{PathEdge, RelatedEntity};
+use crate::knowledge::types::{Entity, Relationship};
 use crate::raft::types::MemoryCommand;
 use crate::server::AppState;
 
@@ -51,33 +54,118 @@ pub async fn set_visibility(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// Stub handlers for Task 6: routes registered here so the router compiles.
-pub async fn get_global(State(_state): State<Arc<AppState>>) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+// ---- Read-only global graph handlers ----------------------------------------
+
+#[derive(Serialize)]
+pub struct GlobalKnowledgeResponse {
+    entities: Vec<Entity>,
+    edges: Vec<Relationship>,
+}
+
+pub async fn get_global(
+    State(state): State<Arc<AppState>>,
+) -> Json<GlobalKnowledgeResponse> {
+    let g = state.global_graph.read().await;
+    Json(GlobalKnowledgeResponse {
+        entities: g.all_entities(),
+        edges: g.all_relationships(),
+    })
+}
+
+#[derive(Serialize)]
+pub(crate) struct RelatedResponse {
+    entity_name: String,
+    related: Vec<RelatedEntity>,
 }
 
 pub async fn get_global_entity(
-    State(_state): State<Arc<AppState>>,
-    Path(_name): Path<String>,
-) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<RelatedResponse> {
+    let g = state.global_graph.read().await;
+    Json(RelatedResponse {
+        entity_name: name.clone(),
+        related: g.get_related(&name),
+    })
+}
+
+#[derive(Serialize)]
+pub(crate) struct SourcesResponse {
+    entity_name: String,
+    sources: Vec<String>,
 }
 
 pub async fn get_global_entity_sources(
-    State(_state): State<Arc<AppState>>,
-    Path(_name): Path<String>,
-) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<SourcesResponse> {
+    let g = state.global_graph.read().await;
+    Json(SourcesResponse {
+        entity_name: name.clone(),
+        sources: g.entity_sources(&name),
+    })
 }
 
-pub async fn get_global_path(State(_state): State<Arc<AppState>>) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+#[derive(Deserialize)]
+pub struct PathQuery {
+    from: String,
+    to: String,
 }
 
-pub async fn get_global_export(State(_state): State<Arc<AppState>>) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+#[derive(Serialize)]
+pub(crate) struct PathResponse {
+    from: String,
+    to: String,
+    path: Option<Vec<PathEdge>>,
 }
 
-pub async fn get_global_conflicts(State(_state): State<Arc<AppState>>) -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+pub async fn get_global_path(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PathQuery>,
+) -> Json<PathResponse> {
+    let g = state.global_graph.read().await;
+    let path = g.find_path(&params.from, &params.to);
+    Json(PathResponse { from: params.from, to: params.to, path })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ExportQuery {
+    #[serde(default = "default_format")]
+    format: String,
+}
+
+fn default_format() -> String {
+    "json".to_string()
+}
+
+pub async fn get_global_export(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ExportQuery>,
+) -> (StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+    let g = state.global_graph.read().await;
+    let export = GraphExport::new("global", g.all_entities(), g.all_relationships());
+    match params.format.as_str() {
+        "dot" => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/vnd.graphviz")],
+            to_dot(&export),
+        ),
+        _ => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&export).unwrap_or_default(),
+        ),
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct ConflictsResponse {
+    conflicts: Vec<Conflict>,
+}
+
+pub async fn get_global_conflicts(
+    State(state): State<Arc<AppState>>,
+) -> Json<ConflictsResponse> {
+    let g = state.global_graph.read().await;
+    Json(ConflictsResponse { conflicts: g.conflicts() })
 }
