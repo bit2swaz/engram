@@ -4,7 +4,7 @@ use crate::knowledge::graph::GraphSnapshot;
 use crate::models::Message;
 
 /// Snapshot schema version. Bump when the payload layout changes incompatibly.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessages {
@@ -28,9 +28,12 @@ pub struct EngramSnapshot {
     pub short_term: Vec<SessionMessages>,
     pub core_memory: Vec<SessionFacts>,
     pub knowledge_graph: GraphSnapshot,
-    /// Reserved for Stage 3B (collective/global knowledge graph). Absent in 3A.
     #[serde(default)]
-    pub global_graph: Option<GraphSnapshot>,
+    pub global_graph: Option<crate::knowledge::global::GlobalGraphSnapshot>,
+    #[serde(default)]
+    pub visibility: Vec<(String, crate::knowledge::global::Visibility)>,
+    #[serde(default)]
+    pub session_agents: Vec<(String, String)>,
 }
 
 impl EngramSnapshot {
@@ -56,12 +59,14 @@ mod tests {
             core_memory: vec![SessionFacts { session_id: "s1".into(), facts: vec!["f".into()] }],
             knowledge_graph: crate::knowledge::graph::GraphSnapshot::default(),
             global_graph: None,
+            visibility: vec![],
+            session_agents: vec![],
         }
     }
 
     #[test]
-    fn snapshot_carries_version_one() {
-        assert_eq!(sample().version, 1);
+    fn snapshot_carries_version_two() {
+        assert_eq!(sample().version, 2);
     }
 
     #[test]
@@ -69,9 +74,10 @@ mod tests {
         let snap = sample();
         let bytes = snap.to_bytes().unwrap();
         let back = EngramSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(back.version, 1);
+        assert_eq!(back.version, 2);
         assert_eq!(back.core_memory[0].facts, vec!["f".to_string()]);
         assert!(back.global_graph.is_none());
+        assert!(back.visibility.is_empty());
     }
 
     #[test]
@@ -80,5 +86,32 @@ mod tests {
         // Absent global_graph must deserialize cleanly (forward-compat for 3B).
         let back = EngramSnapshot::from_bytes(&bytes).unwrap();
         assert!(back.global_graph.is_none());
+    }
+
+    #[test]
+    fn snapshot_version_is_two_and_carries_global_and_visibility() {
+        let snap = EngramSnapshot {
+            version: SNAPSHOT_VERSION,
+            short_term: vec![],
+            core_memory: vec![],
+            knowledge_graph: crate::knowledge::graph::GraphSnapshot::default(),
+            global_graph: Some(crate::knowledge::global::GlobalGraphSnapshot::default()),
+            visibility: vec![("s1".into(), crate::knowledge::global::Visibility::Shared)],
+            session_agents: vec![("s1".into(), "agent-7".into())],
+        };
+        assert_eq!(snap.version, 2);
+        let bytes = snap.to_bytes().unwrap();
+        let back = EngramSnapshot::from_bytes(&bytes).unwrap();
+        assert!(back.global_graph.is_some());
+        assert_eq!(back.visibility.len(), 1);
+    }
+
+    #[test]
+    fn v1_snapshot_without_global_fields_still_loads() {
+        let v1 = r#"{"version":1,"short_term":[],"core_memory":[],"knowledge_graph":{"sessions":[],"processed":[]}}"#;
+        let back = EngramSnapshot::from_bytes(v1.as_bytes()).unwrap();
+        assert!(back.global_graph.is_none());
+        assert!(back.visibility.is_empty());
+        assert!(back.session_agents.is_empty());
     }
 }

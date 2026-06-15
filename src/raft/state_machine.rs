@@ -148,13 +148,20 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         .map(|(session_id, facts)| SessionFacts { session_id, facts })
         .collect();
     let knowledge_graph = inner.knowledge_graph.read().await.to_snapshot();
+    let global_graph = Some(inner.global_graph.read().await.to_snapshot());
+    let visibility = inner.visibility.read().await
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
 
     let payload = EngramSnapshot {
         version: crate::raft::snapshot::SNAPSHOT_VERSION,
         short_term,
         core_memory,
         knowledge_graph,
-        global_graph: None,
+        global_graph,
+        visibility,
+        session_agents: vec![],
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -291,9 +298,16 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
         // Clone store/graph handles under a short lock so we don't hold it across awaits.
-        let (short_term, core_memory, knowledge_graph, db) = {
+        let (short_term, core_memory, knowledge_graph, global_graph, visibility, db) = {
             let inner = self.inner.lock().await;
-            (inner.short_term.clone(), inner.core_memory.clone(), inner.knowledge_graph.clone(), inner.db.clone())
+            (
+                inner.short_term.clone(),
+                inner.core_memory.clone(),
+                inner.knowledge_graph.clone(),
+                inner.global_graph.clone(),
+                inner.visibility.clone(),
+                inner.db.clone(),
+            )
         };
 
         let st_sessions = payload.short_term.into_iter().map(|s| (s.session_id, s.messages)).collect();
@@ -301,6 +315,17 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         let cm_sessions = payload.core_memory.into_iter().map(|s| (s.session_id, s.facts)).collect();
         core_memory.restore_all(cm_sessions).await.map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
         *knowledge_graph.write().await = KnowledgeGraph::from_snapshot(payload.knowledge_graph);
+
+        if let Some(gg_snap) = payload.global_graph {
+            *global_graph.write().await = GlobalGraph::from_snapshot(gg_snap);
+        }
+        {
+            let mut vis = visibility.write().await;
+            vis.clear();
+            for (session_id, v) in payload.visibility {
+                vis.insert(session_id, v);
+            }
+        }
 
         persist_snapshot(&db, meta, snapshot.get_ref())?;
 
@@ -674,7 +699,7 @@ mod tests {
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
         let payload = crate::raft::snapshot::EngramSnapshot::from_bytes(snap.snapshot.get_ref()).unwrap();
-        assert_eq!(payload.version, 1);
+        assert_eq!(payload.version, 2);
         assert!(payload.knowledge_graph.sessions.iter().any(|s| s.session_id == "s1"));
         assert!(payload.core_memory.iter().any(|s| s.facts.contains(&"likes coffee".to_string())));
     }
