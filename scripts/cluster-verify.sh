@@ -343,3 +343,174 @@ ALL_AFTER=$(entity_count_on node-1)
 
 echo ""
 echo "=== All Stage 3A criteria PASSED ==="
+
+# ---------------------------------------------------------------------------
+# Stage 3B helpers
+# ---------------------------------------------------------------------------
+
+global_entity_count_on() {
+    local port=$1
+    curl -sf "http://localhost:$port/knowledge/global" 2>/dev/null | \
+        python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1"
+}
+
+global_related_on() {
+    local port=$1 entity=$2
+    curl -sf "http://localhost:$port/knowledge/global/entities/$entity" 2>/dev/null | \
+        python3 -c "import sys,json; print([r['name'] for r in json.load(sys.stdin).get('related',[])])" \
+        2>/dev/null || echo "[]"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3B setup: two Shared sessions (SA, SB) + one Private session (SC)
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Stage 3B: Collective Knowledge ==="
+echo ""
+
+echo "  Setting up Stage 3B sessions..."
+S3B_LEADER_PORT=$(find_leader_port)
+[ -z "${S3B_LEADER_PORT:-}" ] && fail "no leader for Stage 3B setup"
+S3B_LEADER="http://localhost:$S3B_LEADER_PORT"
+
+S3B_SA=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+S3B_SB=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+S3B_SC=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+
+# Mark SA and SB as Shared; SC stays Private (default)
+VIS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$S3B_LEADER/sessions/$S3B_SA/visibility" \
+    -H "Content-Type: application/json" \
+    -d '{"visibility":"Shared"}')
+[ "$VIS_CODE" = "204" ] || fail "set SA visibility returned HTTP $VIS_CODE (expected 204)"
+
+VIS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$S3B_LEADER/sessions/$S3B_SB/visibility" \
+    -H "Content-Type: application/json" \
+    -d '{"visibility":"Shared"}')
+[ "$VIS_CODE" = "204" ] || fail "set SB visibility returned HTTP $VIS_CODE (expected 204)"
+
+# SA: Alice+OpenAI, and Alice-knows-Bob for path check [17]
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SA/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Alice works at OpenAI"}' > /dev/null
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SA/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Alice knows Bob"}' > /dev/null
+# SB: Bob+OpenAI -- contributes OpenAI a second time alongside SA
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SB/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Bob works at OpenAI"}' > /dev/null
+# SC: private -- must not surface in global graph
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SC/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"TopSecret works at HiddenCorp"}' > /dev/null
+
+echo "  Waiting 5 seconds for extraction and Raft replication..."
+sleep 5
+
+# [11] Shared sessions aggregate across every node
+echo "[11] shared sessions aggregate"
+for port in 3000 3001 3002; do
+    RELATED_11=$(global_related_on "$port" "OpenAI")
+    echo "$RELATED_11" | grep -q "Alice" \
+        && pass "[11] node :$port OpenAI related to Alice (contributed by SA)" \
+        || fail "[11] node :$port Alice missing from OpenAI related (got: $RELATED_11)"
+    echo "$RELATED_11" | grep -q "Bob" \
+        && pass "[11] node :$port OpenAI related to Bob (contributed by SB)" \
+        || fail "[11] node :$port Bob missing from OpenAI related (got: $RELATED_11)"
+done
+
+# [12] Private session entities never appear in the global graph
+echo "[12] private session isolation"
+GLOBAL_ENTITIES_12=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$GLOBAL_ENTITIES_12" | grep -q "TopSecret" \
+    && fail "[12] private entity TopSecret leaked into global graph" \
+    || pass "[12] private entity TopSecret absent from global graph"
+echo "$GLOBAL_ENTITIES_12" | grep -q "HiddenCorp" \
+    && fail "[12] private entity HiddenCorp leaked into global graph" \
+    || pass "[12] private entity HiddenCorp absent from global graph"
+
+# [13] Provenance lists contributing session ids
+echo "[13] provenance"
+SOURCES_13=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/entities/OpenAI/sources" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('sources',[]))" 2>/dev/null || echo "[]")
+echo "$SOURCES_13" | grep -qF "$S3B_SA" \
+    && pass "[13] SA listed as OpenAI provenance source" \
+    || fail "[13] SA not in OpenAI sources (got: $SOURCES_13)"
+echo "$SOURCES_13" | grep -qF "$S3B_SB" \
+    && pass "[13] SB listed as OpenAI provenance source" \
+    || fail "[13] SB not in OpenAI sources (got: $SOURCES_13)"
+
+# [14] All 3 nodes converge to identical global entity set (deterministic state)
+echo "[14] deterministic conflict resolution"
+GLOBAL_14_1=$(curl -sf "http://localhost:3000/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+GLOBAL_14_2=$(curl -sf "http://localhost:3001/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+GLOBAL_14_3=$(curl -sf "http://localhost:3002/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+[ "$GLOBAL_14_1" = "$GLOBAL_14_2" ] && [ "$GLOBAL_14_2" = "$GLOBAL_14_3" ] \
+    && pass "[14] all 3 nodes converge to identical global entity set: $GLOBAL_14_1" \
+    || fail "[14] nodes diverge: node1=$GLOBAL_14_1 node2=$GLOBAL_14_2 node3=$GLOBAL_14_3"
+
+# [17] Global path traversal across sessions, no LLM call
+echo "[17] global path traversal (no LLM)"
+PATH_17=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/path?from=Alice&to=Bob" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print('found' if d.get('path') else 'none')" \
+    2>/dev/null || echo "none")
+[ "$PATH_17" = "found" ] \
+    && pass "[17] global path Alice->Bob found via graph traversal (no LLM)" \
+    || fail "[17] no global path found from Alice to Bob"
+
+# [16] Global graph and visibility survive a full cluster restart
+echo "[16] persistence of collective state"
+S3B_GLOBAL_BEFORE=$(global_entity_count_on "$S3B_LEADER_PORT")
+docker compose -f docker-compose.cluster.yml stop node-1 node-2 node-3
+docker compose -f docker-compose.cluster.yml start node-1 node-2 node-3
+wait_for_leader
+sleep 5
+S3B_LEADER_PORT=$(find_leader_port)
+S3B_GLOBAL_AFTER=$(global_entity_count_on "$S3B_LEADER_PORT")
+[ "$S3B_GLOBAL_AFTER" = "$S3B_GLOBAL_BEFORE" ] \
+    && pass "[16] global graph survived restart ($S3B_GLOBAL_AFTER entities, was $S3B_GLOBAL_BEFORE)" \
+    || fail "[16] global entity count changed after restart ($S3B_GLOBAL_BEFORE -> $S3B_GLOBAL_AFTER)"
+RESTORED_SOURCES=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/entities/OpenAI/sources" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('sources',[]))" 2>/dev/null || echo "[]")
+echo "$RESTORED_SOURCES" | grep -qF "$S3B_SA" \
+    && pass "[16] visibility and provenance restored after restart (SA still owns OpenAI)" \
+    || fail "[16] SA no longer in OpenAI sources after restart (visibility or provenance lost)"
+
+# [15] Provenance-scoped deletion
+echo "[15] provenance-scoped deletion"
+S3B_LEADER_PORT=$(find_leader_port)
+S3B_LEADER="http://localhost:$S3B_LEADER_PORT"
+# Delete SA: OpenAI must remain (SB still contributes it)
+curl -sf -X DELETE "$S3B_LEADER/sessions/$S3B_SA" > /dev/null
+sleep 1
+AFTER_SA=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$AFTER_SA" | grep -q "OpenAI" \
+    && pass "[15] OpenAI remains after deleting SA (still contributed by SB)" \
+    || fail "[15] OpenAI wrongly removed when only SA was deleted"
+# Delete SB: OpenAI must now be gone (no remaining contributors)
+curl -sf -X DELETE "$S3B_LEADER/sessions/$S3B_SB" > /dev/null
+sleep 1
+AFTER_SB=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$AFTER_SB" | grep -q "OpenAI" \
+    && fail "[15] OpenAI still in global graph after deleting all contributing sessions" \
+    || pass "[15] OpenAI removed after deleting both SA and SB"
+
+echo ""
+echo "=== All Stage 3B criteria PASSED ==="
