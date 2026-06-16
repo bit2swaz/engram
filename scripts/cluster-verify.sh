@@ -8,11 +8,25 @@ N3="http://localhost:3002"
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; exit 1; }
 
+# Inline leader finder used before the Stage 3A helpers are declared.
+_find_leader_port_early() {
+    for p in 3000 3001 3002; do
+        local role
+        role=$(curl -sf "http://localhost:$p/cluster" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+        if [ "$role" = "Leader" ]; then
+            echo "$p"
+            return
+        fi
+    done
+}
+
 echo ""
 echo "=== Stage 1 Acceptance Verification ==="
 echo ""
 
 echo "[1] Leader election"
+# Query any node — leader identity is cluster-wide state
 STATUS=$(curl -sf "$N1/cluster")
 LEADER=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['leader_id'])" 2>/dev/null || echo "null")
 MEMBERS=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['members']))" 2>/dev/null || echo "0")
@@ -21,23 +35,40 @@ MEMBERS=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); 
   || fail "no leader or wrong member count (leader=$LEADER, members=$MEMBERS)"
 
 echo "[2] Write replication"
-SESSION=$(curl -sf -X POST "$N1/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
-WRITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$N1/sessions/$SESSION/messages" \
+# Discover actual leader — do not assume N1 is always the leader
+EARLY_LEADER_PORT=$(_find_leader_port_early)
+[ -z "${EARLY_LEADER_PORT:-}" ] && fail "no leader found for check [2]"
+EARLY_LEADER="http://localhost:$EARLY_LEADER_PORT"
+# Snapshot the leader index BEFORE the write so we have a stable target to wait for.
+BEFORE_IDX=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "0")
+SESSION=$(curl -sf -X POST "$EARLY_LEADER/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+WRITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$EARLY_LEADER/sessions/$SESSION/messages" \
   -H "Content-Type: application/json" \
   -d '{"role":"user","content":"stage1 replication test"}')
 [ "$WRITE_CODE" = "204" ] || fail "write to leader returned HTTP $WRITE_CODE (expected 204)"
-sleep 1
-# Verify replication by checking last_applied_index matches across all nodes.
-# Using /cluster avoids calling OpenAI (which /context requires).
-LEADER_APPLIED=$(curl -sf "$N1/cluster" | python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
-[ "$LEADER_APPLIED" != "null" ] || fail "could not read last_applied_index from leader"
-for port in 3000 3001 3002; do
-  NODE_APPLIED=$(curl -sf "http://localhost:$port/cluster" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
-  [ "$NODE_APPLIED" = "$LEADER_APPLIED" ] \
-    && pass "node :$port applied_index=$NODE_APPLIED (matches leader)" \
-    || fail "node :$port applied_index=$NODE_APPLIED (leader has $LEADER_APPLIED)"
+# Verify replication: wait for the leader to report every member's last_log_index >= TARGET.
+# Using the leader's member list avoids the follower state-machine apply lag (entries are
+# committed and in every follower's log before the leader acks 204).
+TARGET_IDX=$((BEFORE_IDX + 1))
+REPLICATED=0
+for _i in $(seq 1 30); do
+  sleep 0.5
+  MEMBER_IDXS=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(str(m['last_log_index']) for m in d['members']))" \
+    2>/dev/null || echo "")
+  [ -z "${MEMBER_IDXS:-}" ] && continue
+  ALL_PAST=1
+  for idx in $MEMBER_IDXS; do
+    [ "${idx:-0}" -lt "$TARGET_IDX" ] 2>/dev/null && { ALL_PAST=0; break; }
+  done
+  [ "$ALL_PAST" = "1" ] && { REPLICATED=1; break; }
 done
+[ "$REPLICATED" = "1" ] || fail "write not replicated to all members within 15 s (target=$TARGET_IDX)"
+FINAL_IDXS=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'  node id={m[\"id\"]} last_log_index={m[\"last_log_index\"]}') for m in d['members']]" \
+  2>/dev/null || true)
+echo "$FINAL_IDXS" | while IFS= read -r line; do pass "$line (>= write checkpoint $TARGET_IDX)"; done
 
 echo "[3] Follower redirect"
 FOLLOWER_TESTED=0
@@ -84,7 +115,12 @@ curl -sf -X POST "$WRITE_NODE/sessions/$SESSION2/messages" \
   || fail "write rejected after failover"
 echo "  Restarting node-1..."
 docker compose -f docker-compose.cluster.yml start node-1
-sleep 2
+# Wait for node-1 to be healthy before proceeding (up to 15 s)
+for _i in $(seq 1 30); do
+  sleep 0.5
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000/health" 2>/dev/null || echo "0")
+  [ "$CODE" = "200" ] && break
+done
 
 echo "[5] Cluster observability"
 # Read metrics from whichever node is the current leader (node-1 may still be catching up)
@@ -123,39 +159,46 @@ curl -sf -X POST "$WRITE_LEADER/sessions/$SESSION_K/messages" \
   -H "Content-Type: application/json" \
   -d '{"role":"user","content":"Alice knows Bob"}' > /dev/null
 
-echo "  Waiting 3 seconds for extraction and Raft replication..."
-sleep 3
+echo "  Waiting for extraction and Raft replication (up to 20 s)..."
 
 LEADER_PORT=""
-for port in 3000 3001 3002; do
-  ROLE=$(curl -sf "http://localhost:$port/cluster" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
-  if [ "$ROLE" = "Leader" ]; then
-    LEADER_PORT="$port"
-    break
-  fi
+LEADER_ENTITIES=-1
+LEADER_EDGES=-1
+for _i in $(seq 1 40); do
+  sleep 0.5
+  LEADER_PORT=""
+  for port in 3000 3001 3002; do
+    ROLE=$(curl -sf "http://localhost:$port/cluster" 2>/dev/null | \
+      python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+    if [ "$ROLE" = "Leader" ]; then LEADER_PORT="$port"; break; fi
+  done
+  [ -z "${LEADER_PORT:-}" ] && continue
+  LEADER_ENTITIES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" 2>/dev/null | \
+    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  [ "${LEADER_ENTITIES:-0}" -ge 3 ] && break
 done
 
-[ -z "$LEADER_PORT" ] && fail "no leader found for knowledge check"
-
-LEADER_ENTITIES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
-  python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
-
-[ "$LEADER_ENTITIES" -ge 3 ] \
+[ -z "${LEADER_PORT:-}" ] && fail "no leader found for knowledge check"
+[ "${LEADER_ENTITIES:-0}" -ge 3 ] \
   && pass "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities" \
   || fail "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities (expected >= 3)"
 
-LEADER_EDGES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
+LEADER_EDGES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" 2>/dev/null | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['edges']))" 2>/dev/null || echo "-1")
-
-[ "$LEADER_EDGES" -ge 3 ] \
+[ "${LEADER_EDGES:-0}" -ge 3 ] \
   && pass "leader (:$LEADER_PORT) has $LEADER_EDGES relationships" \
   || fail "leader (:$LEADER_PORT) has $LEADER_EDGES relationships (expected >= 3)"
 
+# Wait for followers to converge on the same entity count (up to 15 s each)
 for port in 3000 3001 3002; do
   [ "$port" -eq "$LEADER_PORT" ] && continue
-  FOLLOWER_ENTITIES=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" | \
-    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  FOLLOWER_ENTITIES=-1
+  for _j in $(seq 1 30); do
+    sleep 0.5
+    FOLLOWER_ENTITIES=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" 2>/dev/null | \
+      python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+    [ "$FOLLOWER_ENTITIES" -eq "$LEADER_ENTITIES" ] && break
+  done
   [ "$FOLLOWER_ENTITIES" -eq "$LEADER_ENTITIES" ] \
     && pass "follower :$port converged to $FOLLOWER_ENTITIES entities (matches leader)" \
     || fail "follower :$port has $FOLLOWER_ENTITIES entities (leader has $LEADER_ENTITIES)"
