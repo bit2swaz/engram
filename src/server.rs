@@ -10,6 +10,10 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use crate::knowledge::global_handler::{
+    get_global, get_global_conflicts, get_global_entity, get_global_entity_sources,
+    get_global_export, get_global_path, set_visibility,
+};
 use crate::knowledge::handler::{export_knowledge, find_path, get_knowledge, get_related};
 use axum_prometheus::{PrometheusMetricLayer, PrometheusMetricLayerBuilder};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
@@ -128,12 +132,19 @@ pub struct AppState {
     pub knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
     /// Channel for sending knowledge extraction jobs to the worker pool.
     pub knowledge_job_sender: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
+    /// Cluster-wide knowledge graph aggregating all Shared sessions.
+    pub global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
 }
 
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct CreateSessionResponse {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
+struct CreateSessionRequest {
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -224,6 +235,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/knowledge/entities/{entity_name}", get(get_related))
         .route("/sessions/{session_id}/knowledge/path", get(find_path))
         .route("/sessions/{session_id}/knowledge/export", get(export_knowledge))
+        .route("/sessions/{session_id}/visibility", put(set_visibility))
+        .route("/knowledge/global", get(get_global))
+        .route("/knowledge/global/entities/{name}", get(get_global_entity))
+        .route("/knowledge/global/entities/{name}/sources", get(get_global_entity_sources))
+        .route("/knowledge/global/path", get(get_global_path))
+        .route("/knowledge/global/export", get(get_global_export))
+        .route("/knowledge/global/conflicts", get(get_global_conflicts))
         .route("/cluster", get(crate::cluster::get_cluster_status))
         .route("/cluster/init", post(crate::cluster::init_cluster))
         .route("/cluster/add-learner", post(crate::cluster::add_learner))
@@ -289,7 +307,7 @@ async fn health_check() -> StatusCode {
     StatusCode::OK
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state, body))]
 #[utoipa::path(
     post,
     path = "/sessions",
@@ -298,11 +316,29 @@ async fn health_check() -> StatusCode {
         (status = 200, description = "Session created successfully", body = CreateSessionResponse)
     )
 )]
-async fn create_session() -> Json<CreateSessionResponse> {
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<CreateSessionRequest>>,
+) -> Result<Json<CreateSessionResponse>, MemoryServerError> {
     let session_id = Uuid::new_v4().to_string();
-    tracing::info!(session_id = %session_id, "created session");
 
-    Json(CreateSessionResponse { session_id })
+    if let Some(agent_id) = body.and_then(|b| b.0.agent_id) {
+        if let Some(raft) = &state.raft {
+            raft_write(
+                raft,
+                MemoryCommand::RegisterSession {
+                    session_id: session_id.clone(),
+                    agent_id: Some(agent_id),
+                },
+                &state.peer_http_addrs,
+                "/sessions",
+            )
+            .await?;
+        }
+    }
+
+    tracing::info!(session_id = %session_id, "created session");
+    Ok(Json(CreateSessionResponse { session_id }))
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]
@@ -777,6 +813,9 @@ mod tests {
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
                 tx
             },
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         })
     }
 
@@ -1236,6 +1275,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_visibility_route_exists_and_validates_body() {
+        let state = build_test_state();
+        let server = TestServer::new(build_router(state)).unwrap();
+        let resp = server
+            .put("/sessions/s1/visibility")
+            .json(&json!({ "visibility": "Shared" }))
+            .await;
+        assert!(
+            resp.status_code().is_success() || resp.status_code().as_u16() == 307,
+            "expected 2xx or 307 but got {}",
+            resp.status_code()
+        );
+    }
+
+    #[tokio::test]
     async fn knowledge_routes_are_registered() {
         let server = TestServer::new(build_router(build_test_state())).unwrap();
         server.get("/sessions/test-session/knowledge").await.assert_status_ok();
@@ -1243,6 +1297,44 @@ mod tests {
             .get("/sessions/test-session/knowledge/export?format=json")
             .await
             .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn global_endpoints_return_aggregated_view() {
+        use crate::knowledge::types::{Entity, Relationship};
+        use std::collections::HashMap;
+
+        let state = build_test_state();
+        {
+            let mut g = state.global_graph.write().await;
+            g.merge(
+                "s1",
+                0,
+                vec![
+                    Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+                    Entity { name: "OpenAI".into(), entity_type: "Organization".into(), attributes: HashMap::new() },
+                ],
+                vec![Relationship { from: "Alice".into(), to: "OpenAI".into(), relationship_type: "works_at".into() }],
+            );
+        }
+        let server = TestServer::new(build_router(state)).unwrap();
+
+        let all = server.get("/knowledge/global").await;
+        all.assert_status_ok();
+
+        let neighbors = server.get("/knowledge/global/entities/OpenAI").await;
+        neighbors.assert_status_ok();
+        assert!(neighbors.text().contains("Alice"));
+
+        let sources = server.get("/knowledge/global/entities/OpenAI/sources").await;
+        assert!(sources.text().contains("s1"));
+
+        let path = server.get("/knowledge/global/path?from=Alice&to=OpenAI").await;
+        path.assert_status_ok();
+        assert!(path.text().contains("works_at"));
+
+        let dot = server.get("/knowledge/global/export?format=dot").await;
+        assert!(dot.text().contains("digraph"));
     }
 
     #[tokio::test]

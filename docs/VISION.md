@@ -240,7 +240,9 @@ Learn:
 
 Status: complete. Persistent redb-backed Raft log and snapshot store, full state machine snapshots (short-term memory, core memory, knowledge graph), startup recovery, InstallSnapshot over gRPC for lagging followers, automatic log compaction. All 10 cluster-verify criteria pass.
 
-### Stage 3B: Collective memory
+### Stage 3B: Collective memory ✅
+
+Status: complete. Session visibility (Private/Shared) controlled via `SetSessionVisibility` Raft command, global cross-session knowledge graph with provenance and conflict tracking, agent registration at session creation, six new global REST endpoints, three new Prometheus gauges (`engram_global_entities`, `engram_global_relationships`, `engram_global_conflicts`), snapshot protocol v2 including global_graph/visibility/session_agents, 17/17 cluster-verify criteria pass.
 
 Goal:
 

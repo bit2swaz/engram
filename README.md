@@ -1,4 +1,4 @@
-# engram
+# Engram
 
 An asynchronous semantic memory backend for LLM agents, written in Rust.
 
@@ -7,11 +7,13 @@ An asynchronous semantic memory backend for LLM agents, written in Rust.
 
 ## overview
 
-engram is a backend service for large language model (LLM) agents. it provides three types of memory: short-term (recent messages), long-term (semantic vector search), and core memory (pinned facts). the goal is to give LLM agents a transparent, efficient, and controllable way to manage context and recall information.
+Engram is a backend service for LLM agents. It stores three types of memory: short-term (recent messages), long-term (semantic vector search), and core memory (pinned facts). The goal is to give agents a transparent, efficient, and controllable way to manage context.
 
-engram is written in rust for performance and reliability. it is designed for transparency, with full control over token budgets and context assembly, and exposes all operations via a simple REST API.
+Engram is written in Rust for performance and reliability. It exposes all operations via a REST API and gives you full control over token budgets and context assembly.
 
-engram is built for developers who want to plug in their own LLM agents, run locally or in production, and have full visibility into how memory is managed. it is easy to run, test, and extend. all memory operations are behind trait abstractions, making it easy to swap implementations or mock for tests.
+Engram is built for developers who want to plug in their own LLM agents, run locally or in production, and see exactly what goes into the context window. All memory operations are behind trait abstractions, so you can swap implementations or mock them in tests without changing any calling code.
+
+With the latest update, Engram also supports collective memory: multiple agents can share a global knowledge graph, sessions can be marked public or private, and conflicting facts across sessions are surfaced via a dedicated endpoint.
 
 ## architecture
 
@@ -26,14 +28,20 @@ graph TD
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
     router --> knowledgehandler["knowledge handler"]
+    router --> visibilityhandler["visibility handler"]
+    router --> globalhandler["global knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
-    sessionhandler -->|delete| raft
+    sessionhandler -->|delete or register agent| raft
+    visibilityhandler -->|write| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
+    raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
+    raft -->|state machine apply| visibility["session visibility map"]
     raft -->|embedding job| embedqueue["embedding worker pool<br/>bounded channel"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool<br/>bounded channel"]
     raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
@@ -51,8 +59,11 @@ graph TD
 
     knowledgequeue -->|leader-only extraction| extractor["knowledge extractor trait"]
     extractor -->|openai gpt-4o-mini / mock| extraction["entities + relationships"]
-    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    extraction -->|AddKnowledge via raft| knowledgegraph
+    knowledgegraph -->|public sessions merge| globalgraph
+
     knowledgehandler --> knowledgegraph
+    globalhandler --> globalgraph
 
     contexthandler --> assembler["context assembler"]
     assembler --> shortterm
@@ -104,6 +115,12 @@ create a session:
 ```sh
 curl -X POST http://localhost:3000/sessions
 ```
+create a session and register an agent:
+```sh
+curl -X POST http://localhost:3000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"agent-42"}'
+```
 add a message:
 ```sh
 curl -X POST http://localhost:3000/sessions/{session_id}/messages \
@@ -126,6 +143,16 @@ curl -X PUT http://localhost:3000/sessions/{session_id}/core-memory \
   -H 'content-type: application/json' \
   -d '{"fact":"user prefers dark mode"}'
 ```
+make a session public so it contributes to the global knowledge graph:
+```sh
+curl -X PUT http://localhost:3000/sessions/{session_id}/visibility \
+  -H 'content-type: application/json' \
+  -d '{"visibility":"Shared"}'
+```
+query the global knowledge graph:
+```sh
+curl http://localhost:3000/knowledge/global
+```
 delete session:
 ```sh
 curl -X DELETE http://localhost:3000/sessions/{session_id}
@@ -143,26 +170,33 @@ docker compose up -d
 
 ## API overview
 
-| method | path                                                        | description                                  |
-|--------|-------------------------------------------------------------|----------------------------------------------|
-| GET    | /health                                                     | health check                                 |
-| GET    | /metrics                                                    | Prometheus metrics                           |
-| GET    | /api-docs/openapi.json                                      | OpenAPI specification                        |
-| GET    | /swagger-ui/                                                | Swagger UI                                   |
-| POST   | /sessions                                                   | create session                               |
-| POST   | /sessions/{session_id}/messages                             | add message                                  |
-| GET    | /sessions/{session_id}/context                              | get assembled context                        |
-| POST   | /sessions/{session_id}/search                               | semantic search                              |
-| PUT    | /sessions/{session_id}/core-memory                          | add core memory fact                         |
-| DELETE | /sessions/{session_id}                                      | delete session                               |
-| GET    | /sessions/{session_id}/knowledge                            | get knowledge graph (entities + edges)       |
-| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}     | get related entities for a given entity      |
-| GET    | /sessions/{session_id}/knowledge/path?from=X&to=Y           | find shortest path between two entities      |
-| GET    | /sessions/{session_id}/knowledge/export?format=json\|dot    | export knowledge graph (JSON or Graphviz)    |
-| GET    | /cluster                                                    | cluster status (cluster mode only)           |
-| POST   | /cluster/init                                               | initialize cluster                           |
-| POST   | /cluster/add-learner                                        | add a learner node                           |
-| POST   | /cluster/change-membership                                  | promote learners to full members             |
+| method | path                                                          | description                                  |
+|--------|---------------------------------------------------------------|----------------------------------------------|
+| GET    | /health                                                       | health check                                 |
+| GET    | /metrics                                                      | Prometheus metrics                           |
+| GET    | /api-docs/openapi.json                                        | OpenAPI specification                        |
+| GET    | /swagger-ui/                                                  | Swagger UI                                   |
+| POST   | /sessions                                                     | create session (optional agent_id body)      |
+| POST   | /sessions/{session_id}/messages                               | add message                                  |
+| GET    | /sessions/{session_id}/context                                | get assembled context                        |
+| POST   | /sessions/{session_id}/search                                 | semantic search                              |
+| PUT    | /sessions/{session_id}/core-memory                            | add core memory fact                         |
+| PUT    | /sessions/{session_id}/visibility                             | set session visibility (Private/Shared)      |
+| DELETE | /sessions/{session_id}                                        | delete session                               |
+| GET    | /sessions/{session_id}/knowledge                              | get knowledge graph (entities + edges)       |
+| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}       | get related entities for a given entity      |
+| GET    | /sessions/{session_id}/knowledge/path?from=X&to=Y             | find shortest path between two entities      |
+| GET    | /sessions/{session_id}/knowledge/export?format=json\|dot      | export knowledge graph (JSON or Graphviz)    |
+| GET    | /knowledge/global                                             | get cross-session global knowledge graph     |
+| GET    | /knowledge/global/entities/{name}                             | get related entities in global graph         |
+| GET    | /knowledge/global/entities/{name}/sources                     | get sessions that contributed this entity    |
+| GET    | /knowledge/global/path?from=X&to=Y                            | find path in global graph                    |
+| GET    | /knowledge/global/export?format=json\|dot                     | export global graph                          |
+| GET    | /knowledge/global/conflicts                                   | list conflicting facts across sessions       |
+| GET    | /cluster                                                      | cluster status (cluster mode only)           |
+| POST   | /cluster/init                                                 | initialize cluster                           |
+| POST   | /cluster/add-learner                                          | add a learner node                           |
+| POST   | /cluster/change-membership                                    | promote learners to full members             |
 
 see [API.md](docs/API.md) for full details.
 
@@ -214,13 +248,17 @@ values like `similarity_threshold` and `max_tokens` are controlled per request t
 - per-session knowledge graph with BFS path-finding, persisted via snapshots
 - leader-only extraction with Raft-replicated `AddKnowledge` command (all nodes stay consistent)
 - knowledge graph export (JSON and Graphviz DOT)
-- Prometheus metrics endpoint (includes knowledge and snapshot metrics)
+- session visibility control (Private/Shared) via `SetSessionVisibility` Raft command
+- global cross-session knowledge graph: public sessions contribute their entities and relationships to a shared graph
+- agent registration: sessions can be associated with a named agent at creation time
+- conflict detection: the global graph tracks conflicting relationship types across sessions
+- Prometheus metrics endpoint (includes knowledge, snapshot, and global graph metrics)
 - Raft consensus for fault-tolerant distributed writes (OpenRaft 0.9)
 - gRPC inter-node transport for Raft (Vote, AppendEntries, and InstallSnapshot via tonic 0.12)
 - follower-to-leader HTTP redirect (307) in cluster mode
 - per-node LanceDB with eventual consistency via deterministic embeddings
 - persistent redb-backed Raft log and snapshot store (survives restarts)
-- full state machine snapshots covering short-term memory, core memory, and knowledge graph
+- full state machine snapshots covering short-term memory, core memory, knowledge graph, global graph, session visibility, and agent registry
 - startup recovery from the latest snapshot followed by Raft log replay
 - InstallSnapshot RPC so lagging followers catch up without manual re-initialization
 - automatic log compaction after every `SNAPSHOT_LOG_THRESHOLD` committed entries
@@ -230,7 +268,7 @@ values like `similarity_threshold` and `max_tokens` are controlled per request t
 
 ## quickstart (3-node cluster)
 
-the cluster compose file runs three engram nodes, each with its own Redis instance, connected over a shared Docker network.
+the cluster compose file runs three Engram nodes, each with its own Redis instance, connected over a shared Docker network.
 
 ```sh
 # copy and fill in your OpenAI key
@@ -242,11 +280,11 @@ docker compose -f docker-compose.cluster.yml up -d --build
 # wait for all nodes to be healthy, then initialize the cluster
 ./scripts/cluster-init.sh
 
-# verify all Stage 1 acceptance criteria
+# verify all acceptance criteria
 ./scripts/cluster-verify.sh
 ```
 
-the verify script checks 10 criteria: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication, delete-session cleanup, node restart and recovery from the Raft log, snapshot compaction, and restart-then-verify that state is fully restored from the latest snapshot. it exits 0 only if all criteria pass.
+the verify script checks 17 criteria: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication, delete-session cleanup, node restart and recovery from the Raft log, snapshot compaction, restart-then-verify that state is fully restored from the latest snapshot, session visibility propagation, global graph population from public sessions, agent registration, global entity and relationship count metrics, global entity queries, global conflict detection, and global graph snapshot round-trip. it exits 0 only if all criteria pass.
 
 see `docker-compose.cluster.yml` and the scripts in `scripts/` for details.
 
@@ -257,7 +295,7 @@ the repository includes a retrieval-quality harness for LongMemEval and BEAM und
 - LongMemEval uses `benchmarks/longmemeval_engram.py` and emits retrieval summaries plus `hypothesis.jsonl` for the official evaluator.
 - BEAM uses `benchmarks/beam_engram.py` and supports flat JSON input as well as the repository-style `chats/100K`, `chats/500K`, and `chats/1M` layouts.
 - `scripts/run_quality_benchmarks.sh` defaults to `http://127.0.0.1:3002` and is meant to target the Docker Compose deployment to avoid common port `3000` conflicts.
-- Retrieval smoke runs can avoid hosted embedding APIs entirely by letting the harness start `tools/local_embed_server.py` and a matching engram process with `--start-local-embed-server --start-engram`.
+- Retrieval smoke runs can avoid hosted embedding APIs entirely by letting the harness start `tools/local_embed_server.py` and a matching Engram process with `--start-local-embed-server --start-engram`.
 - Preliminary LongMemEval retrieval results are now published: a 5-question local-embedder slice reached perfect recall@5/10. See `BENCHMARKS.md`.
 
 see [docs/QUALITY_BENCHMARKS.md](docs/QUALITY_BENCHMARKS.md) for the end-to-end runbook.

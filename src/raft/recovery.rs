@@ -56,7 +56,9 @@ mod tests {
         let (etx, _erx) = mpsc::channel(10);
         let (ktx, _krx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
-        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db);
+        let gg = Arc::new(RwLock::new(crate::knowledge::global::GlobalGraph::new()));
+        let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
+        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db, gg, metrics);
         (sm, st, cm, kg)
     }
 

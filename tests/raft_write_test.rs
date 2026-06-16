@@ -22,7 +22,9 @@ async fn single_node_raft_write_commits_to_state_machine() {
         ..Config::default()
     };
     let knowledge_graph = Arc::new(tokio::sync::RwLock::new(engram::knowledge::graph::KnowledgeGraph::new()));
+    let global_graph = Arc::new(tokio::sync::RwLock::new(engram::knowledge::GlobalGraph::new()));
     let (knowledge_tx, _knowledge_rx) = mpsc::channel(500);
+    let metrics = Arc::new(engram::metrics::AppMetrics::new().unwrap());
     let raft = build_raft_node(
         &config,
         short_term.clone(),
@@ -31,6 +33,8 @@ async fn single_node_raft_write_commits_to_state_machine() {
         tx,
         knowledge_graph,
         knowledge_tx,
+        global_graph,
+        metrics,
     )
     .await
     .unwrap();

@@ -2,15 +2,15 @@
 
 ## Overview
 
-engram is an asynchronous semantic memory backend for LLM-powered agents, written in Rust. It provides short-term, long-term, and core memory for agents, enabling context assembly with strict token budgeting, semantic search, and transparent memory management.
+Engram is an asynchronous semantic memory backend for LLM-powered agents, written in Rust. It provides short-term, long-term, and core memory for agents, enabling context assembly with strict token budgeting, semantic search, and transparent memory management.
 
-The system is designed for performance, reliability, and developer control, with all major components behind trait abstractions for easy swapping and testing.
+All major components are behind trait abstractions so implementations can be swapped out and mocked in tests without changing any calling code.
 
 ## Data flow
 
-in cluster mode, writes go through Raft consensus before reaching the stores. in standalone mode (NODE_ID not set), the Raft layer is absent and write handlers reach the stores directly.
+In cluster mode, writes go through Raft consensus before reaching the stores. In standalone mode (NODE_ID not set), the Raft layer is absent and write handlers reach the stores directly.
 
-reads (context, search) always go directly to the local stores on whichever node receives the request.
+Reads (context, search, knowledge queries) always go directly to the local stores on whichever node receives the request.
 
 ```mermaid
 graph TD
@@ -24,14 +24,20 @@ graph TD
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
     router --> knowledgehandler["knowledge handler"]
+    router --> visibilityhandler["visibility handler"]
+    router --> globalhandler["global knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
-    sessionhandler -->|delete| raft
+    sessionhandler -->|delete or register agent| raft
+    visibilityhandler -->|write| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory (trait)"]
     raft -->|state machine apply| coremem["core memory store (trait)"]
+    raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
+    raft -->|state machine apply| visibility["session visibility map"]
     raft -->|embedding job| embedqueue["embedding worker pool (bounded channel)"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool (bounded channel)"]
     raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
@@ -50,8 +56,11 @@ graph TD
 
     knowledgequeue -->|leader-only| extractor["knowledge extractor (trait)"]
     extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
-    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    extraction -->|AddKnowledge via raft| knowledgegraph
+    knowledgegraph -->|public sessions merge| globalgraph
+
     knowledgehandler --> knowledgegraph
+    globalhandler --> globalgraph
 
     searchhandler --> embedprovider
     searchhandler --> longterm
@@ -101,6 +110,8 @@ All major components are behind trait abstractions, which lets implementations b
 | MockKnowledgeExtractor as default in Docker Compose | always OpenAI | decouples cluster verification from OpenAI API quota; pattern-matching mock is deterministic and offline-capable |
 | redb v2 for Raft log and snapshot store | sled, RocksDB, file-based log | redb is pure Rust, ACID, embedded, and simple to use; the key constraint is that tables must be pre-created in a write transaction before any read transaction touches them on a fresh database |
 | Redis as a projection, not the source of truth | reconcile Redis with Raft log on recovery | flushing Redis unconditionally on startup and restoring from the snapshot avoids a maze of reconciliation edge cases; one authoritative source (Raft log plus latest snapshot) with all volatile state derived from it |
+| global graph as in-memory projection of public sessions | separate global persistent store | the global graph is always derivable from the full log; snapshotting it avoids replaying the entire history on startup while keeping the system simple |
+| session visibility defaults to Private | defaults to Shared | private by default prevents unintended cross-agent knowledge leakage; agents opt in explicitly |
 
 ## Context assembly algorithm
 
@@ -131,8 +142,8 @@ Stage 2 adds a knowledge graph pipeline that runs alongside the existing memory 
 
 ### Knowledge pipeline
 
-1. State machine receives `AddMessage` command → enqueues `KnowledgeJob { session_id, message_id, text }` on a bounded channel (capacity 500 by default).
-2. Knowledge workers dequeue jobs. In cluster mode only the **current leader** calls the extractor; followers skip because they will receive the result via Raft replication. This prevents duplicate LLM calls and avoids non-deterministic divergence between nodes.
+1. State machine receives `AddMessage` command and enqueues `KnowledgeJob { session_id, message_id, text }` on a bounded channel (capacity 500 by default).
+2. Knowledge workers dequeue jobs. In cluster mode only the current leader calls the extractor; followers skip because they will receive the result via Raft replication. This prevents duplicate LLM calls and avoids non-deterministic divergence between nodes.
 3. The extractor calls GPT-4o-mini (or the mock) with a structured JSON prompt requesting named entities and typed relationships.
 4. The result is submitted as a `MemoryCommand::AddKnowledge` through `raft.client_write()`. OpenRaft replicates this to all nodes.
 5. Each node's state machine applies `AddKnowledge` to its local `KnowledgeGraph` (idempotent by `(session_id, message_id)` key).
@@ -160,7 +171,7 @@ Key operations:
 
 ### Knowledge metrics
 
-Four new Prometheus metrics are exposed alongside the existing Raft and embedding metrics:
+Four Prometheus metrics are exposed alongside the existing Raft and embedding metrics:
 
 | metric | type | description |
 |--------|------|-------------|
@@ -171,7 +182,7 @@ Four new Prometheus metrics are exposed alongside the existing Raft and embeddin
 
 ## Distributed cluster mode (Stage 1)
 
-In cluster mode, multiple engram nodes form a Raft consensus group using [OpenRaft 0.9](https://github.com/datafuselabs/openraft). Cluster mode is enabled by setting `NODE_ID` in the environment. Without it, the server runs in standalone mode exactly as described above.
+In cluster mode, multiple Engram nodes form a Raft consensus group using [OpenRaft 0.9](https://github.com/datafuselabs/openraft). Cluster mode is enabled by setting `NODE_ID` in the environment. Without it, the server runs in standalone mode exactly as described above.
 
 ### Node anatomy
 
@@ -236,14 +247,14 @@ OpenAI text embeddings are deterministic for the same input. All nodes converge 
 | component | description |
 |-----------|-------------|
 | `EngRaftLogStore` | redb-backed persistent log store; implements `RaftLogStorage + RaftLogReader`; pre-creates tables on init so read transactions never fail on a fresh database |
-| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis and the knowledge graph; hosts `EngSnapshotBuilder`, which serializes the full state to an `EngramSnapshot` payload and persists it in redb |
+| `EngStateMachineStore` | applies committed `MemoryCommand` entries to Redis, the per-session knowledge graph, the global graph, and the session visibility map; hosts `EngSnapshotBuilder`, which serializes the full state to an `EngramSnapshot` payload and persists it in redb |
 | `EngRaftNetwork` | factory that creates per-peer gRPC connections using tonic channels |
 | `EngRaftNetworkConnection` | sends Vote, AppendEntries, and InstallSnapshot RPCs over gRPC; the snapshot payload is a serialized `EngramSnapshot` |
 | `RaftGrpcServer` | tonic service that forwards incoming Raft RPCs to the local `RaftHandle`; handles `InstallSnapshotRequest` so lagging followers can restore a leader snapshot over gRPC |
 
-`MemoryCommand` has four variants: `AddMessage`, `AddFact`, `DeleteSession`, and `AddKnowledge`. `AddMessage` also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
+`MemoryCommand` has six variants: `AddMessage`, `AddFact`, `DeleteSession`, `AddKnowledge`, `SetSessionVisibility`, and `RegisterSession`. `AddMessage` also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
 
-`EngramSnapshot` is the versioned payload serialized into every snapshot. It contains `short_term`, `core_memory`, `knowledge_graph`, and a reserved `global_graph` field. Adding `version: 1` and `#[serde(default)]` on optional fields means future stages can extend the payload without breaking existing snapshots.
+`EngramSnapshot` is the versioned payload serialized into every snapshot. It contains `short_term`, `core_memory`, `knowledge_graph`, `global_graph`, `visibility`, and `session_agents`. The `version: 1` field and `#[serde(default)]` on optional fields mean older nodes can install newer snapshots by ignoring fields they don't recognize.
 
 `recover_state_machine()` in `src/raft/recovery.rs` runs at node startup before Raft is initialized. It flushes Redis, loads the latest persisted snapshot from redb, restores the payload into the live stores, and advances `last_applied` and `last_membership`. OpenRaft then replays any committed log entries that sit past the snapshot index.
 
@@ -282,8 +293,6 @@ Stage 3A replaced the in-memory Raft log store with a persistent redb-backed sto
 
 The leader builds a snapshot by serializing the entire state machine under the `SmInner` lock. Holding the lock continuously across all `dump_all` calls (short-term memory, core memory, knowledge graph) guarantees that the snapshot represents exactly the state at `last_applied` index N rather than a mix of states from different moments.
 
-The snapshot payload is `EngramSnapshot`: a versioned struct with `version: 1`, three store snapshots, and a reserved `global_graph` field marked `#[serde(default)]` so Stage 3B can add it without breaking existing snapshots.
-
 Snapshots are stored in redb in the same database file as the Raft log (`RAFT_DB_PATH`). Log compaction runs automatically when the number of committed entries since the last snapshot exceeds `SNAPSHOT_LOG_THRESHOLD` (default 1000).
 
 ### Recovery sequence
@@ -292,7 +301,7 @@ At startup, before OpenRaft is initialized, `recover_state_machine()` runs:
 
 1. Flush Redis completely. This is unconditional; Redis is always treated as a projection, never as a source of truth.
 2. Load the latest `EngramSnapshot` from the redb snapshot table.
-3. Restore `short_term`, `core_memory`, and `knowledge_graph` from the snapshot payload.
+3. Restore `short_term`, `core_memory`, `knowledge_graph`, `global_graph`, `visibility`, and `session_agents` from the snapshot payload.
 4. Set `last_applied` and `last_membership` so OpenRaft knows where the state machine is.
 5. OpenRaft reads the persistent log and replays any committed entries past the snapshot index.
 
@@ -314,9 +323,58 @@ Three Prometheus metrics are exported in cluster mode alongside the existing Raf
 
 `engram_snapshot_last_index` is updated from the OpenRaft `RaftMetrics.snapshot` field in the background metrics watcher task in `app.rs`.
 
+## Stage 3B: Collective memory
+
+Stage 3B adds cross-agent knowledge sharing. Multiple agents can now contribute to a shared global knowledge graph, control whether their sessions are public or private, and inspect conflicts between facts reported by different sessions.
+
+### Session visibility
+
+Each session has a visibility setting that defaults to `Private`. When set to `Shared`, the session's knowledge extraction results are merged into the global graph. The `SetSessionVisibility` Raft command replicates this change to all nodes so the visibility state stays consistent across the cluster.
+
+`PUT /sessions/{session_id}/visibility` accepts `{ "visibility": "Shared" }` or `{ "visibility": "Private" }`. In standalone mode the command is accepted and no-ops (there is no global coordination needed when running a single node).
+
+### Agent registration
+
+`POST /sessions` now accepts an optional `agent_id` field in the request body. When provided, the server issues a `RegisterSession` Raft command that records the `(session_id, agent_id)` mapping in `SmInner.session_agents`. This mapping is included in snapshots and survives restarts. It lets you trace which agent produced which knowledge in the global graph.
+
+### Global knowledge graph
+
+`GlobalGraph` is an in-memory directed graph that aggregates entities and relationships from all sessions whose visibility is set to `Shared`. It also tracks provenance (which session contributed each entity) and detects conflicts (the same entity connected to another entity via different relationship types across sessions).
+
+When the state machine applies `AddKnowledge` for a session that is visible, it calls `global_graph.merge_with_agent()`, which upserts entities and edges with provenance metadata. Conflicts are recorded when a new relationship type for the same entity pair differs from an existing one.
+
+### Global REST endpoints
+
+| method | path | description |
+|--------|------|-------------|
+| PUT | `/sessions/{id}/visibility` | set session visibility (Private or Shared) |
+| GET | `/knowledge/global` | full global graph: all entities and edges |
+| GET | `/knowledge/global/entities/{name}` | entities connected to the named entity in the global graph |
+| GET | `/knowledge/global/entities/{name}/sources` | sessions that contributed this entity |
+| GET | `/knowledge/global/path?from=X&to=Y` | BFS shortest path in the global graph |
+| GET | `/knowledge/global/export?format=json\|dot` | export the global graph as JSON or Graphviz DOT |
+| GET | `/knowledge/global/conflicts` | list conflicting relationship types across sessions |
+
+All global read endpoints return data from the local in-memory `GlobalGraph`. In cluster mode the global graph is eventually consistent: a freshly committed `SetSessionVisibility` or `AddKnowledge` may not appear immediately on a follower that is slightly behind the leader.
+
+### Global graph metrics
+
+Three Prometheus gauges track the state of the global graph. They are updated each time the state machine applies a command that modifies the global graph:
+
+| metric | type | description |
+|--------|------|-------------|
+| `engram_global_entities` | gauge | number of distinct entities in the global graph |
+| `engram_global_relationships` | gauge | number of edges in the global graph |
+| `engram_global_conflicts` | gauge | number of detected conflicting relationship types |
+
+### Snapshot protocol v2
+
+The `EngramSnapshot` payload now includes `global_graph`, `visibility`, and `session_agents` fields alongside the existing `short_term`, `core_memory`, and `knowledge_graph` fields. The `#[serde(default)]` attribute on all new fields means Stage 3A snapshots deserialize cleanly on Stage 3B nodes.
+
 ## Deferred items
 
-The following remain out of scope after Stage 3A:
+The following remain out of scope after Stage 3B:
 
 - **LanceDB replication.** Each node still calls the embedding API independently. Routing vector storage through Raft (leader-only embedding, follower payload replication) is a future item.
+- **KG-augmented context assembly.** The knowledge graph (per-session and global) is queryable via REST but is not yet integrated into the context assembly pipeline to augment semantic search results.
 - **Multi-tenant auth.** Cluster-aware authentication routing.

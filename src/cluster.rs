@@ -208,6 +208,7 @@ mod tests {
             ..Config::default()
         };
         let knowledge_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::graph::KnowledgeGraph::new()));
+        let global_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::global::GlobalGraph::new()));
         let (knowledge_tx, mut knowledge_rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(500);
         tokio::spawn(async move { while knowledge_rx.recv().await.is_some() {} });
         let raft = build_raft_node(
@@ -218,6 +219,8 @@ mod tests {
             c.embedding_job_sender.clone(),
             knowledge_graph.clone(),
             knowledge_tx.clone(),
+            global_graph,
+            c.metrics.clone(),
         )
         .await
         .unwrap();
@@ -246,6 +249,9 @@ mod tests {
             cluster_peers: vec![],
             knowledge_graph,
             knowledge_job_sender: knowledge_tx,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         });
         (TestServer::new(build_router(state)).unwrap(), raft_dir)
     }
@@ -274,6 +280,9 @@ mod tests {
                 crate::knowledge::graph::KnowledgeGraph::new(),
             )),
             knowledge_job_sender,
+            global_graph: Arc::new(tokio::sync::RwLock::new(
+                crate::knowledge::global::GlobalGraph::new(),
+            )),
         });
         TestServer::new(build_router(state)).unwrap()
     }

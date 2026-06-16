@@ -1,35 +1,47 @@
 # API Reference
 
-This document describes every REST endpoint exposed by engram. All endpoints are served at `http://localhost:3000` by default.
+This document describes every REST endpoint exposed by Engram. All endpoints are served at `http://localhost:3000` by default.
 
-| method | path                                                        | description                                           |
-|--------|-------------------------------------------------------------|-------------------------------------------------------|
-| POST   | /sessions                                                   | create a new session                                  |
-| POST   | /sessions/{session_id}/messages                             | add a message                                         |
-| GET    | /sessions/{session_id}/context                              | get assembled context                                 |
-| POST   | /sessions/{session_id}/search                               | semantic search over long-term memory                 |
-| DELETE | /sessions/{session_id}                                      | delete a session and all its memories                 |
-| PUT    | /sessions/{session_id}/core-memory                          | add a core memory fact                                |
-| GET    | /sessions/{session_id}/knowledge                            | get full knowledge graph for the session              |
-| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}     | get all entities connected to a named entity          |
-| GET    | /sessions/{session_id}/knowledge/path                       | find shortest path between two entities               |
-| GET    | /sessions/{session_id}/knowledge/export                     | export knowledge graph (JSON or Graphviz DOT)         |
-| GET    | /health                                                     | health check                                          |
-| GET    | /metrics                                                    | Prometheus metrics                                    |
-| GET    | /api-docs/openapi.json                                      | OpenAPI specification                                 |
-| GET    | /swagger-ui/                                                | Swagger UI                                            |
-| GET    | /cluster                                                    | cluster status (cluster mode only)                    |
-| POST   | /cluster/init                                               | initialize the Raft cluster                           |
-| POST   | /cluster/add-learner                                        | add a learner node                                    |
-| POST   | /cluster/change-membership                                  | promote learners to full voting members               |
+| method | path                                                          | description                                           |
+|--------|---------------------------------------------------------------|-------------------------------------------------------|
+| POST   | /sessions                                                     | create a new session (optional agent_id)              |
+| POST   | /sessions/{session_id}/messages                               | add a message                                         |
+| GET    | /sessions/{session_id}/context                                | get assembled context                                 |
+| POST   | /sessions/{session_id}/search                                 | semantic search over long-term memory                 |
+| DELETE | /sessions/{session_id}                                        | delete a session and all its memories                 |
+| PUT    | /sessions/{session_id}/core-memory                            | add a core memory fact                                |
+| PUT    | /sessions/{session_id}/visibility                             | set session visibility (Private or Shared)            |
+| GET    | /sessions/{session_id}/knowledge                              | get full knowledge graph for the session              |
+| GET    | /sessions/{session_id}/knowledge/entities/{entity_name}       | get all entities connected to a named entity          |
+| GET    | /sessions/{session_id}/knowledge/path                         | find shortest path between two entities               |
+| GET    | /sessions/{session_id}/knowledge/export                       | export knowledge graph (JSON or Graphviz DOT)         |
+| GET    | /knowledge/global                                             | get the cross-session global knowledge graph          |
+| GET    | /knowledge/global/entities/{name}                             | get entities connected to a named entity (global)     |
+| GET    | /knowledge/global/entities/{name}/sources                     | get sessions that contributed a named entity          |
+| GET    | /knowledge/global/path                                        | find shortest path in the global graph                |
+| GET    | /knowledge/global/export                                      | export global graph (JSON or Graphviz DOT)            |
+| GET    | /knowledge/global/conflicts                                   | list conflicting facts across sessions                |
+| GET    | /health                                                       | health check                                          |
+| GET    | /metrics                                                      | Prometheus metrics                                    |
+| GET    | /api-docs/openapi.json                                        | OpenAPI specification                                 |
+| GET    | /swagger-ui/                                                  | Swagger UI                                            |
+| GET    | /cluster                                                      | cluster status (cluster mode only)                    |
+| POST   | /cluster/init                                                 | initialize the Raft cluster                           |
+| POST   | /cluster/add-learner                                          | add a learner node                                    |
+| POST   | /cluster/change-membership                                    | promote learners to full voting members               |
 
 ---
 
 ## POST /sessions
 
-create a new session.
+Create a new session. Optionally supply an `agent_id` to associate the session with a named agent. In cluster mode, a non-empty `agent_id` is persisted via a `RegisterSession` Raft command so the mapping survives restarts.
 
-**request body:** none
+**request body:** optional
+```json
+{
+  "agent_id": "agent-42"
+}
+```
 
 **success response:**
 - status: 200
@@ -43,16 +55,22 @@ create a new session.
 **error responses:**
 - 500: internal server error
 
-**example:**
+**examples:**
 ```sh
+# no agent association
 curl -X POST http://localhost:3000/sessions
+
+# with agent association
+curl -X POST http://localhost:3000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"agent-42"}'
 ```
 
 ---
 
 ## POST /sessions/{session_id}/messages
 
-add a message to a session.
+Add a message to a session.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -88,7 +106,7 @@ curl -X POST http://localhost:3000/sessions/{session_id}/messages \
 
 ## GET /sessions/{session_id}/context
 
-get the assembled context for a session.
+Get the assembled context for a session.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -121,7 +139,7 @@ curl http://localhost:3000/sessions/{session_id}/context
 
 ## POST /sessions/{session_id}/search
 
-semantic search over long-term memory.
+Semantic search over long-term memory.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -162,7 +180,7 @@ curl -X POST http://localhost:3000/sessions/{session_id}/search \
 
 ## DELETE /sessions/{session_id}
 
-delete a session and all its memories.
+Delete a session and all its memories.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -182,7 +200,7 @@ curl -X DELETE http://localhost:3000/sessions/{session_id}
 
 ## PUT /sessions/{session_id}/core-memory
 
-add a core memory fact to a session.
+Add a core memory fact to a session.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -212,9 +230,44 @@ curl -X PUT http://localhost:3000/sessions/{session_id}/core-memory \
 
 ---
 
+## PUT /sessions/{session_id}/visibility
+
+Set the visibility of a session. Sessions are `Private` by default. Setting a session to `Shared` causes its extracted knowledge to be merged into the global knowledge graph.
+
+In cluster mode this goes through Raft so all nodes see the same visibility state. In standalone mode the command is accepted and no-ops.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**request body:**
+```json
+{
+  "visibility": "Shared"
+}
+```
+
+`visibility` must be `"Shared"` or `"Private"`.
+
+**success response:**
+- status: 204 (no content)
+
+**error responses:**
+- 400: invalid request body
+- 307: redirect to leader (cluster mode, follower received the request)
+- 500: failed to set visibility
+
+**example:**
+```sh
+curl -X PUT http://localhost:3000/sessions/{session_id}/visibility \
+  -H 'content-type: application/json' \
+  -d '{"visibility":"Shared"}'
+```
+
+---
+
 ## GET /health
 
-health check endpoint.
+Health check endpoint.
 
 **success response:**
 - status: 200
@@ -273,13 +326,13 @@ curl http://localhost:3000/swagger-ui/
 
 ## cluster endpoints
 
-these endpoints are only available when the node is started in cluster mode (i.e., `NODE_ID` is set). standalone nodes return 503.
+These endpoints are only available when the node is started in cluster mode (i.e., `NODE_ID` is set). Standalone nodes return 503.
 
 ---
 
 ## GET /cluster
 
-returns the current Raft cluster status for this node.
+Returns the current Raft cluster status for this node.
 
 **success response:**
 - status: 200
@@ -311,7 +364,7 @@ curl http://localhost:3000/cluster
 
 ## POST /cluster/init
 
-initializes the Raft cluster. call this once from any node after all nodes are running. reads `NODE_ID`, `RAFT_ADDR` (or `RAFT_ADVERTISE_ADDR`), and `CLUSTER_PEERS` from the node's environment to build the initial membership set.
+Initializes the Raft cluster. Call this once from any node after all nodes are running. Reads `NODE_ID`, `RAFT_ADDR` (or `RAFT_ADVERTISE_ADDR`), and `CLUSTER_PEERS` from the node's environment to build the initial membership set.
 
 **request body:** none
 
@@ -331,7 +384,7 @@ curl -X POST http://localhost:3000/cluster/init
 
 ## POST /cluster/add-learner
 
-adds a new node as a learner. learners receive log replication but do not vote in elections. promote to a full member with `/cluster/change-membership`.
+Adds a new node as a learner. Learners receive log replication but do not vote in elections. Promote to a full member with `/cluster/change-membership`.
 
 **request body:**
 ```json
@@ -356,7 +409,7 @@ curl -X POST http://localhost:3000/cluster/add-learner \
 
 ## POST /cluster/change-membership
 
-changes the cluster membership to the given set of node IDs. nodes in the new set that are currently learners are promoted to full members; nodes not in the new set are removed.
+Changes the cluster membership to the given set of node IDs. Nodes in the new set that are currently learners are promoted to full members; nodes not in the new set are removed.
 
 **request body:**
 ```json
@@ -381,13 +434,13 @@ curl -X POST http://localhost:3000/cluster/change-membership \
 
 ## knowledge graph endpoints
 
-these endpoints query the per-session knowledge graph built by the background knowledge extraction pipeline. entities and relationships are extracted automatically from every message added to the session. results reflect all committed messages; there may be a brief delay while extraction jobs are processed.
+These endpoints query the per-session knowledge graph built by the background knowledge extraction pipeline. Entities and relationships are extracted automatically from every message added to the session. Results reflect all committed messages; there may be a brief delay while extraction jobs are processed.
 
 ---
 
 ## GET /sessions/{session_id}/knowledge
 
-returns all entities and edges in the session's knowledge graph.
+Returns all entities and edges in the session's knowledge graph.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -417,7 +470,7 @@ curl http://localhost:3000/sessions/{session_id}/knowledge
 
 ## GET /sessions/{session_id}/knowledge/entities/{entity_name}
 
-returns all entities directly connected to the named entity, including both incoming and outgoing relationships.
+Returns all entities directly connected to the named entity, including both incoming and outgoing relationships.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -452,7 +505,7 @@ curl http://localhost:3000/sessions/{session_id}/knowledge/entities/Alice
 
 ## GET /sessions/{session_id}/knowledge/path
 
-finds the shortest directed path (BFS over outgoing edges) between two named entities.
+Finds the shortest directed path (BFS over outgoing edges) between two named entities.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -484,7 +537,7 @@ curl "http://localhost:3000/sessions/{session_id}/knowledge/path?from=Alice&to=B
 
 ## GET /sessions/{session_id}/knowledge/export
 
-exports the knowledge graph in JSON or Graphviz DOT format.
+Exports the knowledge graph in JSON or Graphviz DOT format.
 
 **path parameters:**
 - `session_id` (string): session identifier
@@ -515,4 +568,165 @@ digraph knowledge {
 **example:**
 ```sh
 curl "http://localhost:3000/sessions/{session_id}/knowledge/export?format=dot"
+```
+
+---
+
+## global knowledge graph endpoints
+
+The global graph aggregates entities and relationships from all sessions whose visibility is set to `Shared`. These endpoints return data from the local in-memory global graph. In cluster mode the global graph is eventually consistent with the leader.
+
+---
+
+## GET /knowledge/global
+
+Returns all entities and edges in the global knowledge graph.
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "entities": [
+    { "name": "Alice", "entity_type": "Person", "attributes": {} },
+    { "name": "OpenAI", "entity_type": "Organization", "attributes": {} }
+  ],
+  "edges": [
+    { "from": "Alice", "to": "OpenAI", "relationship_type": "works_at" }
+  ]
+}
+```
+
+**example:**
+```sh
+curl http://localhost:3000/knowledge/global
+```
+
+---
+
+## GET /knowledge/global/entities/{name}
+
+Returns all entities directly connected to the named entity in the global graph, including both incoming and outgoing relationships.
+
+**path parameters:**
+- `name` (string): the entity to look up
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "entity_name": "Alice",
+  "related": [
+    {
+      "name": "OpenAI",
+      "entity_type": "Organization",
+      "relationship_type": "works_at",
+      "direction": "Outgoing"
+    }
+  ]
+}
+```
+
+**example:**
+```sh
+curl http://localhost:3000/knowledge/global/entities/Alice
+```
+
+---
+
+## GET /knowledge/global/entities/{name}/sources
+
+Returns the list of session IDs that contributed the named entity to the global graph.
+
+**path parameters:**
+- `name` (string): the entity to look up
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "entity_name": "Alice",
+  "sources": ["session-abc123", "session-def456"]
+}
+```
+
+**example:**
+```sh
+curl http://localhost:3000/knowledge/global/entities/Alice/sources
+```
+
+---
+
+## GET /knowledge/global/path
+
+Finds the shortest directed path (BFS over outgoing edges) between two named entities in the global graph.
+
+**query parameters:**
+- `from` (string, required): source entity name
+- `to` (string, required): target entity name
+
+**success response:**
+- status: 200
+- body (`path` is `null` if no path exists):
+```json
+{
+  "from": "Alice",
+  "to": "Bob",
+  "path": [
+    { "from": "Alice", "relationship_type": "works_at", "to": "OpenAI" },
+    { "from": "OpenAI", "relationship_type": "employs", "to": "Bob" }
+  ]
+}
+```
+
+**example:**
+```sh
+curl "http://localhost:3000/knowledge/global/path?from=Alice&to=Bob"
+```
+
+---
+
+## GET /knowledge/global/export
+
+Exports the global knowledge graph in JSON or Graphviz DOT format.
+
+**query parameters:**
+- `format` (string, optional, default: `json`): `json` or `dot`
+
+**success response:**
+- status: 200
+- content-type: `application/json` for JSON, `text/vnd.graphviz` for DOT
+
+**example:**
+```sh
+curl "http://localhost:3000/knowledge/global/export?format=dot"
+```
+
+---
+
+## GET /knowledge/global/conflicts
+
+Returns all detected conflicts in the global graph. A conflict occurs when two different sessions report different relationship types between the same pair of entities.
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "conflicts": [
+    {
+      "entity": "Alice",
+      "related": "OpenAI",
+      "relationship_types": ["works_at", "founded"],
+      "sessions": ["session-abc123", "session-def456"]
+    }
+  ]
+}
+```
+
+**example:**
+```sh
+curl http://localhost:3000/knowledge/global/conflicts
 ```

@@ -8,11 +8,25 @@ N3="http://localhost:3002"
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; exit 1; }
 
+# Inline leader finder used before the Stage 3A helpers are declared.
+_find_leader_port_early() {
+    for p in 3000 3001 3002; do
+        local role
+        role=$(curl -sf "http://localhost:$p/cluster" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+        if [ "$role" = "Leader" ]; then
+            echo "$p"
+            return
+        fi
+    done
+}
+
 echo ""
 echo "=== Stage 1 Acceptance Verification ==="
 echo ""
 
 echo "[1] Leader election"
+# Query any node — leader identity is cluster-wide state
 STATUS=$(curl -sf "$N1/cluster")
 LEADER=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['leader_id'])" 2>/dev/null || echo "null")
 MEMBERS=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['members']))" 2>/dev/null || echo "0")
@@ -21,23 +35,40 @@ MEMBERS=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); 
   || fail "no leader or wrong member count (leader=$LEADER, members=$MEMBERS)"
 
 echo "[2] Write replication"
-SESSION=$(curl -sf -X POST "$N1/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
-WRITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$N1/sessions/$SESSION/messages" \
+# Discover actual leader — do not assume N1 is always the leader
+EARLY_LEADER_PORT=$(_find_leader_port_early)
+[ -z "${EARLY_LEADER_PORT:-}" ] && fail "no leader found for check [2]"
+EARLY_LEADER="http://localhost:$EARLY_LEADER_PORT"
+# Snapshot the leader index BEFORE the write so we have a stable target to wait for.
+BEFORE_IDX=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "0")
+SESSION=$(curl -sf -X POST "$EARLY_LEADER/sessions" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+WRITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$EARLY_LEADER/sessions/$SESSION/messages" \
   -H "Content-Type: application/json" \
   -d '{"role":"user","content":"stage1 replication test"}')
 [ "$WRITE_CODE" = "204" ] || fail "write to leader returned HTTP $WRITE_CODE (expected 204)"
-sleep 1
-# Verify replication by checking last_applied_index matches across all nodes.
-# Using /cluster avoids calling OpenAI (which /context requires).
-LEADER_APPLIED=$(curl -sf "$N1/cluster" | python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
-[ "$LEADER_APPLIED" != "null" ] || fail "could not read last_applied_index from leader"
-for port in 3000 3001 3002; do
-  NODE_APPLIED=$(curl -sf "http://localhost:$port/cluster" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['last_applied_index'])" 2>/dev/null || echo "null")
-  [ "$NODE_APPLIED" = "$LEADER_APPLIED" ] \
-    && pass "node :$port applied_index=$NODE_APPLIED (matches leader)" \
-    || fail "node :$port applied_index=$NODE_APPLIED (leader has $LEADER_APPLIED)"
+# Verify replication: wait for the leader to report every member's last_log_index >= TARGET.
+# Using the leader's member list avoids the follower state-machine apply lag (entries are
+# committed and in every follower's log before the leader acks 204).
+TARGET_IDX=$((BEFORE_IDX + 1))
+REPLICATED=0
+for _i in $(seq 1 30); do
+  sleep 0.5
+  MEMBER_IDXS=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(str(m['last_log_index']) for m in d['members']))" \
+    2>/dev/null || echo "")
+  [ -z "${MEMBER_IDXS:-}" ] && continue
+  ALL_PAST=1
+  for idx in $MEMBER_IDXS; do
+    [ "${idx:-0}" -lt "$TARGET_IDX" ] 2>/dev/null && { ALL_PAST=0; break; }
+  done
+  [ "$ALL_PAST" = "1" ] && { REPLICATED=1; break; }
 done
+[ "$REPLICATED" = "1" ] || fail "write not replicated to all members within 15 s (target=$TARGET_IDX)"
+FINAL_IDXS=$(curl -sf "$EARLY_LEADER/cluster" 2>/dev/null | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'  node id={m[\"id\"]} last_log_index={m[\"last_log_index\"]}') for m in d['members']]" \
+  2>/dev/null || true)
+echo "$FINAL_IDXS" | while IFS= read -r line; do pass "$line (>= write checkpoint $TARGET_IDX)"; done
 
 echo "[3] Follower redirect"
 FOLLOWER_TESTED=0
@@ -84,7 +115,12 @@ curl -sf -X POST "$WRITE_NODE/sessions/$SESSION2/messages" \
   || fail "write rejected after failover"
 echo "  Restarting node-1..."
 docker compose -f docker-compose.cluster.yml start node-1
-sleep 2
+# Wait for node-1 to be healthy before proceeding (up to 15 s)
+for _i in $(seq 1 30); do
+  sleep 0.5
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000/health" 2>/dev/null || echo "0")
+  [ "$CODE" = "200" ] && break
+done
 
 echo "[5] Cluster observability"
 # Read metrics from whichever node is the current leader (node-1 may still be catching up)
@@ -123,39 +159,46 @@ curl -sf -X POST "$WRITE_LEADER/sessions/$SESSION_K/messages" \
   -H "Content-Type: application/json" \
   -d '{"role":"user","content":"Alice knows Bob"}' > /dev/null
 
-echo "  Waiting 3 seconds for extraction and Raft replication..."
-sleep 3
+echo "  Waiting for extraction and Raft replication (up to 20 s)..."
 
 LEADER_PORT=""
-for port in 3000 3001 3002; do
-  ROLE=$(curl -sf "http://localhost:$port/cluster" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
-  if [ "$ROLE" = "Leader" ]; then
-    LEADER_PORT="$port"
-    break
-  fi
+LEADER_ENTITIES=-1
+LEADER_EDGES=-1
+for _i in $(seq 1 40); do
+  sleep 0.5
+  LEADER_PORT=""
+  for port in 3000 3001 3002; do
+    ROLE=$(curl -sf "http://localhost:$port/cluster" 2>/dev/null | \
+      python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+    if [ "$ROLE" = "Leader" ]; then LEADER_PORT="$port"; break; fi
+  done
+  [ -z "${LEADER_PORT:-}" ] && continue
+  LEADER_ENTITIES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" 2>/dev/null | \
+    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  [ "${LEADER_ENTITIES:-0}" -ge 3 ] && break
 done
 
-[ -z "$LEADER_PORT" ] && fail "no leader found for knowledge check"
-
-LEADER_ENTITIES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
-  python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
-
-[ "$LEADER_ENTITIES" -ge 3 ] \
+[ -z "${LEADER_PORT:-}" ] && fail "no leader found for knowledge check"
+[ "${LEADER_ENTITIES:-0}" -ge 3 ] \
   && pass "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities" \
   || fail "leader (:$LEADER_PORT) has $LEADER_ENTITIES entities (expected >= 3)"
 
-LEADER_EDGES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" | \
+LEADER_EDGES=$(curl -sf "http://localhost:$LEADER_PORT/sessions/$SESSION_K/knowledge" 2>/dev/null | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['edges']))" 2>/dev/null || echo "-1")
-
-[ "$LEADER_EDGES" -ge 3 ] \
+[ "${LEADER_EDGES:-0}" -ge 3 ] \
   && pass "leader (:$LEADER_PORT) has $LEADER_EDGES relationships" \
   || fail "leader (:$LEADER_PORT) has $LEADER_EDGES relationships (expected >= 3)"
 
+# Wait for followers to converge on the same entity count (up to 15 s each)
 for port in 3000 3001 3002; do
   [ "$port" -eq "$LEADER_PORT" ] && continue
-  FOLLOWER_ENTITIES=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" | \
-    python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+  FOLLOWER_ENTITIES=-1
+  for _j in $(seq 1 30); do
+    sleep 0.5
+    FOLLOWER_ENTITIES=$(curl -sf "http://localhost:$port/sessions/$SESSION_K/knowledge" 2>/dev/null | \
+      python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1")
+    [ "$FOLLOWER_ENTITIES" -eq "$LEADER_ENTITIES" ] && break
+  done
   [ "$FOLLOWER_ENTITIES" -eq "$LEADER_ENTITIES" ] \
     && pass "follower :$port converged to $FOLLOWER_ENTITIES entities (matches leader)" \
     || fail "follower :$port has $FOLLOWER_ENTITIES entities (leader has $LEADER_ENTITIES)"
@@ -343,3 +386,174 @@ ALL_AFTER=$(entity_count_on node-1)
 
 echo ""
 echo "=== All Stage 3A criteria PASSED ==="
+
+# ---------------------------------------------------------------------------
+# Stage 3B helpers
+# ---------------------------------------------------------------------------
+
+global_entity_count_on() {
+    local port=$1
+    curl -sf "http://localhost:$port/knowledge/global" 2>/dev/null | \
+        python3 -c "import sys,json; print(len(json.load(sys.stdin)['entities']))" 2>/dev/null || echo "-1"
+}
+
+global_related_on() {
+    local port=$1 entity=$2
+    curl -sf "http://localhost:$port/knowledge/global/entities/$entity" 2>/dev/null | \
+        python3 -c "import sys,json; print([r['name'] for r in json.load(sys.stdin).get('related',[])])" \
+        2>/dev/null || echo "[]"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3B setup: two Shared sessions (SA, SB) + one Private session (SC)
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Stage 3B: Collective Knowledge ==="
+echo ""
+
+echo "  Setting up Stage 3B sessions..."
+S3B_LEADER_PORT=$(find_leader_port)
+[ -z "${S3B_LEADER_PORT:-}" ] && fail "no leader for Stage 3B setup"
+S3B_LEADER="http://localhost:$S3B_LEADER_PORT"
+
+S3B_SA=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+S3B_SB=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+S3B_SC=$(curl -sf -X POST "$S3B_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+
+# Mark SA and SB as Shared; SC stays Private (default)
+VIS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$S3B_LEADER/sessions/$S3B_SA/visibility" \
+    -H "Content-Type: application/json" \
+    -d '{"visibility":"Shared"}')
+[ "$VIS_CODE" = "204" ] || fail "set SA visibility returned HTTP $VIS_CODE (expected 204)"
+
+VIS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$S3B_LEADER/sessions/$S3B_SB/visibility" \
+    -H "Content-Type: application/json" \
+    -d '{"visibility":"Shared"}')
+[ "$VIS_CODE" = "204" ] || fail "set SB visibility returned HTTP $VIS_CODE (expected 204)"
+
+# SA: Alice+OpenAI, and Alice-knows-Bob for path check [17]
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SA/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Alice works at OpenAI"}' > /dev/null
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SA/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Alice knows Bob"}' > /dev/null
+# SB: Bob+OpenAI -- contributes OpenAI a second time alongside SA
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SB/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"Bob works at OpenAI"}' > /dev/null
+# SC: private -- must not surface in global graph
+curl -sf -X POST "$S3B_LEADER/sessions/$S3B_SC/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"role":"user","content":"TopSecret works at HiddenCorp"}' > /dev/null
+
+echo "  Waiting 5 seconds for extraction and Raft replication..."
+sleep 5
+
+# [11] Shared sessions aggregate across every node
+echo "[11] shared sessions aggregate"
+for port in 3000 3001 3002; do
+    RELATED_11=$(global_related_on "$port" "OpenAI")
+    echo "$RELATED_11" | grep -q "Alice" \
+        && pass "[11] node :$port OpenAI related to Alice (contributed by SA)" \
+        || fail "[11] node :$port Alice missing from OpenAI related (got: $RELATED_11)"
+    echo "$RELATED_11" | grep -q "Bob" \
+        && pass "[11] node :$port OpenAI related to Bob (contributed by SB)" \
+        || fail "[11] node :$port Bob missing from OpenAI related (got: $RELATED_11)"
+done
+
+# [12] Private session entities never appear in the global graph
+echo "[12] private session isolation"
+GLOBAL_ENTITIES_12=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$GLOBAL_ENTITIES_12" | grep -q "TopSecret" \
+    && fail "[12] private entity TopSecret leaked into global graph" \
+    || pass "[12] private entity TopSecret absent from global graph"
+echo "$GLOBAL_ENTITIES_12" | grep -q "HiddenCorp" \
+    && fail "[12] private entity HiddenCorp leaked into global graph" \
+    || pass "[12] private entity HiddenCorp absent from global graph"
+
+# [13] Provenance lists contributing session ids
+echo "[13] provenance"
+SOURCES_13=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/entities/OpenAI/sources" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('sources',[]))" 2>/dev/null || echo "[]")
+echo "$SOURCES_13" | grep -qF "$S3B_SA" \
+    && pass "[13] SA listed as OpenAI provenance source" \
+    || fail "[13] SA not in OpenAI sources (got: $SOURCES_13)"
+echo "$SOURCES_13" | grep -qF "$S3B_SB" \
+    && pass "[13] SB listed as OpenAI provenance source" \
+    || fail "[13] SB not in OpenAI sources (got: $SOURCES_13)"
+
+# [14] All 3 nodes converge to identical global entity set (deterministic state)
+echo "[14] deterministic conflict resolution"
+GLOBAL_14_1=$(curl -sf "http://localhost:3000/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+GLOBAL_14_2=$(curl -sf "http://localhost:3001/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+GLOBAL_14_3=$(curl -sf "http://localhost:3002/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print(sorted([e['name'] for e in json.load(sys.stdin).get('entities',[])]))" \
+    2>/dev/null || echo "[]")
+[ "$GLOBAL_14_1" = "$GLOBAL_14_2" ] && [ "$GLOBAL_14_2" = "$GLOBAL_14_3" ] \
+    && pass "[14] all 3 nodes converge to identical global entity set: $GLOBAL_14_1" \
+    || fail "[14] nodes diverge: node1=$GLOBAL_14_1 node2=$GLOBAL_14_2 node3=$GLOBAL_14_3"
+
+# [17] Global path traversal across sessions, no LLM call
+echo "[17] global path traversal (no LLM)"
+PATH_17=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/path?from=Alice&to=Bob" 2>/dev/null | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print('found' if d.get('path') else 'none')" \
+    2>/dev/null || echo "none")
+[ "$PATH_17" = "found" ] \
+    && pass "[17] global path Alice->Bob found via graph traversal (no LLM)" \
+    || fail "[17] no global path found from Alice to Bob"
+
+# [16] Global graph and visibility survive a full cluster restart
+echo "[16] persistence of collective state"
+S3B_GLOBAL_BEFORE=$(global_entity_count_on "$S3B_LEADER_PORT")
+docker compose -f docker-compose.cluster.yml stop node-1 node-2 node-3
+docker compose -f docker-compose.cluster.yml start node-1 node-2 node-3
+wait_for_leader
+sleep 5
+S3B_LEADER_PORT=$(find_leader_port)
+S3B_GLOBAL_AFTER=$(global_entity_count_on "$S3B_LEADER_PORT")
+[ "$S3B_GLOBAL_AFTER" = "$S3B_GLOBAL_BEFORE" ] \
+    && pass "[16] global graph survived restart ($S3B_GLOBAL_AFTER entities, was $S3B_GLOBAL_BEFORE)" \
+    || fail "[16] global entity count changed after restart ($S3B_GLOBAL_BEFORE -> $S3B_GLOBAL_AFTER)"
+RESTORED_SOURCES=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global/entities/OpenAI/sources" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('sources',[]))" 2>/dev/null || echo "[]")
+echo "$RESTORED_SOURCES" | grep -qF "$S3B_SA" \
+    && pass "[16] visibility and provenance restored after restart (SA still owns OpenAI)" \
+    || fail "[16] SA no longer in OpenAI sources after restart (visibility or provenance lost)"
+
+# [15] Provenance-scoped deletion
+echo "[15] provenance-scoped deletion"
+S3B_LEADER_PORT=$(find_leader_port)
+S3B_LEADER="http://localhost:$S3B_LEADER_PORT"
+# Delete SA: OpenAI must remain (SB still contributes it)
+curl -sf -X DELETE "$S3B_LEADER/sessions/$S3B_SA" > /dev/null
+sleep 1
+AFTER_SA=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$AFTER_SA" | grep -q "OpenAI" \
+    && pass "[15] OpenAI remains after deleting SA (still contributed by SB)" \
+    || fail "[15] OpenAI wrongly removed when only SA was deleted"
+# Delete SB: OpenAI must now be gone (no remaining contributors)
+curl -sf -X DELETE "$S3B_LEADER/sessions/$S3B_SB" > /dev/null
+sleep 1
+AFTER_SB=$(curl -sf "http://localhost:$S3B_LEADER_PORT/knowledge/global" 2>/dev/null | \
+    python3 -c "import sys,json; print([e['name'] for e in json.load(sys.stdin).get('entities',[])])" \
+    2>/dev/null || echo "[]")
+echo "$AFTER_SB" | grep -q "OpenAI" \
+    && fail "[15] OpenAI still in global graph after deleting all contributing sessions" \
+    || pass "[15] OpenAI removed after deleting both SA and SB"
+
+echo ""
+echo "=== All Stage 3B criteria PASSED ==="

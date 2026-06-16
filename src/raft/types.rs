@@ -43,6 +43,14 @@ pub enum MemoryCommand {
         entities: Vec<crate::knowledge::types::Entity>,
         relationships: Vec<crate::knowledge::types::Relationship>,
     },
+    /// Set a session's visibility. Replicated so every node agrees deterministically
+    /// on which sessions contribute to the global graph.
+    SetSessionVisibility {
+        session_id: String,
+        visibility: crate::knowledge::global::Visibility,
+    },
+    /// Record an agent owner for a session (provenance for the global graph).
+    RegisterSession { session_id: String, agent_id: Option<String> },
     /// No-op placeholder. Applied by the state machine without side effects.
     /// Reserved for future cluster operations (e.g., leadership probes).
     NoOp,
@@ -125,5 +133,17 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: MemoryCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, MemoryCommand::NoOp));
+    }
+
+    #[test]
+    fn set_session_visibility_command_round_trips() {
+        use crate::knowledge::global::Visibility;
+        let cmd = MemoryCommand::SetSessionVisibility {
+            session_id: "s1".into(),
+            visibility: Visibility::Shared,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: MemoryCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, MemoryCommand::SetSessionVisibility { visibility: Visibility::Shared, .. }));
     }
 }

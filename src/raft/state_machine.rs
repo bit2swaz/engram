@@ -10,12 +10,15 @@ use openraft::{
 use redb::{Database, TableDefinition};
 
 use crate::core::{CoreMemoryStore, ShortTermMemory};
+use crate::knowledge::global::{GlobalGraph, Visibility};
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::knowledge::types::KnowledgeJob;
+use crate::metrics::AppMetrics;
 use crate::models::{EmbeddingStatus, Message};
 use crate::raft::snapshot::{EngramSnapshot, SessionFacts, SessionMessages};
 use crate::raft::types::{CommandResponse, MemoryCommand, TypeConfig};
 use crate::worker::EmbeddingJob;
+use std::collections::HashMap;
 
 const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_snapshot");
 const SNAPSHOT_META_KEY: &str = "meta";
@@ -33,6 +36,10 @@ struct SmInner {
     embedding_tx: mpsc::Sender<EmbeddingJob>,
     knowledge_graph: Arc<RwLock<KnowledgeGraph>>,
     knowledge_tx: mpsc::Sender<KnowledgeJob>,
+    global_graph: Arc<RwLock<GlobalGraph>>,
+    visibility: Arc<RwLock<HashMap<String, Visibility>>>,
+    session_agents: Arc<RwLock<HashMap<String, String>>>,
+    metrics: Arc<AppMetrics>,
     db: Arc<Database>,
     snapshot_idx: u64,
 }
@@ -48,6 +55,8 @@ impl EngStateMachineStore {
         knowledge_graph: Arc<RwLock<KnowledgeGraph>>,
         knowledge_tx: mpsc::Sender<KnowledgeJob>,
         db: Arc<Database>,
+        global_graph: Arc<RwLock<GlobalGraph>>,
+        metrics: Arc<AppMetrics>,
     ) -> Self {
         {
             let txn = db.begin_write().expect("redb begin_write sm init");
@@ -63,6 +72,10 @@ impl EngStateMachineStore {
                 embedding_tx,
                 knowledge_graph,
                 knowledge_tx,
+                global_graph,
+                visibility: Arc::new(RwLock::new(HashMap::new())),
+                session_agents: Arc::new(RwLock::new(HashMap::new())),
+                metrics,
                 db,
                 snapshot_idx: 0,
             })),
@@ -141,13 +154,24 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         .map(|(session_id, facts)| SessionFacts { session_id, facts })
         .collect();
     let knowledge_graph = inner.knowledge_graph.read().await.to_snapshot();
+    let global_graph = Some(inner.global_graph.read().await.to_snapshot());
+    let visibility = inner.visibility.read().await
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let session_agents = inner.session_agents.read().await
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let payload = EngramSnapshot {
         version: crate::raft::snapshot::SNAPSHOT_VERSION,
         short_term,
         core_memory,
         knowledge_graph,
-        global_graph: None,
+        global_graph,
+        visibility,
+        session_agents,
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -222,7 +246,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         I::IntoIter: Send,
     {
         // Clone Arcs once so the lock is not held across async apply_cmd calls.
-        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx) = {
+        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility, session_agents, metrics) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -230,6 +254,10 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.embedding_tx.clone(),
                 inner.knowledge_graph.clone(),
                 inner.knowledge_tx.clone(),
+                inner.global_graph.clone(),
+                inner.visibility.clone(),
+                inner.session_agents.clone(),
+                inner.metrics.clone(),
             )
         };
 
@@ -238,12 +266,13 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         let mut last_membership = None;
 
         for entry in entries {
+            let index = entry.log_id.index;
             last_applied = Some(entry.log_id.clone());
             if let EntryPayload::Membership(mem) = &entry.payload {
                 last_membership = Some(StoredMembership::new(Some(entry.log_id.clone()), mem.clone()));
             }
             if let EntryPayload::Normal(cmd) = entry.payload {
-                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx).await;
+                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, &session_agents, &metrics, index).await;
             }
             responses.push(CommandResponse::default());
         }
@@ -281,9 +310,17 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
         // Clone store/graph handles under a short lock so we don't hold it across awaits.
-        let (short_term, core_memory, knowledge_graph, db) = {
+        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, db) = {
             let inner = self.inner.lock().await;
-            (inner.short_term.clone(), inner.core_memory.clone(), inner.knowledge_graph.clone(), inner.db.clone())
+            (
+                inner.short_term.clone(),
+                inner.core_memory.clone(),
+                inner.knowledge_graph.clone(),
+                inner.global_graph.clone(),
+                inner.visibility.clone(),
+                inner.session_agents.clone(),
+                inner.db.clone(),
+            )
         };
 
         let st_sessions = payload.short_term.into_iter().map(|s| (s.session_id, s.messages)).collect();
@@ -291,6 +328,24 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         let cm_sessions = payload.core_memory.into_iter().map(|s| (s.session_id, s.facts)).collect();
         core_memory.restore_all(cm_sessions).await.map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
         *knowledge_graph.write().await = KnowledgeGraph::from_snapshot(payload.knowledge_graph);
+
+        if let Some(gg_snap) = payload.global_graph {
+            *global_graph.write().await = GlobalGraph::from_snapshot(gg_snap);
+        }
+        {
+            let mut vis = visibility.write().await;
+            vis.clear();
+            for (session_id, v) in payload.visibility {
+                vis.insert(session_id, v);
+            }
+        }
+        {
+            let mut agents = session_agents.write().await;
+            agents.clear();
+            for (session_id, agent_id) in payload.session_agents {
+                agents.insert(session_id, agent_id);
+            }
+        }
 
         persist_snapshot(&db, meta, snapshot.get_ref())?;
 
@@ -310,6 +365,12 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
     }
 }
 
+fn update_global_metrics(metrics: &AppMetrics, graph: &GlobalGraph) {
+    metrics.set_global_entities(graph.all_entities().len());
+    metrics.set_global_relationships(graph.all_relationships().len());
+    metrics.set_global_conflicts(graph.conflicts().len());
+}
+
 async fn apply_cmd(
     cmd: MemoryCommand,
     short_term: &Arc<dyn ShortTermMemory>,
@@ -317,6 +378,11 @@ async fn apply_cmd(
     embedding_tx: &mpsc::Sender<EmbeddingJob>,
     knowledge_graph: &Arc<RwLock<KnowledgeGraph>>,
     knowledge_tx: &mpsc::Sender<KnowledgeJob>,
+    global_graph: &Arc<RwLock<GlobalGraph>>,
+    visibility: &Arc<RwLock<HashMap<String, Visibility>>>,
+    session_agents: &Arc<RwLock<HashMap<String, String>>>,
+    metrics: &Arc<AppMetrics>,
+    index: u64,
 ) {
     match cmd {
         MemoryCommand::AddMessage { session_id, message } => {
@@ -357,9 +423,53 @@ async fn apply_cmd(
             // Signal embedding worker to delete from local LanceDB.
             let _ = embedding_tx.try_send(EmbeddingJob::DeleteSession { session_id: session_id.clone() });
             knowledge_graph.write().await.delete_session(&session_id);
+            {
+                let mut gg = global_graph.write().await;
+                gg.prune_session(&session_id);
+                update_global_metrics(metrics, &*gg);
+            }
+            visibility.write().await.remove(&session_id);
+            session_agents.write().await.remove(&session_id);
         }
         MemoryCommand::AddKnowledge { session_id, message_id, entities, relationships } => {
-            knowledge_graph.write().await.apply_extraction(&session_id, &message_id, entities, relationships);
+            knowledge_graph.write().await.apply_extraction(&session_id, &message_id, entities.clone(), relationships.clone());
+            if visibility.read().await.get(&session_id) == Some(&Visibility::Shared) {
+                let agent_id = session_agents.read().await.get(&session_id).cloned();
+                let mut gg = global_graph.write().await;
+                gg.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                update_global_metrics(metrics, &*gg);
+            }
+        }
+        MemoryCommand::SetSessionVisibility { session_id, visibility: new_vis } => {
+            let prev = visibility.write().await.insert(session_id.clone(), new_vis);
+            match new_vis {
+                Visibility::Shared => {
+                    // Back-merge existing session knowledge only if this is a
+                    // Private->Shared transition (idempotent: re-inserting the
+                    // same provenance key is a no-op in GlobalGraph).
+                    let (entities, relationships) = {
+                        let kg = knowledge_graph.read().await;
+                        (kg.all_entities(&session_id), kg.all_relationships(&session_id))
+                    };
+                    let agent_id = session_agents.read().await.get(&session_id).cloned();
+                    let mut gg = global_graph.write().await;
+                    gg.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                    update_global_metrics(metrics, &*gg);
+                }
+                Visibility::Private => {
+                    // Prune only when actually switching away from Shared.
+                    if prev == Some(Visibility::Shared) {
+                        let mut gg = global_graph.write().await;
+                        gg.prune_session(&session_id);
+                        update_global_metrics(metrics, &*gg);
+                    }
+                }
+            }
+        }
+        MemoryCommand::RegisterSession { session_id, agent_id } => {
+            if let Some(agent) = agent_id {
+                session_agents.write().await.insert(session_id, agent);
+            }
         }
         MemoryCommand::NoOp => {}
     }
@@ -369,6 +479,7 @@ async fn apply_cmd(
 mod tests {
     use super::*;
     use crate::core::{InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore};
+    use crate::knowledge::global::{GlobalGraph, Visibility};
     use crate::knowledge::graph::KnowledgeGraph;
     use crate::knowledge::types::{Entity, KnowledgeJob, Relationship};
     use crate::raft::types::MessagePayload;
@@ -383,6 +494,7 @@ mod tests {
         mpsc::Receiver<KnowledgeJob>,
         Arc<RwLock<KnowledgeGraph>>,
         Arc<InMemoryCoreMemoryStore>,
+        Arc<RwLock<GlobalGraph>>,
         tempfile::TempDir,
     ) {
         let short_term = Arc::new(InMemoryStore::default());
@@ -391,8 +503,10 @@ mod tests {
         let (embed_tx, embed_rx) = mpsc::channel(10);
         let (know_tx, know_rx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+        let gg = Arc::new(RwLock::new(GlobalGraph::new()));
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("sm.redb")).unwrap());
+        let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
         let sm = EngStateMachineStore::new(
             short_term.clone(),
             core_memory.clone(),
@@ -401,8 +515,10 @@ mod tests {
             kg.clone(),
             know_tx,
             db,
+            gg.clone(),
+            metrics,
         );
-        (sm, short_term, embed_rx, know_rx, kg, core_memory, dir)
+        (sm, short_term, embed_rx, know_rx, kg, core_memory, gg, dir)
     }
 
     fn make_entry(index: u64, cmd: MemoryCommand) -> openraft::Entry<TypeConfig> {
@@ -414,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_writes_to_short_term() {
-        let (mut sm, short_term, _embed, _know, _kg, _cm, _dir) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -436,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_embedding_job() {
-        let (mut sm, _st, mut embed_rx, _know, _kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, mut embed_rx, _know, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -457,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_redis_and_enqueues_lancedb_delete() {
-        let (mut sm, short_term, mut embed_rx, _know, _kg, _cm, _dir) = make_sm();
+        let (mut sm, short_term, mut embed_rx, _know, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![
             make_entry(
                 0,
@@ -484,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn noop_command_is_ignored() {
-        let (mut sm, short_term, _embed, _know, _kg, _cm, _dir) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::NoOp)]).await.unwrap();
         let msgs = short_term.get_recent("any", 10).await.unwrap();
         assert_eq!(msgs.len(), 0);
@@ -492,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_knowledge_job() {
-        let (mut sm, _st, _embed, mut know_rx, _kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _embed, mut know_rx, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddMessage {
             session_id: "s1".into(),
             message: MessagePayload {
@@ -509,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_knowledge_updates_graph() {
-        let (mut sm, _st, _embed, _know, kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(),
             message_id: "m1".into(),
@@ -530,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_knowledge_graph() {
-        let (mut sm, _st, _embed, _know, kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -544,14 +660,14 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_sets_last_applied_to_meta_log_id() {
-        let (mut src, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        let (mut src, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
         src.apply(vec![make_entry(7, MemoryCommand::AddFact {
             session_id: "s1".into(), fact: "f".into(),
         })]).await.unwrap();
         let mut builder = src.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
 
-        let (mut dst, dst_st, _e2, _k2, dst_kg, _cm2, _dir2) = make_sm();
+        let (mut dst, dst_st, _e2, _k2, dst_kg, _cm2, _gg2, _dir2) = make_sm();
         let mut buf = dst.begin_receiving_snapshot().await.unwrap();
         *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
         dst.install_snapshot(&snap.meta, buf).await.unwrap();
@@ -564,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_build_install_reproduces_state() {
-        let (mut src, _st, _e, _k, _kg, src_cm, _dir) = make_sm();
+        let (mut src, _st, _e, _k, _kg, src_cm, _gg, _dir) = make_sm();
         src.apply(vec![
             make_entry(0, MemoryCommand::AddKnowledge {
                 session_id: "s1".into(), message_id: "m1".into(),
@@ -581,7 +697,7 @@ mod tests {
         let mut builder = src.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
 
-        let (mut dst, _st2, _e2, _k2, dst_kg, dst_cm, _dir2) = make_sm();
+        let (mut dst, _st2, _e2, _k2, dst_kg, dst_cm, _gg2, _dir2) = make_sm();
         let mut buf = dst.begin_receiving_snapshot().await.unwrap();
         *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
         dst.install_snapshot(&snap.meta, buf).await.unwrap();
@@ -593,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_snapshot_meta_index_equals_last_applied() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
         for i in 0..=4u64 {
             sm.apply(vec![make_entry(i, MemoryCommand::AddFact {
                 session_id: "s1".into(), fact: format!("f{i}"),
@@ -606,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_then_get_current_snapshot_returns_same_index() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddFact {
             session_id: "s1".into(), fact: "f".into(),
         })]).await.unwrap();
@@ -618,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_payload_contains_applied_state() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -631,8 +747,115 @@ mod tests {
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
         let payload = crate::raft::snapshot::EngramSnapshot::from_bytes(snap.snapshot.get_ref()).unwrap();
-        assert_eq!(payload.version, 1);
+        assert_eq!(payload.version, 2);
         assert!(payload.knowledge_graph.sessions.iter().any(|s| s.session_id == "s1"));
         assert!(payload.core_memory.iter().any(|s| s.facts.contains(&"likes coffee".to_string())));
+    }
+
+    #[tokio::test]
+    async fn shared_session_knowledge_reaches_global_graph() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::SetSessionVisibility {
+            session_id: "s1".into(), visibility: Visibility::Shared,
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(1, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        assert!(gg.read().await.all_entities().iter().any(|e| e.name == "Alice"));
+    }
+
+    #[tokio::test]
+    async fn private_session_knowledge_stays_out_of_global_graph() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "Secret".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        assert!(gg.read().await.all_entities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn becoming_shared_backmerges_existing_session_knowledge() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(1, MemoryCommand::SetSessionVisibility {
+            session_id: "s1".into(), visibility: Visibility::Shared,
+        })]).await.unwrap();
+        assert!(gg.read().await.all_entities().iter().any(|e| e.name == "Alice"));
+    }
+
+    #[tokio::test]
+    async fn delete_session_prunes_global_contributions() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        for (idx, sid) in [(0u64, "s1"), (1, "s2")] {
+            sm.apply(vec![make_entry(idx, MemoryCommand::SetSessionVisibility {
+                session_id: sid.into(), visibility: Visibility::Shared,
+            })]).await.unwrap();
+        }
+        sm.apply(vec![make_entry(2, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(3, MemoryCommand::AddKnowledge {
+            session_id: "s2".into(), message_id: "m2".into(),
+            entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(4, MemoryCommand::DeleteSession { session_id: "s1".into() })]).await.unwrap();
+        assert!(gg.read().await.all_entities().iter().any(|e| e.name == "Alice"), "still contributed by s2");
+        sm.apply(vec![make_entry(5, MemoryCommand::DeleteSession { session_id: "s2".into() })]).await.unwrap();
+        assert!(gg.read().await.all_entities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_agent_id_flows_into_global_provenance() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::RegisterSession {
+            session_id: "s1".into(), agent_id: Some("agent-7".into()),
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(1, MemoryCommand::SetSessionVisibility {
+            session_id: "s1".into(), visibility: Visibility::Shared,
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(2, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "OpenAI".into(), entity_type: "Organization".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        assert_eq!(gg.read().await.entity_agents("OpenAI"), vec!["agent-7".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn visibility_transitions_are_fully_reversible() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![
+                Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+                Entity { name: "Bob".into(), entity_type: "Person".into(), attributes: HashMap::new() },
+            ],
+            relationships: vec![Relationship { from: "Alice".into(), to: "Bob".into(), relationship_type: "knows".into() }],
+        })]).await.unwrap();
+
+        let vis = |idx: u64, v| make_entry(idx, MemoryCommand::SetSessionVisibility { session_id: "s1".into(), visibility: v });
+        sm.apply(vec![vis(1, Visibility::Shared)]).await.unwrap();
+        sm.apply(vec![vis(2, Visibility::Private)]).await.unwrap();
+        sm.apply(vec![vis(3, Visibility::Shared)]).await.unwrap();
+
+        let g = gg.read().await;
+        assert_eq!(g.all_entities().iter().filter(|e| e.name == "Alice").count(), 1);
+        assert_eq!(g.all_relationships().len(), 1);
+        assert_eq!(g.entity_sources("Alice"), vec!["s1".to_string()]);
+        drop(g);
+
+        sm.apply(vec![vis(4, Visibility::Private)]).await.unwrap();
+        assert!(gg.read().await.all_entities().is_empty());
     }
 }

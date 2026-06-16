@@ -25,6 +25,9 @@ pub struct AppMetrics {
     snapshot_build_total: IntCounter,
     snapshot_install_total: IntCounter,
     snapshot_last_index: IntGauge,
+    global_entities: IntGauge,
+    global_relationships: IntGauge,
+    global_conflicts: IntGauge,
 }
 
 impl AppMetrics {
@@ -148,6 +151,24 @@ impl AppMetrics {
         ))?;
         registry.register(Box::new(snapshot_last_index.clone()))?;
 
+        let global_entities = IntGauge::with_opts(Opts::new(
+            "global_entities",
+            "Current number of entities in the global knowledge graph.",
+        ))?;
+        registry.register(Box::new(global_entities.clone()))?;
+
+        let global_relationships = IntGauge::with_opts(Opts::new(
+            "global_relationships",
+            "Current number of relationships in the global knowledge graph.",
+        ))?;
+        registry.register(Box::new(global_relationships.clone()))?;
+
+        let global_conflicts = IntGauge::with_opts(Opts::new(
+            "global_conflicts",
+            "Current number of conflicting relationships in the global knowledge graph.",
+        ))?;
+        registry.register(Box::new(global_conflicts.clone()))?;
+
         Ok(Self {
             registry,
             messages_added_total,
@@ -167,6 +188,9 @@ impl AppMetrics {
             snapshot_build_total,
             snapshot_install_total,
             snapshot_last_index,
+            global_entities,
+            global_relationships,
+            global_conflicts,
         })
     }
 
@@ -244,6 +268,18 @@ impl AppMetrics {
         self.snapshot_last_index.set(index as i64);
     }
 
+    pub fn set_global_entities(&self, count: usize) {
+        self.global_entities.set(count as i64);
+    }
+
+    pub fn set_global_relationships(&self, count: usize) {
+        self.global_relationships.set(count as i64);
+    }
+
+    pub fn set_global_conflicts(&self, count: usize) {
+        self.global_conflicts.set(count as i64);
+    }
+
     pub fn render(&self) -> Result<String, String> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();
@@ -269,5 +305,17 @@ mod tests {
         assert!(text.contains("engram_snapshot_build_total"));
         assert!(text.contains("engram_snapshot_install_total"));
         assert!(text.contains("engram_snapshot_last_index"));
+    }
+
+    #[test]
+    fn renders_global_graph_metrics() {
+        let m = AppMetrics::new().unwrap();
+        m.set_global_entities(3);
+        m.set_global_relationships(2);
+        m.set_global_conflicts(1);
+        let t = m.render().unwrap();
+        assert!(t.contains("engram_global_entities"));
+        assert!(t.contains("engram_global_relationships"));
+        assert!(t.contains("engram_global_conflicts"));
     }
 }
