@@ -49,6 +49,8 @@ pub enum MemoryCommand {
         session_id: String,
         visibility: crate::knowledge::global::Visibility,
     },
+    /// Record an agent owner for a session (provenance for the global graph).
+    RegisterSession { session_id: String, agent_id: Option<String> },
     /// No-op placeholder. Applied by the state machine without side effects.
     /// Reserved for future cluster operations (e.g., leadership probes).
     NoOp,

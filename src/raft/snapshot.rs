@@ -104,6 +104,7 @@ mod tests {
         let back = EngramSnapshot::from_bytes(&bytes).unwrap();
         assert!(back.global_graph.is_some());
         assert_eq!(back.visibility.len(), 1);
+        assert_eq!(back.session_agents, vec![("s1".to_string(), "agent-7".to_string())]);
     }
 
     #[test]

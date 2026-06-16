@@ -142,6 +142,11 @@ struct CreateSessionResponse {
     session_id: String,
 }
 
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
+struct CreateSessionRequest {
+    agent_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct AddMessageRequest {
     id: Option<String>,
@@ -302,7 +307,7 @@ async fn health_check() -> StatusCode {
     StatusCode::OK
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state, body))]
 #[utoipa::path(
     post,
     path = "/sessions",
@@ -311,11 +316,29 @@ async fn health_check() -> StatusCode {
         (status = 200, description = "Session created successfully", body = CreateSessionResponse)
     )
 )]
-async fn create_session() -> Json<CreateSessionResponse> {
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<CreateSessionRequest>>,
+) -> Result<Json<CreateSessionResponse>, MemoryServerError> {
     let session_id = Uuid::new_v4().to_string();
-    tracing::info!(session_id = %session_id, "created session");
 
-    Json(CreateSessionResponse { session_id })
+    if let Some(agent_id) = body.and_then(|b| b.0.agent_id) {
+        if let Some(raft) = &state.raft {
+            raft_write(
+                raft,
+                MemoryCommand::RegisterSession {
+                    session_id: session_id.clone(),
+                    agent_id: Some(agent_id),
+                },
+                &state.peer_http_addrs,
+                "/sessions",
+            )
+            .await?;
+        }
+    }
+
+    tracing::info!(session_id = %session_id, "created session");
+    Ok(Json(CreateSessionResponse { session_id }))
 }
 
 #[tracing::instrument(skip(state, payload), fields(session_id = %session_id))]

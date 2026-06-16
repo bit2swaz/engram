@@ -37,6 +37,7 @@ struct SmInner {
     knowledge_tx: mpsc::Sender<KnowledgeJob>,
     global_graph: Arc<RwLock<GlobalGraph>>,
     visibility: Arc<RwLock<HashMap<String, Visibility>>>,
+    session_agents: Arc<RwLock<HashMap<String, String>>>,
     db: Arc<Database>,
     snapshot_idx: u64,
 }
@@ -70,6 +71,7 @@ impl EngStateMachineStore {
                 knowledge_tx,
                 global_graph,
                 visibility: Arc::new(RwLock::new(HashMap::new())),
+                session_agents: Arc::new(RwLock::new(HashMap::new())),
                 db,
                 snapshot_idx: 0,
             })),
@@ -153,6 +155,10 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         .iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect();
+    let session_agents = inner.session_agents.read().await
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let payload = EngramSnapshot {
         version: crate::raft::snapshot::SNAPSHOT_VERSION,
@@ -161,7 +167,7 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         knowledge_graph,
         global_graph,
         visibility,
-        session_agents: vec![],
+        session_agents,
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -236,7 +242,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         I::IntoIter: Send,
     {
         // Clone Arcs once so the lock is not held across async apply_cmd calls.
-        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility) = {
+        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility, session_agents) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -246,6 +252,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.knowledge_tx.clone(),
                 inner.global_graph.clone(),
                 inner.visibility.clone(),
+                inner.session_agents.clone(),
             )
         };
 
@@ -260,7 +267,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 last_membership = Some(StoredMembership::new(Some(entry.log_id.clone()), mem.clone()));
             }
             if let EntryPayload::Normal(cmd) = entry.payload {
-                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, index).await;
+                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, &session_agents, index).await;
             }
             responses.push(CommandResponse::default());
         }
@@ -298,7 +305,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
         // Clone store/graph handles under a short lock so we don't hold it across awaits.
-        let (short_term, core_memory, knowledge_graph, global_graph, visibility, db) = {
+        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, db) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -306,6 +313,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.knowledge_graph.clone(),
                 inner.global_graph.clone(),
                 inner.visibility.clone(),
+                inner.session_agents.clone(),
                 inner.db.clone(),
             )
         };
@@ -324,6 +332,13 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             vis.clear();
             for (session_id, v) in payload.visibility {
                 vis.insert(session_id, v);
+            }
+        }
+        {
+            let mut agents = session_agents.write().await;
+            agents.clear();
+            for (session_id, agent_id) in payload.session_agents {
+                agents.insert(session_id, agent_id);
             }
         }
 
@@ -354,6 +369,7 @@ async fn apply_cmd(
     knowledge_tx: &mpsc::Sender<KnowledgeJob>,
     global_graph: &Arc<RwLock<GlobalGraph>>,
     visibility: &Arc<RwLock<HashMap<String, Visibility>>>,
+    session_agents: &Arc<RwLock<HashMap<String, String>>>,
     index: u64,
 ) {
     match cmd {
@@ -397,11 +413,13 @@ async fn apply_cmd(
             knowledge_graph.write().await.delete_session(&session_id);
             global_graph.write().await.prune_session(&session_id);
             visibility.write().await.remove(&session_id);
+            session_agents.write().await.remove(&session_id);
         }
         MemoryCommand::AddKnowledge { session_id, message_id, entities, relationships } => {
             knowledge_graph.write().await.apply_extraction(&session_id, &message_id, entities.clone(), relationships.clone());
             if visibility.read().await.get(&session_id) == Some(&Visibility::Shared) {
-                global_graph.write().await.merge(&session_id, index, entities, relationships);
+                let agent_id = session_agents.read().await.get(&session_id).cloned();
+                global_graph.write().await.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
             }
         }
         MemoryCommand::SetSessionVisibility { session_id, visibility: new_vis } => {
@@ -415,7 +433,8 @@ async fn apply_cmd(
                         let kg = knowledge_graph.read().await;
                         (kg.all_entities(&session_id), kg.all_relationships(&session_id))
                     };
-                    global_graph.write().await.merge(&session_id, index, entities, relationships);
+                    let agent_id = session_agents.read().await.get(&session_id).cloned();
+                    global_graph.write().await.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
                 }
                 Visibility::Private => {
                     // Prune only when actually switching away from Shared.
@@ -423,6 +442,11 @@ async fn apply_cmd(
                         global_graph.write().await.prune_session(&session_id);
                     }
                 }
+            }
+        }
+        MemoryCommand::RegisterSession { session_id, agent_id } => {
+            if let Some(agent) = agent_id {
+                session_agents.write().await.insert(session_id, agent);
             }
         }
         MemoryCommand::NoOp => {}
@@ -765,6 +789,23 @@ mod tests {
         assert!(gg.read().await.all_entities().iter().any(|e| e.name == "Alice"), "still contributed by s2");
         sm.apply(vec![make_entry(5, MemoryCommand::DeleteSession { session_id: "s2".into() })]).await.unwrap();
         assert!(gg.read().await.all_entities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_agent_id_flows_into_global_provenance() {
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::RegisterSession {
+            session_id: "s1".into(), agent_id: Some("agent-7".into()),
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(1, MemoryCommand::SetSessionVisibility {
+            session_id: "s1".into(), visibility: Visibility::Shared,
+        })]).await.unwrap();
+        sm.apply(vec![make_entry(2, MemoryCommand::AddKnowledge {
+            session_id: "s1".into(), message_id: "m1".into(),
+            entities: vec![Entity { name: "OpenAI".into(), entity_type: "Organization".into(), attributes: HashMap::new() }],
+            relationships: vec![],
+        })]).await.unwrap();
+        assert_eq!(gg.read().await.entity_agents("OpenAI"), vec!["agent-7".to_string()]);
     }
 
     #[tokio::test]
