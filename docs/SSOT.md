@@ -128,6 +128,17 @@ The project serves two purposes:
 3. Install snapshot: a follower wiped after compaction catches up via InstallSnapshot, not full log replay
 4. Full restart recovery: all three nodes stopped and restarted; state is fully restored from the latest snapshot
 
+### Stage 3B: Collective memory ✅ **(Completed)**
+- Session visibility (`Private`/`Shared`) controlled via `MemoryCommand::SetSessionVisibility`, replicated through Raft
+- Global cross-session knowledge graph (`GlobalGraph`): aggregates entities and relationships from all Shared sessions with provenance tracking and conflict detection
+- `MemoryCommand::RegisterSession` persists `(session_id, agent_id)` mappings in `SmInner.session_agents`
+- `POST /sessions` accepts optional `agent_id` body field
+- `PUT /sessions/{id}/visibility` endpoint for changing session visibility
+- 6 new global REST endpoints: `GET /knowledge/global`, `GET /knowledge/global/entities/{name}`, `GET /knowledge/global/entities/{name}/sources`, `GET /knowledge/global/path`, `GET /knowledge/global/export`, `GET /knowledge/global/conflicts`
+- 3 new Prometheus gauges: `engram_global_entities`, `engram_global_relationships`, `engram_global_conflicts`
+- `EngramSnapshot` protocol v2: adds `global_graph`, `visibility`, and `session_agents` fields with `#[serde(default)]` for backward compatibility with Stage 3A snapshots
+- 194 tests passing; all 17 cluster-verify acceptance criteria pass
+
 ---
 
 ## 3. System Architecture (High-Level)
@@ -144,13 +155,19 @@ graph TD
     router --> corememhandler["core memory handler"]
     router --> healthhandler["health handler"]
     router --> knowledgehandler["knowledge handler"]
+    router --> visibilityhandler["visibility handler"]
+    router --> globalhandler["global knowledge handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
-    sessionhandler -->|delete| raft
+    sessionhandler -->|delete or register agent| raft
+    visibilityhandler -->|write| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
+    raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
+    raft -->|state machine apply| visibility["session visibility map"]
     raft -->|embedding job| embedqueue["embedding worker pool\nbounded channel"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool\nbounded channel"]
 
@@ -166,8 +183,11 @@ graph TD
 
     knowledgequeue -->|leader-only| extractor["knowledge extractor trait"]
     extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
-    extraction -->|AddKnowledge via raft| knowledgegraph[("knowledge graph\nper-session in-memory")]
+    extraction -->|AddKnowledge via raft| knowledgegraph
+    knowledgegraph -->|public sessions merge| globalgraph
+
     knowledgehandler --> knowledgegraph
+    globalhandler --> globalgraph
 
     contexthandler --> assembler["context assembler"]
     assembler --> shortterm
@@ -477,8 +497,8 @@ This algorithm preserves conversational continuity (recent messages), injects on
 - Single table `memories` with schema:
   - `id` (Int64, auto‑increment)
   - `session_id` (Utf8)
-  - `message_id` (Utf8) – for idempotency
-  - `text` (Utf8) – full `Message` JSON to preserve role/timestamp
+  - `message_id` (Utf8) - for idempotency
+  - `text` (Utf8) - full `Message` JSON to preserve role/timestamp
   - `embedding` (FixedSizeList<Float32>[1536])
   - `created_at` (Timestamp)
 - **Indexes** (create immediately after table creation):
@@ -557,18 +577,18 @@ services:
 - `LOG_FORMAT` (default `pretty`, supports `json`)
 
 **Knowledge pipeline** (Stage 2):
-- `KNOWLEDGE_EXTRACTOR` — `openai` (default) or `mock`; use `mock` to avoid OpenAI quota consumption in CI/testing
-- `KNOWLEDGE_MAX_WORKERS` — number of knowledge extraction workers (default `4`)
-- `KNOWLEDGE_CHANNEL_SIZE` — knowledge job queue capacity (default `500`)
+- `KNOWLEDGE_EXTRACTOR` - `openai` (default) or `mock`; use `mock` to avoid OpenAI quota consumption in CI/testing
+- `KNOWLEDGE_MAX_WORKERS` - number of knowledge extraction workers (default `4`)
+- `KNOWLEDGE_CHANNEL_SIZE` - knowledge job queue capacity (default `500`)
 
 **Cluster mode** (all required when `NODE_ID` is set):
-- `NODE_ID` — unique integer node identifier (e.g. `1`)
-- `RAFT_ADDR` — bind address for the gRPC Raft server (e.g. `0.0.0.0:9001`)
-- `RAFT_ADVERTISE_ADDR` — address other nodes route to; required when binding `0.0.0.0` (e.g. `node-1:9001`)
-- `CLUSTER_PEERS` — comma-separated gRPC peers as `id:host:port` (e.g. `2:node-2:9001,3:node-3:9001`)
-- `CLUSTER_HTTP_PEERS` — comma-separated HTTP peers as `id:host:port`, used for leader redirect URLs
-- `RAFT_DB_PATH` — path to the redb file for the persistent Raft log and snapshot store (default `./data/raft/engram.redb`)
-- `SNAPSHOT_LOG_THRESHOLD` — number of committed log entries after which the leader builds a new snapshot (default `1000`)
+- `NODE_ID` - unique integer node identifier (e.g. `1`)
+- `RAFT_ADDR` - bind address for the gRPC Raft server (e.g. `0.0.0.0:9001`)
+- `RAFT_ADVERTISE_ADDR` - address other nodes route to; required when binding `0.0.0.0` (e.g. `node-1:9001`)
+- `CLUSTER_PEERS` - comma-separated gRPC peers as `id:host:port` (e.g. `2:node-2:9001,3:node-3:9001`)
+- `CLUSTER_HTTP_PEERS` - comma-separated HTTP peers as `id:host:port`, used for leader redirect URLs
+- `RAFT_DB_PATH` - path to the redb file for the persistent Raft log and snapshot store (default `./data/raft/engram.redb`)
+- `SNAPSHOT_LOG_THRESHOLD` - number of committed log entries after which the leader builds a new snapshot (default `1000`)
 
 Per-request context settings such as `max_tokens`, `similarity_threshold`, and `long_term_top_k` are currently controlled through query parameters on the context endpoint rather than startup environment variables.
 
@@ -585,21 +605,21 @@ Per-request context settings such as `max_tokens`, `similarity_threshold`, and `
 - `memory_embedding_queue_size` (gauge)
 
 **Raft cluster metrics** (only emitted in cluster mode):
-- `engram_raft_term` — current Raft term (gauge)
-- `engram_raft_commit_index` — index of last applied log entry (gauge)
-- `engram_raft_is_leader` — 1 if this node is the current leader, 0 otherwise (gauge)
-- `engram_raft_leader_changes_total` — number of leader changes observed by this node (counter)
+- `engram_raft_term` - current Raft term (gauge)
+- `engram_raft_commit_index` - index of last applied log entry (gauge)
+- `engram_raft_is_leader` - 1 if this node is the current leader, 0 otherwise (gauge)
+- `engram_raft_leader_changes_total` - number of leader changes observed by this node (counter)
 
 **Knowledge pipeline metrics** (Stage 2, all modes):
-- `engram_knowledge_extraction_duration_seconds` — duration of extraction calls (histogram, label: extractor)
-- `engram_knowledge_entities_extracted_total` — cumulative entities extracted (counter)
-- `engram_knowledge_relationships_extracted_total` — cumulative relationships extracted (counter)
-- `engram_knowledge_queue_size` — pending knowledge jobs (gauge)
+- `engram_knowledge_extraction_duration_seconds` - duration of extraction calls (histogram, label: extractor)
+- `engram_knowledge_entities_extracted_total` - cumulative entities extracted (counter)
+- `engram_knowledge_relationships_extracted_total` - cumulative relationships extracted (counter)
+- `engram_knowledge_queue_size` - pending knowledge jobs (gauge)
 
 **Snapshot metrics** (Stage 3A, cluster mode):
-- `engram_snapshot_build_total` — number of snapshots built by this node (counter)
-- `engram_snapshot_install_total` — number of snapshots installed from the leader (counter)
-- `engram_snapshot_last_index` — log index of the most recent snapshot; 0 if none exists (gauge)
+- `engram_snapshot_build_total` - number of snapshots built by this node (counter)
+- `engram_snapshot_install_total` - number of snapshots installed from the leader (counter)
+- `engram_snapshot_last_index` - log index of the most recent snapshot; 0 if none exists (gauge)
 
 ### 10.2 Tracing
 - Each request gets a span.

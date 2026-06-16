@@ -1,15 +1,15 @@
 # Quality Benchmarking
 
-This document is the end-to-end runbook for engram's retrieval-quality benchmarks.
+This document is the end-to-end runbook for Engram's retrieval-quality benchmarks.
 
 ## Scope
 
-engram currently ships two benchmark bridges:
+Engram currently ships two benchmark bridges:
 
 - `benchmarks/longmemeval_engram.py` for LongMemEval retrieval and QA.
 - `benchmarks/beam_engram.py` for BEAM retrieval and QA.
 
-These scripts drive the existing engram HTTP API. They do not require extra debug endpoints or message-status APIs. Instead, they wait for background embeddings by polling the Prometheus gauge `engram_memory_embedding_queue_size` until the queue settles.
+These scripts drive the existing Engram HTTP API. They do not require extra debug endpoints or message-status APIs. Instead, they wait for background embeddings by polling the Prometheus gauge `engram_memory_embedding_queue_size` until the queue settles.
 
 ## Recommended Runtime
 
@@ -32,7 +32,7 @@ curl http://127.0.0.1:3002/health
 
 ### Dataset Acquisition
 
-The LongMemEval GitHub repository does not include the benchmark JSON files in-tree. You need a local copy of one of the released files before running engram against it:
+The LongMemEval GitHub repository does not include the benchmark JSON files in-tree. You need a local copy of one of the released files before running Engram against it:
 
 - `longmemeval_s.json`
 - `longmemeval_m.json`
@@ -58,7 +58,7 @@ Outputs:
 
 ### Local Embedding Fallback
 
-For retrieval-only runs, you can avoid hosted embedding latency and rate limits by letting the harness start a local OpenAI-compatible embedding server and a matching engram process:
+For retrieval-only runs, you can avoid hosted embedding latency and rate limits by letting the harness start a local OpenAI-compatible embedding server and a matching Engram process:
 
 ```bash
 python3 benchmarks/longmemeval_engram.py \
@@ -71,7 +71,7 @@ python3 benchmarks/longmemeval_engram.py \
   --lance-db-path ./data/lancedb-bench-local
 ```
 
-That flow starts `tools/local_embed_server.py`, injects `OPENAI_BASE_URL` for the spawned engram process, and defaults `EMBEDDING_DIMENSION` to `384`. QA mode still needs a completion model such as `gpt-4o` for answer generation.
+That flow starts `tools/local_embed_server.py`, injects `OPENAI_BASE_URL` for the spawned Engram process, and defaults `EMBEDDING_DIMENSION` to `384`. QA mode still needs a completion model such as `gpt-4o` for answer generation.
 
 ### QA Run
 
@@ -119,7 +119,7 @@ python3 benchmarks/beam_engram.py \
   --output-dir benchmarks/results/beam-128k
 ```
 
-For BEAM retrieval, engram records ranked outputs per probing question. BEAM does not expose LongMemEval-style session gold labels directly, so the bridge writes raw retrieval outputs even when full recall-style metrics are unavailable.
+For BEAM retrieval, Engram records ranked outputs per probing question. BEAM does not expose LongMemEval-style session gold labels directly, so the bridge writes raw retrieval outputs even when full recall-style metrics are unavailable.
 
 ### QA Run
 
@@ -161,7 +161,7 @@ Important caveat:
 
 - `LONGMEMEVAL_DATASET` must point to a real local file.
 - `RUN_BEAM=1` can default `BEAM_DATASET` to `benchmarks/deps/BEAM/chats/<tier>` after sparse-cloning the repo.
-- For local-embedding retrieval smoke runs, prefer the direct Python harnesses; the wrapper still assumes the target engram instance already has a working embedding backend.
+- For local-embedding retrieval smoke runs, prefer the direct Python harnesses; the wrapper still assumes the target Engram instance already has a working embedding backend.
 
 Example:
 
