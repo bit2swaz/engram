@@ -13,6 +13,7 @@ use crate::core::{CoreMemoryStore, ShortTermMemory};
 use crate::knowledge::global::{GlobalGraph, Visibility};
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::knowledge::types::KnowledgeJob;
+use crate::metrics::AppMetrics;
 use crate::models::{EmbeddingStatus, Message};
 use crate::raft::snapshot::{EngramSnapshot, SessionFacts, SessionMessages};
 use crate::raft::types::{CommandResponse, MemoryCommand, TypeConfig};
@@ -38,6 +39,7 @@ struct SmInner {
     global_graph: Arc<RwLock<GlobalGraph>>,
     visibility: Arc<RwLock<HashMap<String, Visibility>>>,
     session_agents: Arc<RwLock<HashMap<String, String>>>,
+    metrics: Arc<AppMetrics>,
     db: Arc<Database>,
     snapshot_idx: u64,
 }
@@ -54,6 +56,7 @@ impl EngStateMachineStore {
         knowledge_tx: mpsc::Sender<KnowledgeJob>,
         db: Arc<Database>,
         global_graph: Arc<RwLock<GlobalGraph>>,
+        metrics: Arc<AppMetrics>,
     ) -> Self {
         {
             let txn = db.begin_write().expect("redb begin_write sm init");
@@ -72,6 +75,7 @@ impl EngStateMachineStore {
                 global_graph,
                 visibility: Arc::new(RwLock::new(HashMap::new())),
                 session_agents: Arc::new(RwLock::new(HashMap::new())),
+                metrics,
                 db,
                 snapshot_idx: 0,
             })),
@@ -242,7 +246,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         I::IntoIter: Send,
     {
         // Clone Arcs once so the lock is not held across async apply_cmd calls.
-        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility, session_agents) = {
+        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility, session_agents, metrics) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -253,6 +257,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.global_graph.clone(),
                 inner.visibility.clone(),
                 inner.session_agents.clone(),
+                inner.metrics.clone(),
             )
         };
 
@@ -267,7 +272,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 last_membership = Some(StoredMembership::new(Some(entry.log_id.clone()), mem.clone()));
             }
             if let EntryPayload::Normal(cmd) = entry.payload {
-                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, &session_agents, index).await;
+                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, &session_agents, &metrics, index).await;
             }
             responses.push(CommandResponse::default());
         }
@@ -360,6 +365,12 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
     }
 }
 
+fn update_global_metrics(metrics: &AppMetrics, graph: &GlobalGraph) {
+    metrics.set_global_entities(graph.all_entities().len());
+    metrics.set_global_relationships(graph.all_relationships().len());
+    metrics.set_global_conflicts(graph.conflicts().len());
+}
+
 async fn apply_cmd(
     cmd: MemoryCommand,
     short_term: &Arc<dyn ShortTermMemory>,
@@ -370,6 +381,7 @@ async fn apply_cmd(
     global_graph: &Arc<RwLock<GlobalGraph>>,
     visibility: &Arc<RwLock<HashMap<String, Visibility>>>,
     session_agents: &Arc<RwLock<HashMap<String, String>>>,
+    metrics: &Arc<AppMetrics>,
     index: u64,
 ) {
     match cmd {
@@ -411,7 +423,11 @@ async fn apply_cmd(
             // Signal embedding worker to delete from local LanceDB.
             let _ = embedding_tx.try_send(EmbeddingJob::DeleteSession { session_id: session_id.clone() });
             knowledge_graph.write().await.delete_session(&session_id);
-            global_graph.write().await.prune_session(&session_id);
+            {
+                let mut gg = global_graph.write().await;
+                gg.prune_session(&session_id);
+                update_global_metrics(metrics, &*gg);
+            }
             visibility.write().await.remove(&session_id);
             session_agents.write().await.remove(&session_id);
         }
@@ -419,7 +435,9 @@ async fn apply_cmd(
             knowledge_graph.write().await.apply_extraction(&session_id, &message_id, entities.clone(), relationships.clone());
             if visibility.read().await.get(&session_id) == Some(&Visibility::Shared) {
                 let agent_id = session_agents.read().await.get(&session_id).cloned();
-                global_graph.write().await.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                let mut gg = global_graph.write().await;
+                gg.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                update_global_metrics(metrics, &*gg);
             }
         }
         MemoryCommand::SetSessionVisibility { session_id, visibility: new_vis } => {
@@ -434,12 +452,16 @@ async fn apply_cmd(
                         (kg.all_entities(&session_id), kg.all_relationships(&session_id))
                     };
                     let agent_id = session_agents.read().await.get(&session_id).cloned();
-                    global_graph.write().await.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                    let mut gg = global_graph.write().await;
+                    gg.merge_with_agent(&session_id, agent_id.as_deref(), index, entities, relationships);
+                    update_global_metrics(metrics, &*gg);
                 }
                 Visibility::Private => {
                     // Prune only when actually switching away from Shared.
                     if prev == Some(Visibility::Shared) {
-                        global_graph.write().await.prune_session(&session_id);
+                        let mut gg = global_graph.write().await;
+                        gg.prune_session(&session_id);
+                        update_global_metrics(metrics, &*gg);
                     }
                 }
             }
@@ -484,6 +506,7 @@ mod tests {
         let gg = Arc::new(RwLock::new(GlobalGraph::new()));
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("sm.redb")).unwrap());
+        let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
         let sm = EngStateMachineStore::new(
             short_term.clone(),
             core_memory.clone(),
@@ -493,6 +516,7 @@ mod tests {
             know_tx,
             db,
             gg.clone(),
+            metrics,
         );
         (sm, short_term, embed_rx, know_rx, kg, core_memory, gg, dir)
     }

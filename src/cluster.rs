@@ -220,6 +220,7 @@ mod tests {
             knowledge_graph.clone(),
             knowledge_tx.clone(),
             global_graph,
+            c.metrics.clone(),
         )
         .await
         .unwrap();

@@ -43,6 +43,7 @@ pub async fn build_raft_node(
     knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
     knowledge_tx: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
     global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
+    metrics: Arc<AppMetrics>,
 ) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
     use crate::raft::{
         log_store::EngRaftLogStore, network::EngRaftNetwork,
@@ -71,6 +72,7 @@ pub async fn build_raft_node(
         knowledge_tx,
         db,
         global_graph,
+        metrics,
     );
 
     // RECOVERY: flush Redis + restore snapshot BEFORE openraft replays the log.
@@ -125,7 +127,8 @@ mod stage3a_tests {
             crate::knowledge::global::GlobalGraph::new(),
         ));
 
-        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx, gg)
+        let metrics = std::sync::Arc::new(crate::metrics::AppMetrics::new().unwrap());
+        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx, gg, metrics)
             .await
             .unwrap();
         assert!(raft.is_initialized().await.is_ok() || true);
@@ -166,6 +169,7 @@ mod stage3a_tests {
             .unwrap();
 
         let st_clone = short_term.clone();
+        let metrics = std::sync::Arc::new(crate::metrics::AppMetrics::new().unwrap());
         let _raft = super::build_raft_node(
             &cfg,
             short_term as std::sync::Arc<dyn crate::core::ShortTermMemory>,
@@ -175,6 +179,7 @@ mod stage3a_tests {
             kg,
             ktx,
             gg,
+            metrics,
         )
         .await
         .unwrap();
@@ -285,6 +290,7 @@ pub async fn build_app_state_with_embedding_provider(
             knowledge_graph.clone(),
             knowledge_job_sender.clone(),
             global_graph.clone(),
+            metrics.clone(),
         )
         .await
         .map_err(|e| AppBuildError::Other(e.into()))?;
