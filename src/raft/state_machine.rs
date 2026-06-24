@@ -471,6 +471,8 @@ async fn apply_cmd(
                 session_agents.write().await.insert(session_id, agent);
             }
         }
+        // Full implementation in Task 6; stub keeps the match exhaustive now.
+        MemoryCommand::ApplySummary { .. } => {}
         MemoryCommand::NoOp => {}
     }
 }
