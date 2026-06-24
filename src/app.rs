@@ -75,12 +75,12 @@ pub async fn build_raft_node(
         knowledge_tx,
         db,
         global_graph,
-        consolidated,
+        consolidated.clone(),
         metrics,
     );
 
     // RECOVERY: flush Redis + restore snapshot BEFORE openraft replays the log.
-    recover_state_machine(&state_machine, short_term, core_memory).await?;
+    recover_state_machine(&state_machine, short_term, core_memory, consolidated).await?;
 
     let raft_config = Arc::new(
         openraft::Config {

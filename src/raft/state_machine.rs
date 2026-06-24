@@ -167,6 +167,11 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let consolidated = inner
+        .consolidated
+        .dump_all()
+        .await
+        .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
     let payload = EngramSnapshot {
         version: crate::raft::snapshot::SNAPSHOT_VERSION,
@@ -176,8 +181,7 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         global_graph,
         visibility,
         session_agents,
-        // ponytail: Task 7 wires up the real consolidated dump; empty for now keeps the build green.
-        consolidated: vec![],
+        consolidated,
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -317,7 +321,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
         // Clone store/graph handles under a short lock so we don't hold it across awaits.
-        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, db) = {
+        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, consolidated, db) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -326,6 +330,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.global_graph.clone(),
                 inner.visibility.clone(),
                 inner.session_agents.clone(),
+                inner.consolidated.clone(),
                 inner.db.clone(),
             )
         };
@@ -353,6 +358,10 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 agents.insert(session_id, agent_id);
             }
         }
+        consolidated
+            .restore_all(payload.consolidated)
+            .await
+            .map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
 
         persist_snapshot(&db, meta, snapshot.get_ref())?;
 
@@ -971,5 +980,26 @@ mod tests {
         assert_eq!(cons.get_summaries("s1").await.unwrap().len(), 1);
         sm.apply(vec![make_entry(1, MemoryCommand::DeleteSession { session_id: "s1".into() })]).await.unwrap();
         assert!(cons.get_summaries("s1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_preserves_summaries() {
+        let (mut sm, _st, _embed, _know, _kg, _cm, _gg, cons, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::ApplySummary {
+            session_id: "s1".into(), summary_id: "u1".into(), summary_text: "kept".into(),
+            consumed_message_ids: vec![], model: "mock".into(), prompt_version: "summarize_v1".into(),
+        })]).await.unwrap();
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let (mut sm2, _st2, _e2, _k2, _kg2, _cm2, _gg2, cons2, _dir2) = make_sm();
+        let mut buf = sm2.begin_receiving_snapshot().await.unwrap();
+        *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
+        sm2.install_snapshot(&snap.meta, buf).await.unwrap();
+
+        let restored = cons2.get_summaries("s1").await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text, "kept");
     }
 }
