@@ -172,6 +172,8 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         global_graph,
         visibility,
         session_agents,
+        // ponytail: Task 7 wires up the real consolidated dump; empty for now keeps the build green.
+        consolidated: vec![],
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -749,7 +751,7 @@ mod tests {
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
         let payload = crate::raft::snapshot::EngramSnapshot::from_bytes(snap.snapshot.get_ref()).unwrap();
-        assert_eq!(payload.version, 2);
+        assert_eq!(payload.version, 3);
         assert!(payload.knowledge_graph.sessions.iter().any(|s| s.session_id == "s1"));
         assert!(payload.core_memory.iter().any(|s| s.facts.contains(&"likes coffee".to_string())));
     }

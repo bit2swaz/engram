@@ -4,7 +4,7 @@ use crate::knowledge::graph::GraphSnapshot;
 use crate::models::Message;
 
 /// Snapshot schema version. Bump when the payload layout changes incompatibly.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessages {
@@ -34,6 +34,9 @@ pub struct EngramSnapshot {
     pub visibility: Vec<(String, crate::knowledge::global::Visibility)>,
     #[serde(default)]
     pub session_agents: Vec<(String, String)>,
+    /// Per-session consolidated summaries. Added in v3; v1/v2 snapshots load with an empty map.
+    #[serde(default)]
+    pub consolidated: Vec<(String, Vec<crate::consolidation::store::Summary>)>,
 }
 
 impl EngramSnapshot {
@@ -61,12 +64,13 @@ mod tests {
             global_graph: None,
             visibility: vec![],
             session_agents: vec![],
+            consolidated: vec![],
         }
     }
 
     #[test]
-    fn snapshot_carries_version_two() {
-        assert_eq!(sample().version, 2);
+    fn snapshot_carries_version_three() {
+        assert_eq!(sample().version, 3);
     }
 
     #[test]
@@ -74,10 +78,11 @@ mod tests {
         let snap = sample();
         let bytes = snap.to_bytes().unwrap();
         let back = EngramSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(back.version, 2);
+        assert_eq!(back.version, 3);
         assert_eq!(back.core_memory[0].facts, vec!["f".to_string()]);
         assert!(back.global_graph.is_none());
         assert!(back.visibility.is_empty());
+        assert!(back.consolidated.is_empty());
     }
 
     #[test]
@@ -89,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_version_is_two_and_carries_global_and_visibility() {
+    fn snapshot_carries_global_and_visibility() {
         let snap = EngramSnapshot {
             version: SNAPSHOT_VERSION,
             short_term: vec![],
@@ -98,8 +103,9 @@ mod tests {
             global_graph: Some(crate::knowledge::global::GlobalGraphSnapshot::default()),
             visibility: vec![("s1".into(), crate::knowledge::global::Visibility::Shared)],
             session_agents: vec![("s1".into(), "agent-7".into())],
+            consolidated: vec![],
         };
-        assert_eq!(snap.version, 2);
+        assert_eq!(snap.version, 3);
         let bytes = snap.to_bytes().unwrap();
         let back = EngramSnapshot::from_bytes(&bytes).unwrap();
         assert!(back.global_graph.is_some());
@@ -114,5 +120,44 @@ mod tests {
         assert!(back.global_graph.is_none());
         assert!(back.visibility.is_empty());
         assert!(back.session_agents.is_empty());
+        assert!(back.consolidated.is_empty());
+    }
+
+    #[test]
+    fn snapshot_version_is_three_and_carries_consolidated() {
+        let snap = EngramSnapshot {
+            version: SNAPSHOT_VERSION,
+            short_term: vec![],
+            core_memory: vec![],
+            knowledge_graph: crate::knowledge::graph::GraphSnapshot::default(),
+            global_graph: None,
+            visibility: vec![],
+            session_agents: vec![],
+            consolidated: vec![(
+                "s1".to_string(),
+                vec![crate::consolidation::store::Summary {
+                    id: "u1".into(),
+                    text: "t".into(),
+                    created_at_index: 1,
+                    consumed_message_ids: vec!["m1".into()],
+                    consumed_count: 1,
+                    model: "mock".into(),
+                    prompt_version: "summarize_v1".into(),
+                }],
+            )],
+        };
+        assert_eq!(snap.version, 3);
+        let bytes = snap.to_bytes().unwrap();
+        let back = EngramSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(back.consolidated.len(), 1);
+        assert_eq!(back.consolidated[0].1[0].id, "u1");
+    }
+
+    #[test]
+    fn v2_snapshot_without_consolidated_still_loads() {
+        // v2 JSON without the consolidated field must load cleanly.
+        let v2 = r#"{"version":2,"short_term":[],"core_memory":[],"knowledge_graph":{"sessions":[],"processed":[]},"global_graph":null,"visibility":[],"session_agents":[]}"#;
+        let back = EngramSnapshot::from_bytes(v2.as_bytes()).unwrap();
+        assert!(back.consolidated.is_empty());
     }
 }
