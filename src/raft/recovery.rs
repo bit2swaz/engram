@@ -43,6 +43,7 @@ mod tests {
     use tokio::sync::{mpsc, RwLock};
     use redb::Database;
 
+    use crate::consolidation::store::{ConsolidatedMemoryStore, InMemoryConsolidatedStore};
     use crate::core::{CoreMemoryStore, InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, ShortTermMemory};
     use crate::knowledge::graph::KnowledgeGraph;
     use crate::raft::recovery::recover_state_machine;
@@ -57,8 +58,9 @@ mod tests {
         let (ktx, _krx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
         let gg = Arc::new(RwLock::new(crate::knowledge::global::GlobalGraph::new()));
+        let consolidated: Arc<dyn ConsolidatedMemoryStore> = Arc::new(InMemoryConsolidatedStore::default());
         let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
-        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db, gg, metrics);
+        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db, gg, consolidated, metrics);
         (sm, st, cm, kg)
     }
 

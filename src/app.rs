@@ -50,6 +50,7 @@ pub async fn build_raft_node(
         state_machine::EngStateMachineStore, types::TypeConfig,
     };
 
+    use crate::consolidation::store::{ConsolidatedMemoryStore, InMemoryConsolidatedStore};
     use crate::raft::recovery::recover_state_machine;
     use openraft::SnapshotPolicy;
 
@@ -63,6 +64,8 @@ pub async fn build_raft_node(
     let db = Arc::new(redb::Database::create(&config.raft_db_path)?);
 
     let log_store = EngRaftLogStore::new(db.clone());
+    // ponytail: in-memory consolidated store until Task 4A wires up the cluster-aware one
+    let consolidated: Arc<dyn ConsolidatedMemoryStore> = Arc::new(InMemoryConsolidatedStore::default());
     let state_machine = EngStateMachineStore::new(
         short_term.clone(),
         core_memory.clone(),
@@ -72,6 +75,7 @@ pub async fn build_raft_node(
         knowledge_tx,
         db,
         global_graph,
+        consolidated,
         metrics,
     );
 

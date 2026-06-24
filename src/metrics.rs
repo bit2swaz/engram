@@ -280,6 +280,11 @@ impl AppMetrics {
         self.global_conflicts.set(count as i64);
     }
 
+    // ponytail: stubs; real counters added in Task 8 when Prometheus gauges are registered
+    pub fn increment_consolidations(&self) {}
+    pub fn increment_messages_consolidated(&self, _count: u64) {}
+    pub fn set_summaries(&self, _count: usize) {}
+
     pub fn render(&self) -> Result<String, String> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();
