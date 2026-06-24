@@ -28,6 +28,11 @@ pub struct AppMetrics {
     global_entities: IntGauge,
     global_relationships: IntGauge,
     global_conflicts: IntGauge,
+    consolidations_total: IntCounter,
+    messages_consolidated_total: IntCounter,
+    summaries: IntGauge,
+    consolidation_queue_size: IntGauge,
+    summarization_duration_seconds: HistogramVec,
 }
 
 impl AppMetrics {
@@ -169,6 +174,39 @@ impl AppMetrics {
         ))?;
         registry.register(Box::new(global_conflicts.clone()))?;
 
+        let consolidations_total = IntCounter::with_opts(Opts::new(
+            "consolidations_total",
+            "Total number of consolidation operations applied.",
+        ))?;
+        registry.register(Box::new(consolidations_total.clone()))?;
+
+        let messages_consolidated_total = IntCounter::with_opts(Opts::new(
+            "messages_consolidated_total",
+            "Total number of raw messages consumed by consolidation.",
+        ))?;
+        registry.register(Box::new(messages_consolidated_total.clone()))?;
+
+        let summaries = IntGauge::with_opts(Opts::new(
+            "summaries",
+            "Current total number of consolidated summaries across all sessions.",
+        ))?;
+        registry.register(Box::new(summaries.clone()))?;
+
+        let consolidation_queue_size = IntGauge::with_opts(Opts::new(
+            "consolidation_queue_size",
+            "Current number of pending consolidation jobs.",
+        ))?;
+        registry.register(Box::new(consolidation_queue_size.clone()))?;
+
+        let summarization_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "summarization_duration_seconds",
+                "Duration of LLM summarization calls in seconds.",
+            ),
+            &["model"],
+        )?;
+        registry.register(Box::new(summarization_duration_seconds.clone()))?;
+
         Ok(Self {
             registry,
             messages_added_total,
@@ -191,6 +229,11 @@ impl AppMetrics {
             global_entities,
             global_relationships,
             global_conflicts,
+            consolidations_total,
+            messages_consolidated_total,
+            summaries,
+            consolidation_queue_size,
+            summarization_duration_seconds,
         })
     }
 
@@ -280,10 +323,27 @@ impl AppMetrics {
         self.global_conflicts.set(count as i64);
     }
 
-    // ponytail: stubs; real counters added in Task 8 when Prometheus gauges are registered
-    pub fn increment_consolidations(&self) {}
-    pub fn increment_messages_consolidated(&self, _count: u64) {}
-    pub fn set_summaries(&self, _count: usize) {}
+    pub fn increment_consolidations(&self) {
+        self.consolidations_total.inc();
+    }
+
+    pub fn increment_messages_consolidated(&self, n: u64) {
+        self.messages_consolidated_total.inc_by(n);
+    }
+
+    pub fn set_summaries(&self, n: usize) {
+        self.summaries.set(n as i64);
+    }
+
+    pub fn set_consolidation_queue_size(&self, n: usize) {
+        self.consolidation_queue_size.set(n as i64);
+    }
+
+    pub fn start_summarization_timer(&self, model: &str) -> HistogramTimer {
+        self.summarization_duration_seconds
+            .with_label_values(&[model])
+            .start_timer()
+    }
 
     pub fn render(&self) -> Result<String, String> {
         let mut buffer = Vec::new();
@@ -322,5 +382,19 @@ mod tests {
         assert!(t.contains("engram_global_entities"));
         assert!(t.contains("engram_global_relationships"));
         assert!(t.contains("engram_global_conflicts"));
+    }
+
+    #[test]
+    fn renders_consolidation_metrics() {
+        let m = AppMetrics::new().unwrap();
+        m.increment_consolidations();
+        m.increment_messages_consolidated(30);
+        m.set_summaries(2);
+        m.set_consolidation_queue_size(1);
+        let t = m.render().unwrap();
+        assert!(t.contains("engram_consolidations_total"));
+        assert!(t.contains("engram_messages_consolidated_total"));
+        assert!(t.contains("engram_summaries"));
+        assert!(t.contains("engram_consolidation_queue_size"));
     }
 }
