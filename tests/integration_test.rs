@@ -96,6 +96,7 @@ async fn setup_test_app() -> TestApp {
         knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
         raft_db_path: std::path::PathBuf::from("./data/raft/engram.redb"),
         snapshot_log_threshold: 1000,
+        ..Config::default()
     };
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
