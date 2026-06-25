@@ -246,6 +246,15 @@ impl ShortTermMemory for RedisShortTermMemory {
         }
         Ok(())
     }
+
+    async fn remove_messages(&self, session_id: &str, ids: &[String]) -> Result<(), MemoryError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut messages = self.read_messages(session_id).await?;
+        messages.retain(|m| m.id.as_deref().map_or(true, |id| !ids.contains(&id.to_string())));
+        self.write_messages(session_id, &messages).await
+    }
 }
 
 fn session_id_from_key(key: &str) -> String {
@@ -296,6 +305,16 @@ mod tests {
         }
     }
 
+    fn message_with_id(id: &str, content: &str) -> Message {
+        Message {
+            id: Some(id.to_string()),
+            role: "user".to_string(),
+            content: content.to_string(),
+            timestamp: None,
+            embedding_status: None,
+        }
+    }
+
     #[tokio::test]
     async fn dump_all_and_restore_all_round_trip() {
         let (store, _node) = test_store().await;
@@ -312,5 +331,19 @@ mod tests {
         assert!(store.get_recent("stale", 10).await.unwrap().is_empty());
         assert_eq!(store.get_recent("s1", 10).await.unwrap().len(), 1);
         assert_eq!(store.get_recent("s2", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_messages_by_id() {
+        let (store, _node) = test_store().await;
+        store.add_message("s1", message_with_id("m1", "first")).await.unwrap();
+        store.add_message("s1", message_with_id("m2", "second")).await.unwrap();
+        store.add_message("s1", message_with_id("m3", "third")).await.unwrap();
+
+        store.remove_messages("s1", &["m1".into(), "m3".into()]).await.unwrap();
+
+        let remaining = store.get_recent("s1", 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.as_deref(), Some("m2"));
     }
 }
