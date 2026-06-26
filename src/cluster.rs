@@ -211,6 +211,8 @@ mod tests {
         let global_graph = Arc::new(tokio::sync::RwLock::new(crate::knowledge::global::GlobalGraph::new()));
         let (knowledge_tx, mut knowledge_rx) = tokio::sync::mpsc::channel::<crate::knowledge::types::KnowledgeJob>(500);
         tokio::spawn(async move { while knowledge_rx.recv().await.is_some() {} });
+        let consolidated = Arc::new(crate::consolidation::store::InMemoryConsolidatedStore::default())
+            as Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore>;
         let raft = build_raft_node(
             &config,
             c.short_term.clone(),
@@ -220,6 +222,7 @@ mod tests {
             knowledge_graph.clone(),
             knowledge_tx.clone(),
             global_graph,
+            consolidated.clone(),
             c.metrics.clone(),
         )
         .await
@@ -252,6 +255,13 @@ mod tests {
             global_graph: Arc::new(tokio::sync::RwLock::new(
                 crate::knowledge::global::GlobalGraph::new(),
             )),
+            consolidated,
+            consolidation_tx: {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<crate::consolidation::scheduler::ConsolidationJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         });
         (TestServer::new(build_router(state)).unwrap(), raft_dir)
     }
@@ -283,6 +293,13 @@ mod tests {
             global_graph: Arc::new(tokio::sync::RwLock::new(
                 crate::knowledge::global::GlobalGraph::new(),
             )),
+            consolidated: Arc::new(crate::consolidation::store::InMemoryConsolidatedStore::default()),
+            consolidation_tx: {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<crate::consolidation::scheduler::ConsolidationJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         });
         TestServer::new(build_router(state)).unwrap()
     }

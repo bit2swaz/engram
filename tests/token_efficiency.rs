@@ -83,6 +83,13 @@ fn build_test_state() -> Arc<AppState> {
         global_graph: Arc::new(tokio::sync::RwLock::new(
             engram::knowledge::global::GlobalGraph::new(),
         )),
+        consolidated: Arc::new(engram::consolidation::store::InMemoryConsolidatedStore::default()),
+        consolidation_tx: {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<engram::consolidation::scheduler::ConsolidationJob>(16);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            tx
+        },
     })
 }
 

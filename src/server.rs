@@ -88,6 +88,31 @@ fn forward_to_redirect(
     MemoryServerError::Internal(format!("raft error: {e}"))
 }
 
+/// Returns a `RedirectToLeader` error if this node is a follower.
+///
+/// Unlike [`forward_to_redirect`], this consults the leader directly from Raft metrics
+/// rather than a `client_write` rejection for handlers that don't submit a command
+/// synchronously but still must route mutations to the leader (e.g. manual consolidate,
+/// which enqueues an async job the leader runs). Returns `None` when this node is the
+/// leader (or standalone), so the caller proceeds locally.
+pub(crate) fn redirect_if_follower(
+    raft: &crate::raft::types::RaftHandle,
+    node_id: u64,
+    peer_http_addrs: &std::collections::HashMap<u64, String>,
+    path: &str,
+) -> Option<MemoryServerError> {
+    let leader = raft.metrics().borrow().current_leader;
+    if leader == Some(node_id) {
+        return None;
+    }
+    Some(match leader.and_then(|id| peer_http_addrs.get(&id)) {
+        Some(http_addr) => {
+            MemoryServerError::RedirectToLeader(format!("http://{http_addr}{path}"))
+        }
+        None => MemoryServerError::NoLeader,
+    })
+}
+
 /// Submits a command to Raft and maps the result to a handler-ready `StatusCode`.
 ///
 /// Called only when `state.raft.is_some()`. Centralises the `client_write` call and
@@ -134,6 +159,10 @@ pub struct AppState {
     pub knowledge_job_sender: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
     /// Cluster-wide knowledge graph aggregating all Shared sessions.
     pub global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
+    /// Per-session consolidated summaries, shared with the Raft state machine.
+    pub consolidated: Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore>,
+    /// Channel for handing consolidation jobs to the scheduler worker pool.
+    pub consolidation_tx: mpsc::Sender<crate::consolidation::scheduler::ConsolidationJob>,
 }
 
 
@@ -236,6 +265,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{session_id}/knowledge/path", get(find_path))
         .route("/sessions/{session_id}/knowledge/export", get(export_knowledge))
         .route("/sessions/{session_id}/visibility", put(set_visibility))
+        .route(
+            "/sessions/{session_id}/summaries",
+            get(crate::consolidation::handler::get_summaries),
+        )
+        .route(
+            "/sessions/{session_id}/consolidate",
+            post(crate::consolidation::handler::post_consolidate),
+        )
         .route("/knowledge/global", get(get_global))
         .route("/knowledge/global/entities/{name}", get(get_global_entity))
         .route("/knowledge/global/entities/{name}/sources", get(get_global_entity_sources))
@@ -369,7 +406,7 @@ async fn add_message(
     // Cluster mode: replicate through Raft. The state machine applies the command to
     // Redis and enqueues the embedding job on every node independently.
     if let Some(raft) = &state.raft {
-        return raft_write(
+        let status = raft_write(
             raft,
             MemoryCommand::AddMessage {
                 session_id: session_id.clone(),
@@ -378,7 +415,15 @@ async fn add_message(
             &state.peer_http_addrs,
             &format!("/sessions/{session_id}/messages"),
         )
-        .await;
+        .await?;
+        // Nudge the consolidation scheduler. The worker re-checks leadership, the count
+        // threshold, and the in-flight guard, so a full queue or a follower is harmless.
+        let _ = state
+            .consolidation_tx
+            .try_send(crate::consolidation::scheduler::ConsolidationJob {
+                session_id: session_id.clone(),
+            });
+        return Ok(status);
     }
 
     // Standalone mode: write directly to Redis and enqueue embedding.
@@ -816,6 +861,13 @@ mod tests {
             global_graph: Arc::new(tokio::sync::RwLock::new(
                 crate::knowledge::global::GlobalGraph::new(),
             )),
+            consolidated: Arc::new(crate::consolidation::store::InMemoryConsolidatedStore::default()),
+            consolidation_tx: {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<crate::consolidation::scheduler::ConsolidationJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         })
     }
 
@@ -1287,6 +1339,113 @@ mod tests {
             "expected 2xx or 307 but got {}",
             resp.status_code()
         );
+    }
+
+    #[tokio::test]
+    async fn summaries_and_consolidate_routes_exist() {
+        let state = build_test_state();
+        {
+            let s = crate::consolidation::store::Summary {
+                id: "u1".into(),
+                text: "kept".into(),
+                created_at_index: 1,
+                consumed_message_ids: vec!["m1".into()],
+                consumed_count: 1,
+                model: "mock".into(),
+                prompt_version: "summarize_v1".into(),
+            };
+            state.consolidated.add_summary("s1", s).await.unwrap();
+        }
+        let server = TestServer::new(build_router(state)).unwrap();
+
+        let got = server.get("/sessions/s1/summaries").await;
+        got.assert_status_ok();
+        assert!(got.text().contains("kept"));
+
+        // standalone (no raft): leader path always accepts.
+        let resp = server.post("/sessions/s1/consolidate").await;
+        assert!(
+            resp.status_code().is_success() || resp.status_code().as_u16() == 307,
+            "expected 2xx or 307 but got {}",
+            resp.status_code()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_consolidate_drives_full_flow_to_summary_and_trim() {
+        // Wire a real scheduler to the same stores the router serves, mirroring app.rs
+        // standalone wiring, then drive the whole path over HTTP: POST /consolidate ->
+        // job -> mock summarize -> trim -> GET /summaries shows the result.
+        use crate::consolidation::scheduler::{
+            consolidation_job_channel, spawn_consolidation_workers,
+        };
+        use crate::consolidation::store::{ConsolidatedMemoryStore, InMemoryConsolidatedStore};
+        use crate::core::ShortTermMemory;
+        use crate::knowledge::summarizer::{MockSummarizer, Summarizer};
+
+        let short_term = Arc::new(InMemoryStore::default());
+        for i in 0..6 {
+            short_term
+                .add_message(
+                    "s1",
+                    crate::models::Message {
+                        id: Some(format!("m{i}")),
+                        role: "user".into(),
+                        content: format!("content {i}"),
+                        timestamp: None,
+                        embedding_status: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let consolidated = Arc::new(InMemoryConsolidatedStore::default());
+        let metrics = Arc::new(AppMetrics::new().unwrap());
+        let (consolidation_tx, rx) = consolidation_job_channel(16);
+        let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer);
+        // threshold 4, window 2: with 6 messages, summarize oldest 4, keep newest 2.
+        spawn_consolidation_workers(
+            summarizer,
+            None,
+            0,
+            short_term.clone(),
+            consolidated.clone(),
+            metrics.clone(),
+            4,
+            2,
+            rx,
+            1,
+        );
+
+        let base = build_test_state();
+        let state = Arc::new(AppState {
+            short_term_memory: short_term.clone(),
+            consolidated: consolidated.clone(),
+            consolidation_tx,
+            ..(*base).clone()
+        });
+        let server = TestServer::new(build_router(state)).unwrap();
+
+        server.post("/sessions/s1/consolidate").await.assert_status(StatusCode::ACCEPTED);
+
+        // Worker runs async; poll until the summary lands.
+        let mut summaries: Vec<crate::consolidation::store::Summary> = vec![];
+        for _ in 0..40 {
+            summaries = consolidated.get_summaries("s1").await.unwrap();
+            if !summaries.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(summaries.len(), 1, "consolidation produced a summary");
+        assert_eq!(summaries[0].consumed_count, 4);
+
+        let remaining = short_term.get_recent("s1", 10).await.unwrap();
+        assert_eq!(remaining.len(), 2, "session trimmed back to the window");
+
+        let got = server.get("/sessions/s1/summaries").await;
+        got.assert_status_ok();
+        assert!(got.text().contains(&summaries[0].id));
     }
 
     #[tokio::test]

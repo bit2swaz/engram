@@ -158,6 +158,13 @@ mod tests {
             global_graph: Arc::new(tokio::sync::RwLock::new(
                 crate::knowledge::global::GlobalGraph::new(),
             )),
+            consolidated: Arc::new(crate::consolidation::store::InMemoryConsolidatedStore::default()),
+            consolidation_tx: {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<crate::consolidation::scheduler::ConsolidationJob>(16);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tx
+            },
         })
     }
 
