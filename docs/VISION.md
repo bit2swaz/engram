@@ -256,11 +256,13 @@ Learn:
 
 ---
 
-## Stage 4: Memory Evolution
+## Stage 4: Memory Evolution ✅
 
 Goal:
 
 Enable memory consolidation, summarization, and adaptation.
+
+Status: complete. Leader-only consolidation scheduler, `Summarizer` trait (OpenAI GPT-4o-mini + `MockSummarizer`), `ConsolidatedMemoryStore` (in-memory + Redis), `MemoryCommand::ApplySummary` for deterministic cluster-wide application, immutable `Summary` artifacts with UUID identity and message lineage, atomic trim-on-apply, snapshot v3 including consolidated summaries, five new Prometheus metrics, `GET /sessions/{id}/summaries` and `POST /sessions/{id}/consolidate` endpoints. 222 tests pass.
 
 Learn:
 

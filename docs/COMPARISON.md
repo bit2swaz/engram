@@ -6,12 +6,12 @@
 |------------------------------- |:--------------:|:-------------:|:-------------:|:----------------:|:---------------------:|
 | **Language**                   | Rust           | Python        | Python        | Python           | Go                    |
 | **Deployment model**           | Single binary, Docker | Docker, cloud, pip | pip, Docker, cloud | pip, cloud           | Docker, cloud         |
-| **Fault-tolerant cluster**     | Yes (3-node Raft, OpenRaft 0.9, persistent log + snapshots, startup recovery, snapshot v2 with global state) | No | No | No | ? |
+| **Fault-tolerant cluster**     | Yes (3-node Raft, OpenRaft 0.9, persistent log + snapshots, startup recovery, snapshot v3 with global state and consolidated summaries) | No | No | No | ? |
 | **Embedding flexibility**      | Yes (trait, BYO) | Yes (BYO, OpenAI, Cohere, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) | Yes (BYO, OpenAI, etc.) |
 | **Context visibility**         | Full (exact prompt shown) | Partial (debug endpoint) | Partial | Partial (depends on chain) | ? |
 | **Token budget control**       | Yes (per request) | Yes (configurable) | Yes (configurable) | Partial (depends on chain) | ? |
 | **Trimming strategy**          | Pair-preserving | Naive/Configurable | Naive | Naive | ? |
-| **Memory types**               | Short-term, long-term, core, per-session KG, global cross-session KG | Short, long, episodic | Short, long | Short, long, summary | Short, long, KG? |
+| **Memory types**               | Short-term, long-term, core, consolidated summaries, per-session KG, global cross-session KG | Short, long, episodic | Short, long | Short, long, summary | Short, long, KG? |
 | **Retrieval method**           | Semantic search, knowledge graph traversal | Semantic, BM25, hybrid | Semantic, hybrid | Semantic, retriever chain | Semantic, hybrid, KG |
 | **Knowledge graph**            | Yes (petgraph, per-session + global cross-session, agent provenance, conflict detection, persisted via snapshots) | No | No | No | Yes |
 | **Idempotency / deduplication**| Yes (message_id, status) | Yes (message_id) | Partial | No | ? |
@@ -54,7 +54,7 @@ On the currently published numbers, Engram's in-memory context assembly path is 
 - **Transparency:** Developers can inspect the exact assembled context returned by the API rather than relying on hidden chain state.
 - **Rust performance:** High concurrency, low memory overhead, and strong type safety.
 - **Single-binary deployment:** Easy to run locally or in production; Docker and Compose supported.
-- **Durability:** The Raft log, snapshots, and full state machine (including the knowledge graph, global graph, and session visibility) survive node restarts via the redb-backed persistent store and startup recovery.
+- **Durability:** The Raft log, snapshots, and full state machine (including the knowledge graph, global graph, session visibility, and consolidated summaries) survive node restarts via the redb-backed persistent store and startup recovery.
 - **Pair-preserving trim:** Prevents broken dialogue, a common source of LLM hallucination in naive memory engines.
 - **Idempotent workers:** Message ingestion and embedding are robust to retries and crashes.
 - **Observability:** Prometheus metrics and structured tracing from day one; snapshot build and install metrics included.
@@ -62,6 +62,7 @@ On the currently published numbers, Engram's in-memory context assembly path is 
 
 **Where Engram falls short today:**
 - **No KG-augmented retrieval yet:** The knowledge graph (per-session and global) is queryable via REST but is not yet wired into context assembly to augment semantic search results.
+- **Consolidated summaries not yet in retrieval:** Stage 4 stores summaries but `GET /sessions/{id}/context` still reads from raw short-term messages only. Wiring summaries into context assembly is a later stage.
 - **No managed cloud offering:** Self-hosted only; no SaaS or managed tier.
 - **Smaller community:** Newer and less widely adopted than Zep or LangChain.
 - **Retrieval is single-strategy:** Only semantic search drives context assembly; no hybrid or BM25 yet.

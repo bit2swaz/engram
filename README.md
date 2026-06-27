@@ -13,7 +13,9 @@ Engram is written in Rust for performance and reliability. It exposes all operat
 
 Engram is built for developers who want to plug in their own LLM agents, run locally or in production, and see exactly what goes into the context window. All memory operations are behind trait abstractions, so you can swap implementations or mock them in tests without changing any calling code.
 
-With the latest update, Engram also supports collective memory: multiple agents can share a global knowledge graph, sessions can be marked public or private, and conflicting facts across sessions are surfaced via a dedicated endpoint.
+With the latest update, Engram also supports memory evolution: when a session's short-term message count crosses a threshold, the leader automatically summarizes the oldest messages into a compact, immutable consolidated memory and trims them. State shrinks, meaning is preserved, and every node in the cluster agrees on the result.
+
+Engram also supports collective memory: multiple agents can share a global knowledge graph, sessions can be marked public or private, and conflicting facts across sessions are surfaced via a dedicated endpoint.
 
 ## architecture
 
@@ -30,11 +32,13 @@ graph TD
     router --> knowledgehandler["knowledge handler"]
     router --> visibilityhandler["visibility handler"]
     router --> globalhandler["global knowledge handler"]
+    router --> consolidationhandler["consolidation handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
     sessionhandler -->|delete or register agent| raft
     visibilityhandler -->|write| raft
+    consolidationhandler -->|ApplySummary| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
@@ -42,6 +46,7 @@ graph TD
     raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
     raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
     raft -->|state machine apply| visibility["session visibility map"]
+    raft -->|state machine apply| consolidated[("consolidated memory\nper-session summaries")]
     raft -->|embedding job| embedqueue["embedding worker pool<br/>bounded channel"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool<br/>bounded channel"]
     raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
@@ -56,11 +61,16 @@ graph TD
     longterm --> lancedb[("lancedb<br/>persistent ann search")]
 
     coremem --> redis
+    consolidated --> redis
 
     knowledgequeue -->|leader-only extraction| extractor["knowledge extractor trait"]
     extractor -->|openai gpt-4o-mini / mock| extraction["entities + relationships"]
     extraction -->|AddKnowledge via raft| knowledgegraph
     knowledgegraph -->|public sessions merge| globalgraph
+
+    consolidationscheduler["consolidation scheduler\nleader-only worker"] -->|threshold check| shortterm
+    consolidationscheduler -->|summarize| summarizer["summarizer trait\nopenai gpt-4o-mini / mock"]
+    summarizer -->|ApplySummary via raft| consolidated
 
     knowledgehandler --> knowledgegraph
     globalhandler --> globalgraph
@@ -193,6 +203,8 @@ docker compose up -d
 | GET    | /knowledge/global/path?from=X&to=Y                            | find path in global graph                    |
 | GET    | /knowledge/global/export?format=json\|dot                     | export global graph                          |
 | GET    | /knowledge/global/conflicts                                   | list conflicting facts across sessions       |
+| GET    | /sessions/{session_id}/summaries                              | list consolidated summaries for a session    |
+| POST   | /sessions/{session_id}/consolidate                            | manually trigger consolidation (leader only) |
 | GET    | /cluster                                                      | cluster status (cluster mode only)           |
 | POST   | /cluster/init                                                 | initialize cluster                           |
 | POST   | /cluster/add-learner                                          | add a learner node                           |
@@ -218,6 +230,11 @@ the application reads configuration from environment variables:
 | KNOWLEDGE_EXTRACTOR        | knowledge extractor backend (`openai` or `mock`)        | openai                   |
 | KNOWLEDGE_MAX_WORKERS      | number of knowledge extraction workers                  | 4                        |
 | KNOWLEDGE_CHANNEL_SIZE     | knowledge job queue size                                | 500                      |
+| SUMMARIZER                 | summarizer backend (`openai` or `mock`)                 | openai                   |
+| CONSOLIDATION_THRESHOLD    | message count that triggers consolidation               | 50                       |
+| CONSOLIDATION_TARGET_WINDOW| raw messages kept after consolidation                   | 20                       |
+| CONSOLIDATION_MAX_WORKERS  | number of consolidation workers                         | 2                        |
+| CONSOLIDATION_CHANNEL_SIZE | consolidation job queue size                            | 100                      |
 | RUST_LOG                   | tracing log filter                                      | info                     |
 | LOG_FORMAT                 | logging format (`pretty` or `json`)                     | pretty                   |
 
@@ -258,12 +275,16 @@ values like `similarity_threshold` and `max_tokens` are controlled per request t
 - follower-to-leader HTTP redirect (307) in cluster mode
 - per-node LanceDB with eventual consistency via deterministic embeddings
 - persistent redb-backed Raft log and snapshot store (survives restarts)
-- full state machine snapshots covering short-term memory, core memory, knowledge graph, global graph, session visibility, and agent registry
+- full state machine snapshots covering short-term memory, core memory, knowledge graph, global graph, session visibility, agent registry, and consolidated summaries (snapshot v3)
 - startup recovery from the latest snapshot followed by Raft log replay
 - InstallSnapshot RPC so lagging followers catch up without manual re-initialization
 - automatic log compaction after every `SNAPSHOT_LOG_THRESHOLD` committed entries
 - cluster management REST API
 - OpenAPI docs and Swagger UI
+- memory consolidation: leader-only summarization scheduler, `Summarizer` trait (OpenAI GPT-4o-mini or mock), `ConsolidatedMemoryStore` (in-memory and Redis), immutable summaries with message lineage and model metadata
+- `ApplySummary` Raft command: one atomic replicated transition stores the summary, trims consumed raw messages, and updates metrics; idempotent by `summary_id`
+- `GET /sessions/{id}/summaries` and `POST /sessions/{id}/consolidate` endpoints; followers 307-redirect to the leader
+- five new Prometheus metrics for consolidation throughput and queue depth
 - LongMemEval and BEAM benchmark harnesses
 
 ## quickstart (3-node cluster)
@@ -284,7 +305,7 @@ docker compose -f docker-compose.cluster.yml up -d --build
 ./scripts/cluster-verify.sh
 ```
 
-the verify script checks 17 criteria: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication, delete-session cleanup, node restart and recovery from the Raft log, snapshot compaction, restart-then-verify that state is fully restored from the latest snapshot, session visibility propagation, global graph population from public sessions, agent registration, global entity and relationship count metrics, global entity queries, global conflict detection, and global graph snapshot round-trip. it exits 0 only if all criteria pass.
+the verify script checks 22 criteria: leader election, write replication to all nodes, 307 redirect from followers, failover, Prometheus metric presence, knowledge graph replication, delete-session cleanup, node restart and recovery from the Raft log, snapshot compaction, restart-then-verify that state is fully restored from the latest snapshot, session visibility propagation, global graph population from public sessions, agent registration, global entity and relationship count metrics, global entity queries, global conflict detection, global graph snapshot round-trip, consolidation threshold trigger, replicated determinism (all nodes byte-identical after consolidation), idempotency of re-applied summaries, persistence of summaries through cluster restart, and manual consolidate endpoint. it exits 0 only if all 22 criteria pass.
 
 see `docker-compose.cluster.yml` and the scripts in `scripts/` for details.
 

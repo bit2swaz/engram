@@ -21,6 +21,8 @@ This document describes every REST endpoint exposed by Engram. All endpoints are
 | GET    | /knowledge/global/path                                        | find shortest path in the global graph                |
 | GET    | /knowledge/global/export                                      | export global graph (JSON or Graphviz DOT)            |
 | GET    | /knowledge/global/conflicts                                   | list conflicting facts across sessions                |
+| GET    | /sessions/{session_id}/summaries                              | list consolidated summaries for a session             |
+| POST   | /sessions/{session_id}/consolidate                            | manually trigger consolidation (leader only)          |
 | GET    | /health                                                       | health check                                          |
 | GET    | /metrics                                                      | Prometheus metrics                                    |
 | GET    | /api-docs/openapi.json                                        | OpenAPI specification                                 |
@@ -729,4 +731,80 @@ Returns all detected conflicts in the global graph. A conflict occurs when two d
 **example:**
 ```sh
 curl http://localhost:3000/knowledge/global/conflicts
+```
+
+---
+
+## consolidation endpoints
+
+These endpoints give access to the consolidated memory produced by the leader's summarization scheduler. When a session's short-term message count exceeds `CONSOLIDATION_THRESHOLD`, the leader summarizes the oldest messages, replicates the result as an `ApplySummary` command, and every node atomically stores the summary and trims the consumed raw messages.
+
+---
+
+## GET /sessions/{session_id}/summaries
+
+Returns all consolidated summaries for a session, ordered by Raft log index.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**success response:**
+- status: 200
+- body:
+```json
+{
+  "session_id": "abc123",
+  "summaries": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "text": "Alice discussed her role at OpenAI and her preference for Rust.",
+      "created_at_index": 72,
+      "consumed_message_ids": ["m1", "m2", "m3"],
+      "consumed_count": 3,
+      "model": "gpt-4o-mini",
+      "prompt_version": "summarize_v1"
+    }
+  ]
+}
+```
+
+**error responses:**
+- 500: failed to retrieve summaries
+
+**example:**
+```sh
+curl http://localhost:3000/sessions/{session_id}/summaries
+```
+
+---
+
+## POST /sessions/{session_id}/consolidate
+
+Manually triggers consolidation for a session. The leader summarizes all messages beyond `CONSOLIDATION_TARGET_WINDOW`, stores the result, and trims the consumed raw messages. Useful for debugging, verification, and reproducible cluster tests.
+
+In cluster mode, followers return 307 with a `Location` header pointing to the leader.
+
+**path parameters:**
+- `session_id` (string): session identifier
+
+**request body:** none
+
+**success response:**
+- status: 202 (accepted)
+- body:
+```json
+{
+  "summary_id": "11111111-1111-1111-1111-111111111111"
+}
+```
+
+**error responses:**
+- 307: redirect to leader (cluster mode, follower received the request)
+- 409: consolidation already in flight for this session
+- 422: session has fewer messages than the target window; nothing to consolidate
+- 500: summarization or replication failed
+
+**example:**
+```sh
+curl -X POST http://localhost:3000/sessions/{session_id}/consolidate
 ```

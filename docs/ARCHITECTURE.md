@@ -26,11 +26,13 @@ graph TD
     router --> knowledgehandler["knowledge handler"]
     router --> visibilityhandler["visibility handler"]
     router --> globalhandler["global knowledge handler"]
+    router --> consolidationhandler["consolidation handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
     sessionhandler -->|delete or register agent| raft
     visibilityhandler -->|write| raft
+    consolidationhandler -->|ApplySummary| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -.->|grpc install snapshot| laggers["lagging followers"]
     raft -->|state machine apply| shortterm["short-term memory (trait)"]
@@ -38,6 +40,7 @@ graph TD
     raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
     raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
     raft -->|state machine apply| visibility["session visibility map"]
+    raft -->|state machine apply| consolidated[("consolidated memory\nper-session summaries")]
     raft -->|embedding job| embedqueue["embedding worker pool (bounded channel)"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool (bounded channel)"]
     raft --> redb[("redb\npersistent raft log\n+ snapshot store")]
@@ -45,6 +48,7 @@ graph TD
 
     shortterm --> redis[("redis")]
     shortterm --> inmem["in-memory store (test fallback)"]
+    consolidated --> redis
 
     embedqueue -->|generate| embedprovider["embedding provider (trait)"]
     embedprovider -->|https| openai["openai embedding api"]
@@ -58,6 +62,10 @@ graph TD
     extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
     extraction -->|AddKnowledge via raft| knowledgegraph
     knowledgegraph -->|public sessions merge| globalgraph
+
+    consolidationscheduler["consolidation scheduler\nleader-only worker"] -->|threshold check| shortterm
+    consolidationscheduler -->|leader-only summarize| summarizer["summarizer (trait)\ngpt-4o-mini or mock"]
+    summarizer -->|ApplySummary via raft| consolidated
 
     knowledgehandler --> knowledgegraph
     globalhandler --> globalgraph
@@ -94,6 +102,10 @@ All major components are behind trait abstractions, which lets implementations b
 
 `KnowledgeExtractor` extracts named entities and typed relationships from text. The `OpenAIKnowledgeExtractor` calls GPT-4o-mini with a structured JSON prompt and exponential backoff on 429s. `MockKnowledgeExtractor` uses pattern matching against a fixed set of relationship phrases; this is the default in Docker Compose and CI to avoid OpenAI quota consumption.
 
+`Summarizer` produces a compact third-person summary from a slice of messages. `OpenAISummarizer` calls GPT-4o-mini with a consolidation-specific system prompt and the same exponential backoff pattern as the extractor. `MockSummarizer` is deterministic and offline, suitable for tests and cluster verification.
+
+`ConsolidatedMemoryStore` holds per-session `Vec<Summary>` objects. `InMemoryConsolidatedStore` is the test fallback; `RedisConsolidatedStore` is the production implementation. `add_summary` is idempotent by `summary.id`, so replaying an `ApplySummary` command never produces duplicate entries.
+
 ## Design decisions
 
 | decision | alternatives | final choice & rationale |
@@ -112,6 +124,12 @@ All major components are behind trait abstractions, which lets implementations b
 | Redis as a projection, not the source of truth | reconcile Redis with Raft log on recovery | flushing Redis unconditionally on startup and restoring from the snapshot avoids a maze of reconciliation edge cases; one authoritative source (Raft log plus latest snapshot) with all volatile state derived from it |
 | global graph as in-memory projection of public sessions | separate global persistent store | the global graph is always derivable from the full log; snapshotting it avoids replaying the entire history on startup while keeping the system simple |
 | session visibility defaults to Private | defaults to Shared | private by default prevents unintended cross-agent knowledge leakage; agents opt in explicitly |
+| leader-only summarization + replicated result | all nodes summarize | LLM output is non-deterministic; allowing every node to summarize would produce divergent summaries across the cluster; one call on the leader, replicated as `ApplySummary`, keeps all nodes identical |
+| `summary_id` is a leader-minted UUID | content hash | content hashes would collide when different prompts or models produce different text for the same messages; idempotency is "have I applied this UUID?" not "have I processed these inputs?" |
+| consolidation reduces session back to target window in one pass | fixed-size batches | one summary covering the full overshoot keeps lineage clean, minimizes Raft commands, and avoids repeated mini-consolidations that would each produce their own summary entry |
+| summaries ordered by Raft log index | wall-clock timestamp | log index is identical on every node and stable across replay; timestamps drift and skew between nodes |
+| trim is atomic inside `apply_cmd` | separate trim command | splitting into two commands would allow a node to have the summary but not the trim (double-counting) or the trim but not the summary (data loss); one command, one transition |
+| summaries are immutable once applied | allow regeneration | regenerating a summary with a newer prompt would change the replicated artifact; replay would reproduce a different result, breaking temporal integrity |
 
 ## Context assembly algorithm
 
@@ -209,15 +227,16 @@ flowchart TD
     follower["follower\nhttp :3000 / grpc :9001"]
     lagging["lagging follower\nhttp :3000 / grpc :9001"]
     leader["leader\nhttp :3000 / grpc :9001"]
-    r1["node 1 redis"]
-    r2["node 2 redis"]
-    r3["node 3 redis"]
+    r1["node 1 redis\nshort-term + core + consolidated"]
+    r2["node 2 redis\nshort-term + core + consolidated"]
+    r3["node 3 redis\nshort-term + core + consolidated"]
     l1["node 1 lancedb"]
     l2["node 2 lancedb"]
     l3["node 3 lancedb"]
     db1["node 1 redb\nraft log + snapshots"]
     db2["node 2 redb\nraft log + snapshots"]
     db3["node 3 redb\nraft log + snapshots"]
+    sched["consolidation scheduler\nleader-only"]
 
     client -->|"write to follower"| follower
     follower -->|"307 redirect"| client
@@ -225,13 +244,14 @@ flowchart TD
     leader -->|"append entries (grpc)"| r1
     leader -->|"append entries (grpc)"| r2
     leader -->|"install snapshot (grpc)"| lagging
-    lagging -->|"restore from snapshot"| r3
+    lagging -->|"restore from snapshot (v3)"| r3
     lagging --> db3
     r1 -.->|"embed async"| l1
     r2 -.->|"embed async"| l2
     r3 -.->|"embed async"| l3
     leader --> db1
     r2 -.-> db2
+    sched -->|"ApplySummary via raft"| leader
 ```
 
 The cluster also exposes management endpoints at `/cluster`, `/cluster/init`, `/cluster/add-learner`, and `/cluster/change-membership`.
@@ -252,9 +272,9 @@ OpenAI text embeddings are deterministic for the same input. All nodes converge 
 | `EngRaftNetworkConnection` | sends Vote, AppendEntries, and InstallSnapshot RPCs over gRPC; the snapshot payload is a serialized `EngramSnapshot` |
 | `RaftGrpcServer` | tonic service that forwards incoming Raft RPCs to the local `RaftHandle`; handles `InstallSnapshotRequest` so lagging followers can restore a leader snapshot over gRPC |
 
-`MemoryCommand` has six variants: `AddMessage`, `AddFact`, `DeleteSession`, `AddKnowledge`, `SetSessionVisibility`, and `RegisterSession`. `AddMessage` also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction.
+`MemoryCommand` has seven variants: `AddMessage`, `AddFact`, `DeleteSession`, `AddKnowledge`, `SetSessionVisibility`, `RegisterSession`, and `ApplySummary`. `AddMessage` also enqueues a `KnowledgeJob` so every committed message is a candidate for knowledge extraction. `ApplySummary` carries `session_id`, `summary_id` (leader-minted UUID), `summary_text`, `consumed_message_ids`, `model`, and `prompt_version`; it is idempotent by `summary_id`.
 
-`EngramSnapshot` is the versioned payload serialized into every snapshot. It contains `short_term`, `core_memory`, `knowledge_graph`, `global_graph`, `visibility`, and `session_agents`. The `version: 1` field and `#[serde(default)]` on optional fields mean older nodes can install newer snapshots by ignoring fields they don't recognize.
+`EngramSnapshot` is the versioned payload serialized into every snapshot. It contains `short_term`, `core_memory`, `knowledge_graph`, `global_graph`, `visibility`, `session_agents`, and `consolidated`. The current version is 3. The `#[serde(default)]` on all optional fields means older snapshots (v1 or v2) deserialize cleanly on newer nodes.
 
 `recover_state_machine()` in `src/raft/recovery.rs` runs at node startup before Raft is initialized. It flushes Redis, loads the latest persisted snapshot from redb, restores the payload into the live stores, and advances `last_applied` and `last_membership`. OpenRaft then replays any committed log entries that sit past the snapshot index.
 
@@ -371,10 +391,66 @@ Three Prometheus gauges track the state of the global graph. They are updated ea
 
 The `EngramSnapshot` payload now includes `global_graph`, `visibility`, and `session_agents` fields alongside the existing `short_term`, `core_memory`, and `knowledge_graph` fields. The `#[serde(default)]` attribute on all new fields means Stage 3A snapshots deserialize cleanly on Stage 3B nodes.
 
+## Stage 4: Memory Evolution
+
+Stage 4 makes memory active. When a session's short-term message count crosses `CONSOLIDATION_THRESHOLD` (default 50), the leader automatically summarizes the oldest messages and trims them, driving the session back to exactly `CONSOLIDATION_TARGET_WINDOW` (default 20) raw messages. The summary is an immutable artifact; the raw messages it consumed are gone. This is the first stage where Engram intentionally destroys source material.
+
+### Why leader-only + replicated result
+
+Summarization is non-deterministic. Two calls to GPT-4o-mini on the same transcript produce different text. Allowing every node to summarize independently would produce a different `ApplySummary` command on each node and diverge the cluster. The solution is identical to Stage 2's knowledge extraction: only the current leader calls the `Summarizer`. The leader mints a UUID `summary_id`, submits `MemoryCommand::ApplySummary`, and OpenRaft replicates the artifact to all nodes. Followers apply the identical text. Replay is deterministic because the leader's output is captured once into the log.
+
+### The consolidation scheduler
+
+A leader-only worker loop (mirroring `knowledge/worker.rs`) polls sessions, checks whether any exceed the threshold, and enqueues consolidation jobs. A leader-local `HashSet<session_id>` prevents launching a second job for a session that already has one in flight. The guard is not replicated; it only prevents duplicate work, not divergent state. When a leadership transfer happens, the new leader's scheduler starts fresh with an empty guard.
+
+### The `ApplySummary` state transition
+
+`apply_cmd` for `ApplySummary` performs three things atomically under the `SmInner` lock:
+
+1. `consolidated.add_summary(session_id, summary)` (idempotent by `summary_id`; replaying the command is a no-op)
+2. `short_term.remove_messages(session_id, consumed_message_ids)` (trims exactly the messages the summary replaced)
+3. Metrics update (increments consolidation counters, resets the summary gauge)
+
+There is no side channel between these steps. A node either has the summary and the trim or it has neither.
+
+### Summary ordering
+
+Summaries are ordered by `created_at_index` (the Raft log index of the committing entry). This index is identical on every node and stable across replay, so ordering is immune to clock skew. Anything displaying or sorting summaries must use this field.
+
+### Known limitation: vector cleanup is deferred
+
+Trimming raw messages from short-term memory does not immediately delete their vectors from LanceDB. Vectors are per-node, derived, and eventually consistent by Stage 1 design. A stale vector for a trimmed message may affect search quality but not correctness. A `EmbeddingJob::DeleteMessages` variant is the clean follow-up.
+
+### Consolidation REST endpoints
+
+| method | path | description |
+|--------|------|-------------|
+| GET | `/sessions/{id}/summaries` | list all consolidated summaries for the session, ordered by log index |
+| POST | `/sessions/{id}/consolidate` | manually trigger consolidation; leader summarizes on demand; followers 307-redirect |
+
+### Consolidation metrics
+
+| metric | type | description |
+|--------|------|-------------|
+| `engram_consolidations_total` | counter | number of consolidation operations completed |
+| `engram_messages_consolidated_total` | counter | cumulative raw messages trimmed by consolidation |
+| `engram_summaries` | gauge | current number of stored summaries |
+| `engram_consolidation_queue_size` | gauge | pending jobs in the consolidation channel |
+| `engram_summarization_duration_seconds` | histogram | wall-clock time per summarization call (label: `model`) |
+
+### Snapshot protocol v3
+
+`EngramSnapshot` gains a `consolidated: Vec<(String, Vec<Summary>)>` field with `#[serde(default)]`. v2 snapshots (without the field) deserialize with an empty consolidated map.
+
 ## Deferred items
 
-The following remain out of scope after Stage 3B:
+The following remain out of scope after Stage 4:
 
 - **LanceDB replication.** Each node still calls the embedding API independently. Routing vector storage through Raft (leader-only embedding, follower payload replication) is a future item.
 - **KG-augmented context assembly.** The knowledge graph (per-session and global) is queryable via REST but is not yet integrated into the context assembly pipeline to augment semantic search results.
+- **Summary-aware retrieval.** `GET /sessions/{id}/context` still reads from raw short-term messages only. Wiring consolidated summaries into context assembly is a later stage.
+- **Summary-of-summary hierarchies.** A session accumulates a flat list of summaries. Recursive compaction (summarizing summaries) is deferred; `consumed_message_ids` lineage is already captured so that stage is additive.
+- **Knowledge-graph consolidation.** Entity merge, node pruning, and relationship collapse in the global or per-session graph are a separate capability.
+- **Forgetting and decay.** Importance scoring and eviction policies are deferred.
+- **Per-message vector deletion.** Trimmed messages' vectors remain in LanceDB until their session is deleted.
 - **Multi-tenant auth.** Cluster-aware authentication routing.
