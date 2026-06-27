@@ -86,10 +86,6 @@ impl EngStateMachineStore {
         }
     }
 
-    pub(crate) fn inner_handle(&self) -> Arc<Mutex<SmInner>> {
-        self.inner.clone()
-    }
-
     /// Returns `(meta, payload_bytes)` of the persisted snapshot, if any.
     /// Called at startup before the Raft node starts (uncontended).
     pub(crate) fn load_snapshot_for_recovery(
@@ -984,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_summaries() {
-        let (mut sm, _st, _embed, _know, _kg, _cm, _gg, cons, _dir) = make_sm();
+        let (mut sm, _st, _embed, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::ApplySummary {
             session_id: "s1".into(), summary_id: "u1".into(), summary_text: "kept".into(),
             consumed_message_ids: vec![], model: "mock".into(), prompt_version: "summarize_v1".into(),

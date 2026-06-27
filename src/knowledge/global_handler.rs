@@ -73,7 +73,7 @@ pub async fn get_global(
 }
 
 #[derive(Serialize)]
-pub(crate) struct RelatedResponse {
+pub struct RelatedResponse {
     entity_name: String,
     related: Vec<RelatedEntity>,
 }
@@ -90,7 +90,7 @@ pub async fn get_global_entity(
 }
 
 #[derive(Serialize)]
-pub(crate) struct SourcesResponse {
+pub struct SourcesResponse {
     entity_name: String,
     sources: Vec<String>,
 }
@@ -113,7 +113,7 @@ pub struct PathQuery {
 }
 
 #[derive(Serialize)]
-pub(crate) struct PathResponse {
+pub struct PathResponse {
     from: String,
     to: String,
     path: Option<Vec<PathEdge>>,
@@ -129,7 +129,7 @@ pub async fn get_global_path(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct ExportQuery {
+pub struct ExportQuery {
     #[serde(default = "default_format")]
     format: String,
 }
@@ -159,7 +159,7 @@ pub async fn get_global_export(
 }
 
 #[derive(Serialize)]
-pub(crate) struct ConflictsResponse {
+pub struct ConflictsResponse {
     conflicts: Vec<Conflict>,
 }
 
