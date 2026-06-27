@@ -9,6 +9,7 @@ use openraft::{
 };
 use redb::{Database, TableDefinition};
 
+use crate::consolidation::store::{ConsolidatedMemoryStore, Summary};
 use crate::core::{CoreMemoryStore, ShortTermMemory};
 use crate::knowledge::global::{GlobalGraph, Visibility};
 use crate::knowledge::graph::KnowledgeGraph;
@@ -37,6 +38,7 @@ struct SmInner {
     knowledge_graph: Arc<RwLock<KnowledgeGraph>>,
     knowledge_tx: mpsc::Sender<KnowledgeJob>,
     global_graph: Arc<RwLock<GlobalGraph>>,
+    consolidated: Arc<dyn ConsolidatedMemoryStore>,
     visibility: Arc<RwLock<HashMap<String, Visibility>>>,
     session_agents: Arc<RwLock<HashMap<String, String>>>,
     metrics: Arc<AppMetrics>,
@@ -56,6 +58,7 @@ impl EngStateMachineStore {
         knowledge_tx: mpsc::Sender<KnowledgeJob>,
         db: Arc<Database>,
         global_graph: Arc<RwLock<GlobalGraph>>,
+        consolidated: Arc<dyn ConsolidatedMemoryStore>,
         metrics: Arc<AppMetrics>,
     ) -> Self {
         {
@@ -73,6 +76,7 @@ impl EngStateMachineStore {
                 knowledge_graph,
                 knowledge_tx,
                 global_graph,
+                consolidated,
                 visibility: Arc::new(RwLock::new(HashMap::new())),
                 session_agents: Arc::new(RwLock::new(HashMap::new())),
                 metrics,
@@ -80,10 +84,6 @@ impl EngStateMachineStore {
                 snapshot_idx: 0,
             })),
         }
-    }
-
-    pub(crate) fn inner_handle(&self) -> Arc<Mutex<SmInner>> {
-        self.inner.clone()
     }
 
     /// Returns `(meta, payload_bytes)` of the persisted snapshot, if any.
@@ -163,6 +163,11 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let consolidated = inner
+        .consolidated
+        .dump_all()
+        .await
+        .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
     let payload = EngramSnapshot {
         version: crate::raft::snapshot::SNAPSHOT_VERSION,
@@ -172,6 +177,7 @@ async fn build_payload(inner: &SmInner) -> Result<(EngramSnapshot, SnapshotMeta<
         global_graph,
         visibility,
         session_agents,
+        consolidated,
     };
     let snapshot_id = format!(
         "{}-{}",
@@ -246,7 +252,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
         I::IntoIter: Send,
     {
         // Clone Arcs once so the lock is not held across async apply_cmd calls.
-        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, visibility, session_agents, metrics) = {
+        let (short_term, core_memory, embedding_tx, knowledge_graph, knowledge_tx, global_graph, consolidated, visibility, session_agents, metrics) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -255,6 +261,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.knowledge_graph.clone(),
                 inner.knowledge_tx.clone(),
                 inner.global_graph.clone(),
+                inner.consolidated.clone(),
                 inner.visibility.clone(),
                 inner.session_agents.clone(),
                 inner.metrics.clone(),
@@ -272,7 +279,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 last_membership = Some(StoredMembership::new(Some(entry.log_id.clone()), mem.clone()));
             }
             if let EntryPayload::Normal(cmd) = entry.payload {
-                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &visibility, &session_agents, &metrics, index).await;
+                apply_cmd(cmd, &short_term, &core_memory, &embedding_tx, &knowledge_graph, &knowledge_tx, &global_graph, &consolidated, &visibility, &session_agents, &metrics, index).await;
             }
             responses.push(CommandResponse::default());
         }
@@ -310,7 +317,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
             .map_err(|e| sm_io_err(ErrorVerb::Read, e.to_string()))?;
 
         // Clone store/graph handles under a short lock so we don't hold it across awaits.
-        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, db) = {
+        let (short_term, core_memory, knowledge_graph, global_graph, visibility, session_agents, consolidated, db) = {
             let inner = self.inner.lock().await;
             (
                 inner.short_term.clone(),
@@ -319,6 +326,7 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 inner.global_graph.clone(),
                 inner.visibility.clone(),
                 inner.session_agents.clone(),
+                inner.consolidated.clone(),
                 inner.db.clone(),
             )
         };
@@ -346,6 +354,10 @@ impl RaftStateMachine<TypeConfig> for EngStateMachineStore {
                 agents.insert(session_id, agent_id);
             }
         }
+        consolidated
+            .restore_all(payload.consolidated)
+            .await
+            .map_err(|e| sm_io_err(ErrorVerb::Write, e.to_string()))?;
 
         persist_snapshot(&db, meta, snapshot.get_ref())?;
 
@@ -379,6 +391,7 @@ async fn apply_cmd(
     knowledge_graph: &Arc<RwLock<KnowledgeGraph>>,
     knowledge_tx: &mpsc::Sender<KnowledgeJob>,
     global_graph: &Arc<RwLock<GlobalGraph>>,
+    consolidated: &Arc<dyn ConsolidatedMemoryStore>,
     visibility: &Arc<RwLock<HashMap<String, Visibility>>>,
     session_agents: &Arc<RwLock<HashMap<String, String>>>,
     metrics: &Arc<AppMetrics>,
@@ -419,6 +432,9 @@ async fn apply_cmd(
             }
             if let Err(e) = core_memory.delete_session(&session_id).await {
                 tracing::error!(error = %e, session_id = %session_id, "failed to delete session from core memory");
+            }
+            if let Err(e) = consolidated.delete_session(&session_id).await {
+                tracing::error!(error = %e, session_id = %session_id, "failed to delete session from consolidated store");
             }
             // Signal embedding worker to delete from local LanceDB.
             let _ = embedding_tx.try_send(EmbeddingJob::DeleteSession { session_id: session_id.clone() });
@@ -471,6 +487,41 @@ async fn apply_cmd(
                 session_agents.write().await.insert(session_id, agent);
             }
         }
+        MemoryCommand::ApplySummary {
+            session_id,
+            summary_id,
+            summary_text,
+            consumed_message_ids,
+            model,
+            prompt_version,
+        } => {
+            // One atomic replicated transition: store summary, trim raw messages, update metrics.
+            // The store no-ops a duplicate id, so replaying this entry on a lagging follower
+            // is safe — already-removed ids are gone and the store just skips the duplicate.
+            let summary = Summary {
+                id: summary_id,
+                text: summary_text,
+                created_at_index: index,
+                consumed_count: consumed_message_ids.len() as u64,
+                consumed_message_ids: consumed_message_ids.clone(),
+                model,
+                prompt_version,
+            };
+            if let Err(e) = consolidated.add_summary(&session_id, summary).await {
+                tracing::error!(error = %e, session_id = %session_id, "failed to store summary");
+            }
+            if let Err(e) = short_term.remove_messages(&session_id, &consumed_message_ids).await {
+                tracing::error!(error = %e, session_id = %session_id, "failed to trim consolidated messages");
+            }
+            // ponytail: per-message vector delete deferred; stale vectors are a search-quality
+            // nit, not a correctness bug. Add EmbeddingJob::DeleteMessages when it matters.
+            tracing::debug!(session_id = %session_id, count = consumed_message_ids.len(), "vector cleanup deferred until session delete");
+            metrics.increment_consolidations();
+            metrics.increment_messages_consolidated(consumed_message_ids.len() as u64);
+            if let Ok(all) = consolidated.get_summaries(&session_id).await {
+                metrics.set_summaries(all.len());
+            }
+        }
         MemoryCommand::NoOp => {}
     }
 }
@@ -478,6 +529,7 @@ async fn apply_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consolidation::store::{ConsolidatedMemoryStore, InMemoryConsolidatedStore};
     use crate::core::{InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore};
     use crate::knowledge::global::{GlobalGraph, Visibility};
     use crate::knowledge::graph::KnowledgeGraph;
@@ -495,6 +547,7 @@ mod tests {
         Arc<RwLock<KnowledgeGraph>>,
         Arc<InMemoryCoreMemoryStore>,
         Arc<RwLock<GlobalGraph>>,
+        Arc<InMemoryConsolidatedStore>,
         tempfile::TempDir,
     ) {
         let short_term = Arc::new(InMemoryStore::default());
@@ -504,6 +557,7 @@ mod tests {
         let (know_tx, know_rx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
         let gg = Arc::new(RwLock::new(GlobalGraph::new()));
+        let consolidated = Arc::new(InMemoryConsolidatedStore::default());
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("sm.redb")).unwrap());
         let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
@@ -516,9 +570,10 @@ mod tests {
             know_tx,
             db,
             gg.clone(),
+            consolidated.clone() as Arc<dyn ConsolidatedMemoryStore>,
             metrics,
         );
-        (sm, short_term, embed_rx, know_rx, kg, core_memory, gg, dir)
+        (sm, short_term, embed_rx, know_rx, kg, core_memory, gg, consolidated, dir)
     }
 
     fn make_entry(index: u64, cmd: MemoryCommand) -> openraft::Entry<TypeConfig> {
@@ -530,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_writes_to_short_term() {
-        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -552,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_embedding_job() {
-        let (mut sm, _st, mut embed_rx, _know, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, mut embed_rx, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(
             0,
             MemoryCommand::AddMessage {
@@ -573,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_redis_and_enqueues_lancedb_delete() {
-        let (mut sm, short_term, mut embed_rx, _know, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, short_term, mut embed_rx, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![
             make_entry(
                 0,
@@ -600,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn noop_command_is_ignored() {
-        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::NoOp)]).await.unwrap();
         let msgs = short_term.get_recent("any", 10).await.unwrap();
         assert_eq!(msgs.len(), 0);
@@ -608,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_enqueues_knowledge_job() {
-        let (mut sm, _st, _embed, mut know_rx, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _embed, mut know_rx, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddMessage {
             session_id: "s1".into(),
             message: MessagePayload {
@@ -625,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_knowledge_updates_graph() {
-        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(),
             message_id: "m1".into(),
@@ -646,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_clears_knowledge_graph() {
-        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _embed, _know, kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -660,14 +715,14 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_sets_last_applied_to_meta_log_id() {
-        let (mut src, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut src, _st, _e, _k, _kg, _cm, _gg, _cons, _dir) = make_sm();
         src.apply(vec![make_entry(7, MemoryCommand::AddFact {
             session_id: "s1".into(), fact: "f".into(),
         })]).await.unwrap();
         let mut builder = src.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
 
-        let (mut dst, dst_st, _e2, _k2, dst_kg, _cm2, _gg2, _dir2) = make_sm();
+        let (mut dst, dst_st, _e2, _k2, dst_kg, _cm2, _gg2, _cons2, _dir2) = make_sm();
         let mut buf = dst.begin_receiving_snapshot().await.unwrap();
         *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
         dst.install_snapshot(&snap.meta, buf).await.unwrap();
@@ -680,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_build_install_reproduces_state() {
-        let (mut src, _st, _e, _k, _kg, src_cm, _gg, _dir) = make_sm();
+        let (mut src, _st, _e, _k, _kg, src_cm, _gg, _cons, _dir) = make_sm();
         src.apply(vec![
             make_entry(0, MemoryCommand::AddKnowledge {
                 session_id: "s1".into(), message_id: "m1".into(),
@@ -697,7 +752,7 @@ mod tests {
         let mut builder = src.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
 
-        let (mut dst, _st2, _e2, _k2, dst_kg, dst_cm, _gg2, _dir2) = make_sm();
+        let (mut dst, _st2, _e2, _k2, dst_kg, dst_cm, _gg2, _cons2, _dir2) = make_sm();
         let mut buf = dst.begin_receiving_snapshot().await.unwrap();
         *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
         dst.install_snapshot(&snap.meta, buf).await.unwrap();
@@ -709,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_snapshot_meta_index_equals_last_applied() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _cons, _dir) = make_sm();
         for i in 0..=4u64 {
             sm.apply(vec![make_entry(i, MemoryCommand::AddFact {
                 session_id: "s1".into(), fact: format!("f{i}"),
@@ -722,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_then_get_current_snapshot_returns_same_index() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddFact {
             session_id: "s1".into(), fact: "f".into(),
         })]).await.unwrap();
@@ -734,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_payload_contains_applied_state() {
-        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, _gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -747,14 +802,14 @@ mod tests {
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
         let payload = crate::raft::snapshot::EngramSnapshot::from_bytes(snap.snapshot.get_ref()).unwrap();
-        assert_eq!(payload.version, 2);
+        assert_eq!(payload.version, 3);
         assert!(payload.knowledge_graph.sessions.iter().any(|s| s.session_id == "s1"));
         assert!(payload.core_memory.iter().any(|s| s.facts.contains(&"likes coffee".to_string())));
     }
 
     #[tokio::test]
     async fn shared_session_knowledge_reaches_global_graph() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::SetSessionVisibility {
             session_id: "s1".into(), visibility: Visibility::Shared,
         })]).await.unwrap();
@@ -768,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_session_knowledge_stays_out_of_global_graph() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Secret".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -779,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn becoming_shared_backmerges_existing_session_knowledge() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![Entity { name: "Alice".into(), entity_type: "Person".into(), attributes: HashMap::new() }],
@@ -793,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_prunes_global_contributions() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         for (idx, sid) in [(0u64, "s1"), (1, "s2")] {
             sm.apply(vec![make_entry(idx, MemoryCommand::SetSessionVisibility {
                 session_id: sid.into(), visibility: Visibility::Shared,
@@ -817,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn registered_agent_id_flows_into_global_provenance() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::RegisterSession {
             session_id: "s1".into(), agent_id: Some("agent-7".into()),
         })]).await.unwrap();
@@ -834,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn visibility_transitions_are_fully_reversible() {
-        let (mut sm, _st, _e, _k, _kg, _cm, gg, _dir) = make_sm();
+        let (mut sm, _st, _e, _k, _kg, _cm, gg, _cons, _dir) = make_sm();
         sm.apply(vec![make_entry(0, MemoryCommand::AddKnowledge {
             session_id: "s1".into(), message_id: "m1".into(),
             entities: vec![
@@ -857,5 +912,90 @@ mod tests {
 
         sm.apply(vec![vis(4, Visibility::Private)]).await.unwrap();
         assert!(gg.read().await.all_entities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_summary_stores_summary_and_trims_messages() {
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, cons, _dir) = make_sm();
+        for (i, id) in [(0u64, "m1"), (1, "m2"), (2, "m3")] {
+            sm.apply(vec![make_entry(i, MemoryCommand::AddMessage {
+                session_id: "s1".into(),
+                message: MessagePayload { id: id.into(), role: "user".into(), content: format!("msg {id}"), timestamp: chrono::Utc::now() },
+            })]).await.unwrap();
+        }
+        sm.apply(vec![make_entry(3, MemoryCommand::ApplySummary {
+            session_id: "s1".into(),
+            summary_id: "u1".into(),
+            summary_text: "summary text".into(),
+            consumed_message_ids: vec!["m1".into(), "m2".into()],
+            model: "mock".into(),
+            prompt_version: "summarize_v1".into(),
+        })]).await.unwrap();
+
+        let summaries = cons.get_summaries("s1").await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "u1");
+        assert_eq!(summaries[0].created_at_index, 3, "ordering index is the log index");
+        assert_eq!(summaries[0].consumed_message_ids, vec!["m1".to_string(), "m2".to_string()]);
+
+        let remaining = short_term.get_recent("s1", 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].content, "msg m3");
+    }
+
+    #[tokio::test]
+    async fn apply_summary_is_idempotent_by_id() {
+        let (mut sm, short_term, _embed, _know, _kg, _cm, _gg, cons, _dir) = make_sm();
+        for (i, id) in [(0u64, "m1"), (1, "m2")] {
+            sm.apply(vec![make_entry(i, MemoryCommand::AddMessage {
+                session_id: "s1".into(),
+                message: MessagePayload { id: id.into(), role: "user".into(), content: id.into(), timestamp: chrono::Utc::now() },
+            })]).await.unwrap();
+        }
+        let cmd = MemoryCommand::ApplySummary {
+            session_id: "s1".into(), summary_id: "dup".into(), summary_text: "t".into(),
+            consumed_message_ids: vec!["m1".into()], model: "mock".into(), prompt_version: "summarize_v1".into(),
+        };
+        sm.apply(vec![make_entry(2, cmd.clone())]).await.unwrap();
+        sm.apply(vec![make_entry(3, cmd)]).await.unwrap();
+
+        assert_eq!(cons.get_summaries("s1").await.unwrap().len(), 1, "no duplicate summary");
+        // m1 already trimmed; second apply must not trim m2
+        let remaining = short_term.get_recent("s1", 10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].content, "m2");
+    }
+
+    #[tokio::test]
+    async fn delete_session_clears_consolidated() {
+        let (mut sm, _st, _embed, _know, _kg, _cm, _gg, cons, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::ApplySummary {
+            session_id: "s1".into(), summary_id: "u1".into(), summary_text: "t".into(),
+            consumed_message_ids: vec![], model: "mock".into(), prompt_version: "summarize_v1".into(),
+        })]).await.unwrap();
+        assert_eq!(cons.get_summaries("s1").await.unwrap().len(), 1);
+        sm.apply(vec![make_entry(1, MemoryCommand::DeleteSession { session_id: "s1".into() })]).await.unwrap();
+        assert!(cons.get_summaries("s1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_preserves_summaries() {
+        let (mut sm, _st, _embed, _know, _kg, _cm, _gg, _cons, _dir) = make_sm();
+        sm.apply(vec![make_entry(0, MemoryCommand::ApplySummary {
+            session_id: "s1".into(), summary_id: "u1".into(), summary_text: "kept".into(),
+            consumed_message_ids: vec![], model: "mock".into(), prompt_version: "summarize_v1".into(),
+        })]).await.unwrap();
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let (mut sm2, _st2, _e2, _k2, _kg2, _cm2, _gg2, cons2, _dir2) = make_sm();
+        let mut buf = sm2.begin_receiving_snapshot().await.unwrap();
+        *buf = std::io::Cursor::new(snap.snapshot.get_ref().clone());
+        sm2.install_snapshot(&snap.meta, buf).await.unwrap();
+
+        let restored = cons2.get_summaries("s1").await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text, "kept");
     }
 }

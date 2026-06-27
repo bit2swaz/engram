@@ -51,6 +51,19 @@ pub enum MemoryCommand {
     },
     /// Record an agent owner for a session (provenance for the global graph).
     RegisterSession { session_id: String, agent_id: Option<String> },
+    /// Apply a leader-produced summary: store it, trim the consumed raw messages.
+    /// One atomic replicated transition. Idempotent by `summary_id`. Only the leader
+    /// calls the LLM; followers apply this replicated artifact. `model` and
+    /// `prompt_version` are carried on the command (not read from node-local config)
+    /// so the stored summary is byte-identical on every node.
+    ApplySummary {
+        session_id: String,
+        summary_id: String,
+        summary_text: String,
+        consumed_message_ids: Vec<String>,
+        model: String,
+        prompt_version: String,
+    },
     /// No-op placeholder. Applied by the state machine without side effects.
     /// Reserved for future cluster operations (e.g., leadership probes).
     NoOp,
@@ -145,5 +158,28 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: MemoryCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, MemoryCommand::SetSessionVisibility { visibility: Visibility::Shared, .. }));
+    }
+
+    #[test]
+    fn apply_summary_command_round_trips() {
+        let cmd = MemoryCommand::ApplySummary {
+            session_id: "s1".into(),
+            summary_id: "11111111-1111-1111-1111-111111111111".into(),
+            summary_text: "Alice works at OpenAI.".into(),
+            consumed_message_ids: vec!["m1".into(), "m2".into()],
+            model: "gpt-4o-mini".into(),
+            prompt_version: "summarize_v1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: MemoryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            MemoryCommand::ApplySummary { session_id, summary_id, consumed_message_ids, model, .. } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(summary_id, "11111111-1111-1111-1111-111111111111");
+                assert_eq!(consumed_message_ids.len(), 2);
+                assert_eq!(model, "gpt-4o-mini");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

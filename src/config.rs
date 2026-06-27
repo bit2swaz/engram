@@ -21,6 +21,12 @@ pub enum KnowledgeExtractorType {
     Mock,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarizerType {
+    Mock,
+    OpenAI,
+}
+
 const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
 const DEFAULT_LANCE_DB_PATH: &str = "./data/lancedb";
 const DEFAULT_EMBEDDING_DIMENSION: usize = 1536;
@@ -29,6 +35,8 @@ const DEFAULT_MPSC_CHANNEL_SIZE: usize = 1_000;
 const DEFAULT_SHORT_TERM_COUNT: usize = 20;
 const DEFAULT_RAFT_DB_PATH: &str = "./data/raft/engram.redb";
 const DEFAULT_SNAPSHOT_LOG_THRESHOLD: u64 = 1000;
+const DEFAULT_CONSOLIDATION_THRESHOLD: usize = 50;
+const DEFAULT_CONSOLIDATION_TARGET_WINDOW: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -65,6 +73,14 @@ pub struct Config {
     /// Build a snapshot every N committed log entries (openraft SnapshotPolicy::LogsSinceLast).
     /// Set via SNAPSHOT_LOG_THRESHOLD.
     pub snapshot_log_threshold: u64,
+    /// Which summarizer the consolidation scheduler calls. Mock is offline/deterministic.
+    pub summarizer: SummarizerType,
+    /// A session crossing this many short-term messages becomes a consolidation candidate.
+    pub consolidation_threshold: usize,
+    /// Consolidation drives a session back down to exactly this many raw messages.
+    pub consolidation_target_window: usize,
+    pub consolidation_max_workers: usize,
+    pub consolidation_channel_size: usize,
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +114,11 @@ impl Default for Config {
             knowledge_extractor: KnowledgeExtractorType::OpenAI,
             raft_db_path: std::path::PathBuf::from(DEFAULT_RAFT_DB_PATH),
             snapshot_log_threshold: DEFAULT_SNAPSHOT_LOG_THRESHOLD,
+            summarizer: SummarizerType::OpenAI,
+            consolidation_threshold: DEFAULT_CONSOLIDATION_THRESHOLD,
+            consolidation_target_window: DEFAULT_CONSOLIDATION_TARGET_WINDOW,
+            consolidation_max_workers: 2,
+            consolidation_channel_size: 100,
         }
     }
 }
@@ -155,6 +176,20 @@ impl Config {
                 "SNAPSHOT_LOG_THRESHOLD",
                 DEFAULT_SNAPSHOT_LOG_THRESHOLD,
             )?,
+            summarizer: match env::var("SUMMARIZER").as_deref() {
+                Ok("mock") => SummarizerType::Mock,
+                _ => SummarizerType::OpenAI,
+            },
+            consolidation_threshold: positive_usize_env(
+                "CONSOLIDATION_THRESHOLD",
+                DEFAULT_CONSOLIDATION_THRESHOLD,
+            )?,
+            consolidation_target_window: positive_usize_env(
+                "CONSOLIDATION_TARGET_WINDOW",
+                DEFAULT_CONSOLIDATION_TARGET_WINDOW,
+            )?,
+            consolidation_max_workers: positive_usize_env("CONSOLIDATION_MAX_WORKERS", 2)?,
+            consolidation_channel_size: positive_usize_env("CONSOLIDATION_CHANNEL_SIZE", 100)?,
         })
     }
 
@@ -266,7 +301,7 @@ mod tests {
     use std::env;
     use std::sync::{Mutex, OnceLock};
 
-    use super::{Config, ConfigError, KnowledgeExtractorType};
+    use super::{Config, ConfigError, KnowledgeExtractorType, SummarizerType};
 
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -437,6 +472,30 @@ mod tests {
         assert!(result.is_ok(), "mock mode should not require OPENAI_API_KEY");
         restore_env("OPENAI_API_KEY", old_key);
         restore_env("KNOWLEDGE_EXTRACTOR", old_extractor);
+    }
+
+    #[test]
+    fn consolidation_defaults_and_overrides() {
+        // Defaults when unset.
+        let cfg = Config::default();
+        assert_eq!(cfg.consolidation_threshold, 50);
+        assert_eq!(cfg.consolidation_target_window, 20);
+        assert!(matches!(cfg.summarizer, SummarizerType::OpenAI));
+    }
+
+    #[test]
+    fn summarizer_mock_parsed_from_env() {
+        let _guard = env_lock().lock().unwrap();
+        let old_key = env::var("OPENAI_API_KEY").ok();
+        let old_summarizer = env::var("SUMMARIZER").ok();
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "test-key");
+            env::set_var("SUMMARIZER", "mock");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.summarizer, SummarizerType::Mock);
+        restore_env("OPENAI_API_KEY", old_key);
+        restore_env("SUMMARIZER", old_summarizer);
     }
 
     fn restore_env(name: &str, value: Option<String>) {

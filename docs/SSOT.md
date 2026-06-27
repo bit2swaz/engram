@@ -139,6 +139,19 @@ The project serves two purposes:
 - `EngramSnapshot` protocol v2: adds `global_graph`, `visibility`, and `session_agents` fields with `#[serde(default)]` for backward compatibility with Stage 3A snapshots
 - 194 tests passing; all 17 cluster-verify acceptance criteria pass
 
+### Stage 4: Memory Evolution ✅ **(Completed)**
+- Leader-only consolidation scheduler: worker loop detects sessions over `CONSOLIDATION_THRESHOLD` (default 50), calls the `Summarizer`, and submits `MemoryCommand::ApplySummary` through Raft
+- `Summarizer` trait with `OpenAISummarizer` (GPT-4o-mini, exponential backoff on 429) and `MockSummarizer` (deterministic, offline)
+- `ConsolidatedMemoryStore` trait with `InMemoryConsolidatedStore` and `RedisConsolidatedStore`; `add_summary` is idempotent by `summary_id`
+- `Summary` struct: `id` (leader-minted UUID), `text`, `created_at_index` (Raft log index for deterministic ordering), `consumed_message_ids` (lineage), `consumed_count`, `model`, `prompt_version`
+- `MemoryCommand::ApplySummary`: one atomic replicated transition (store summary, trim consumed raw messages from short-term, update metrics); idempotent by `summary_id`
+- `ShortTermMemory::remove_messages`: new trait method for targeted message removal by id
+- `EngramSnapshot` protocol v3: adds `consolidated: Vec<(String, Vec<Summary>)>` with `#[serde(default)]`; v2 snapshots load with empty consolidated map
+- 5 new Prometheus metrics: `engram_consolidations_total`, `engram_messages_consolidated_total`, `engram_summaries`, `engram_consolidation_queue_size`, `engram_summarization_duration_seconds`
+- 2 new REST endpoints: `GET /sessions/{id}/summaries`, `POST /sessions/{id}/consolidate` (leader redirects followers 307)
+- `SUMMARIZER`, `CONSOLIDATION_THRESHOLD`, `CONSOLIDATION_TARGET_WINDOW`, `CONSOLIDATION_MAX_WORKERS`, `CONSOLIDATION_CHANNEL_SIZE` configuration env vars
+- 222 tests passing; cluster-verify checks [18] through [22] added
+
 ---
 
 ## 3. System Architecture (High-Level)
@@ -157,22 +170,26 @@ graph TD
     router --> knowledgehandler["knowledge handler"]
     router --> visibilityhandler["visibility handler"]
     router --> globalhandler["global knowledge handler"]
+    router --> consolidationhandler["consolidation handler"]
 
     memoryhandler -->|write| raft["raft consensus\nopenraft 0.9\ncluster mode only"]
     corememhandler -->|write| raft
     sessionhandler -->|delete or register agent| raft
     visibilityhandler -->|write| raft
+    consolidationhandler -->|ApplySummary| raft
     raft -.->|grpc append entries| peers["peer nodes (port 9001)"]
     raft -->|state machine apply| shortterm["short-term memory trait"]
     raft -->|state machine apply| coremem["core memory store trait"]
     raft -->|state machine apply| knowledgegraph[("knowledge graph\nper-session in-memory")]
     raft -->|state machine apply| globalgraph[("global knowledge graph\ncross-session")]
     raft -->|state machine apply| visibility["session visibility map"]
+    raft -->|state machine apply| consolidated[("consolidated memory\nper-session summaries")]
     raft -->|embedding job| embedqueue["embedding worker pool\nbounded channel"]
     raft -->|knowledge job| knowledgequeue["knowledge worker pool\nbounded channel"]
 
     shortterm --> redis[("redis")]
     shortterm --> inmem["in-memory store\ntest fallback"]
+    consolidated --> redis
 
     embedqueue -->|generate| embedprovider["embedding provider trait"]
     embedprovider -->|https| openai["openai embeddings"]
@@ -185,6 +202,10 @@ graph TD
     extractor -->|gpt-4o-mini or mock| extraction["entities + relationships"]
     extraction -->|AddKnowledge via raft| knowledgegraph
     knowledgegraph -->|public sessions merge| globalgraph
+
+    consolidationscheduler["consolidation scheduler\nleader-only worker"] -->|threshold check| shortterm
+    consolidationscheduler -->|leader-only summarize| summarizer["summarizer trait\ngpt-4o-mini or mock"]
+    summarizer -->|ApplySummary via raft| consolidated
 
     knowledgehandler --> knowledgegraph
     globalhandler --> globalgraph
@@ -310,7 +331,20 @@ pub enum EmbeddingStatus {
 ```
 
 
-### 6.2 API Request/Response Shapes (Verified)
+### 6.2 Summary (Stage 4)
+```rust
+pub struct Summary {
+    pub id: String,                        // leader-minted UUID; idempotency key for ApplySummary
+    pub text: String,                      // the LLM-produced summary text; immutable
+    pub created_at_index: u64,             // Raft log index; deterministic ordering across nodes
+    pub consumed_message_ids: Vec<String>, // lineage: messages that were summarized and trimmed
+    pub consumed_count: u64,               // len of consumed_message_ids, stored for fast metrics
+    pub model: String,                     // model that produced the summary (carried on command)
+    pub prompt_version: String,            // prompt version (carried on command)
+}
+```
+
+### 6.3 API Request/Response Shapes (Verified)
 
 #### Create Session
 `POST /sessions`  
@@ -398,6 +432,13 @@ Returns 404 if the entity is not in the graph.
 #### Knowledge Export _(Stage 2)_
 `GET /sessions/{session_id}/knowledge/export?format=json|dot` → graph in JSON or Graphviz DOT _(200 OK)_
 
+#### List Summaries _(Stage 4)_
+`GET /sessions/{session_id}/summaries` → `{ session_id, summaries: [...] }` _(200 OK)_
+
+#### Manual Consolidate _(Stage 4)_
+`POST /sessions/{session_id}/consolidate` → `{ summary_id }` _(202 Accepted)_  
+Followers 307-redirect to the leader. Returns 409 if consolidation is already in flight. Returns 422 if the session has fewer messages than the target window.
+
 _All endpoints verified against API.md and server.rs._
 ---
 ## Phase Completion Summary
@@ -408,6 +449,8 @@ _All endpoints verified against API.md and server.rs._
 - **Stage 1 (Distributed Memory):** ✅ Completed. 3-node Raft cluster, gRPC transport, follower redirect, failover, cluster observability. All five acceptance criteria pass.
 - **Stage 2 (Knowledge Formation):** ✅ Completed. Entity/relationship extraction, petgraph-backed per-session knowledge graph, leader-only extraction with Raft-replicated `AddKnowledge`, knowledge REST endpoints, graph export, 4 new Prometheus metrics, configurable extractor, 146 tests pass.
 - **Stage 3A (Persistence and Recovery):** ✅ Completed. redb-backed persistent Raft log and snapshot store, full state machine snapshots, startup recovery, InstallSnapshot over gRPC, automatic log compaction, 3 new snapshot Prometheus metrics, 169 tests pass. All 10 cluster-verify criteria pass.
+- **Stage 3B (Collective Memory):** ✅ Completed. Session visibility, global cross-session knowledge graph with provenance and conflict tracking, agent registration, 6 new global REST endpoints, 3 new Prometheus gauges, snapshot v2, 194 tests pass. All 17 cluster-verify criteria pass.
+- **Stage 4 (Memory Evolution):** ✅ Completed. Leader-only consolidation scheduler, `Summarizer` trait (OpenAI + mock), `ConsolidatedMemoryStore` (in-memory + Redis), `MemoryCommand::ApplySummary` with atomic trim, immutable `Summary` artifacts with UUID id and message lineage, snapshot v3, 5 new Prometheus metrics, 2 new REST endpoints, 222 tests pass. Cluster-verify checks [18] through [22] added.
 
 ---
 If any future changes are made to traits, endpoints, or architecture, update this SSOT accordingly.
@@ -581,6 +624,13 @@ services:
 - `KNOWLEDGE_MAX_WORKERS` - number of knowledge extraction workers (default `4`)
 - `KNOWLEDGE_CHANNEL_SIZE` - knowledge job queue capacity (default `500`)
 
+**Consolidation pipeline** (Stage 4):
+- `SUMMARIZER` - `openai` (default) or `mock`; use `mock` for cluster verification without OpenAI quota
+- `CONSOLIDATION_THRESHOLD` - message count that triggers automatic consolidation (default `50`)
+- `CONSOLIDATION_TARGET_WINDOW` - raw messages remaining after consolidation (default `20`)
+- `CONSOLIDATION_MAX_WORKERS` - number of consolidation workers (default `2`)
+- `CONSOLIDATION_CHANNEL_SIZE` - consolidation job queue capacity (default `100`)
+
 **Cluster mode** (all required when `NODE_ID` is set):
 - `NODE_ID` - unique integer node identifier (e.g. `1`)
 - `RAFT_ADDR` - bind address for the gRPC Raft server (e.g. `0.0.0.0:9001`)
@@ -621,6 +671,13 @@ Per-request context settings such as `max_tokens`, `similarity_threshold`, and `
 - `engram_snapshot_install_total` - number of snapshots installed from the leader (counter)
 - `engram_snapshot_last_index` - log index of the most recent snapshot; 0 if none exists (gauge)
 
+**Consolidation metrics** (Stage 4, all modes):
+- `engram_consolidations_total` - number of consolidation operations completed (counter)
+- `engram_messages_consolidated_total` - cumulative raw messages trimmed by consolidation (counter)
+- `engram_summaries` - current number of stored summaries (gauge)
+- `engram_consolidation_queue_size` - pending jobs in the consolidation worker channel (gauge)
+- `engram_summarization_duration_seconds` - wall-clock time per summarization call (histogram, label: `model`)
+
 ### 10.2 Tracing
 - Each request gets a span.
 - Key spans: `add_message`, `assemble_context`, `embed_text`, `vector_search`.
@@ -645,7 +702,7 @@ In-memory store implementations of all traits allow testing without external dep
 
 - **Hybrid retrieval scoring**: `score = semantic_similarity * 0.7 + recency_boost * 0.2 + frequency * 0.1`. Improves recall for frequently discussed topics.
 - **Semantic chunking**: Split long assistant responses into paragraphs before embedding, so retrieval can pinpoint specific facts.
-- **Consolidation (summarization)**: Periodically summarize older messages and embed the summary.
+- **Consolidation (summarization)**: ✅ Implemented in Stage 4. Summaries are not yet wired into context assembly or retrieval; that is a later stage.
 - **Evaluation harness**: Scripts that run known queries and measure recall/precision of long‑term memory retrieval.
 - **gRPC endpoint for clients**: gRPC is now used for Raft inter-node transport (Stage 1). A public-facing gRPC API for agent clients is a future item.
 - **Multi‑tenancy**: Add `tenant_id` to partition data (Stage 2 auth layer).

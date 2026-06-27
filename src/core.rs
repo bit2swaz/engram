@@ -142,6 +142,12 @@ pub trait ShortTermMemory: Send + Sync {
     async fn restore_all(&self, _sessions: Vec<(String, Vec<Message>)>) -> Result<(), MemoryError> {
         Ok(())
     }
+
+    // Drop specific messages by id once they've been rolled up into a summary.
+    // Default no-op keeps non-primary stores compiling; real stores override this.
+    async fn remove_messages(&self, _session_id: &str, _ids: &[String]) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 pub trait TokenCounter: Send + Sync {
@@ -356,6 +362,20 @@ impl ShortTermMemory for InMemoryStore {
             .map_err(|error| MemoryError::Message(error.to_string()))?;
 
         messages.remove(session_id);
+        Ok(())
+    }
+
+    async fn remove_messages(&self, session_id: &str, ids: &[String]) -> Result<(), MemoryError> {
+        let mut messages = self
+            .messages
+            .lock()
+            .map_err(|error| MemoryError::Message(error.to_string()))?;
+        if let Some(session_messages) = messages.get_mut(session_id) {
+            session_messages.retain(|m| match m.id.as_deref() {
+                Some(id) => !ids.contains(&id.to_string()),
+                None => true,
+            });
+        }
         Ok(())
     }
 
@@ -815,5 +835,22 @@ mod tests {
         assert_eq!(embed_error.to_string(), "embed");
         assert_eq!(store_error.to_string(), "store");
         assert_eq!(memory_error.to_string(), "memory");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_remove_messages_by_id() {
+        let store = InMemoryStore::default();
+        let mut a = message("user", "first");  a.id = Some("m1".into());
+        let mut b = message("assistant", "second"); b.id = Some("m2".into());
+        let mut c = message("user", "third");   c.id = Some("m3".into());
+        store.add_message("s1", a).await.unwrap();
+        store.add_message("s1", b).await.unwrap();
+        store.add_message("s1", c).await.unwrap();
+
+        store.remove_messages("s1", &["m1".into(), "m2".into()]).await.unwrap();
+
+        let recent = store.get_recent("s1", 10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "third");
     }
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use engram::app::build_app_state_with_embedding_provider;
-use engram::config::Config;
+use engram::config::{Config, SummarizerType};
 use engram::core::{EmbeddingProvider, ShortTermMemory};
 use engram::embedding::OpenAIEmbedder;
 use engram::models::EmbeddingStatus;
@@ -96,6 +96,7 @@ async fn setup_test_app() -> TestApp {
         knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
         raft_db_path: std::path::PathBuf::from("./data/raft/engram.redb"),
         snapshot_log_threshold: 1000,
+        ..Config::default()
     };
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
@@ -413,4 +414,101 @@ async fn deleting_a_session_removes_context_and_vector_results() {
         .await
         .unwrap();
     assert!(vector_results.is_empty());
+}
+
+async fn setup_consolidation_test_app() -> TestApp {
+    let redis_container = GenericImage::new("redis", "7.2.4")
+        .with_exposed_port(REDIS_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
+
+    let host = redis_container.get_host().await.unwrap();
+    let port = redis_container.get_host_port_ipv4(REDIS_PORT.tcp()).await.unwrap();
+    let redis_url = format!("redis://{host}:{port}/");
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embedding_payload()))
+        .mount(&mock_server)
+        .await;
+
+    let lance_db_dir = TempDir::new().unwrap();
+    let config = Config {
+        redis_url,
+        openai_api_key: "test-key".to_string(),
+        openai_base_url: Some(mock_server.uri()),
+        lance_db_path: lance_db_dir.path().to_path_buf(),
+        embedding_dimension: 1536,
+        embedding_max_concurrency: 1,
+        mpsc_channel_size: 4,
+        short_term_count: 20,
+        knowledge_extractor: engram::config::KnowledgeExtractorType::Mock,
+        summarizer: SummarizerType::Mock,
+        consolidation_threshold: 3,
+        consolidation_target_window: 2,
+        ..Config::default()
+    };
+
+    let embedding_provider: Arc<dyn EmbeddingProvider> =
+        Arc::new(OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap());
+    let state = build_app_state_with_embedding_provider(&config, embedding_provider)
+        .await
+        .unwrap();
+    let server = TestServer::new(build_router(state.clone())).unwrap();
+
+    TestApp { server, state, _lance_db_dir: lance_db_dir, _redis_container: redis_container, _mock_server: mock_server }
+}
+
+#[tokio::test]
+async fn consolidation_scheduler_fires_when_threshold_crossed_and_trims_short_term() {
+    // threshold=3, window=2: 4 messages → oldest 2 summarized, newest 2 kept.
+    // In standalone mode the add_message nudge is Raft-only, so we POST /consolidate explicitly.
+    // We wait for all embeddings to settle before consolidating: the embedding worker's
+    // update_message_status uses a non-atomic DEL+RPUSH that would race with remove_messages.
+    let app = setup_consolidation_test_app().await;
+    let session_id = create_session(&app.server).await;
+
+    let mut message_ids = Vec::new();
+    for i in 0..4u32 {
+        let id = Uuid::new_v4().to_string();
+        add_user_message(&app.server, &session_id, &id, &format!("message number {i}")).await;
+        message_ids.push(id);
+    }
+
+    // Wait for all embeddings to complete before triggering consolidation.
+    for id in &message_ids {
+        wait_for_terminal_status(app.state.short_term_memory.as_ref(), &session_id, id).await;
+    }
+
+    app.server
+        .post(&format!("/sessions/{session_id}/consolidate"))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    // Poll GET /summaries until the async worker finishes.
+    let mut summaries = serde_json::Value::Array(vec![]);
+    for _ in 0..80 {
+        let resp = app.server.get(&format!("/sessions/{session_id}/summaries")).await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        summaries = body["summaries"].clone();
+        if summaries.as_array().map_or(false, |s| !s.is_empty()) {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let summaries = summaries.as_array().expect("summaries must be an array");
+    assert_eq!(summaries.len(), 1, "one summary produced");
+    assert_eq!(
+        summaries[0]["consumed_count"].as_u64().unwrap(),
+        2,
+        "oldest 2 consumed (4 total - 2 window)"
+    );
+
+    let remaining = app.state.short_term_memory.get_recent(&session_id, 10).await.unwrap();
+    assert_eq!(remaining.len(), 2, "trimmed back to target window of 2");
 }

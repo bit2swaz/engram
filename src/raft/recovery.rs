@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::consolidation::store::ConsolidatedMemoryStore;
 use crate::core::{CoreMemoryStore, ShortTermMemory};
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::raft::snapshot::EngramSnapshot;
@@ -13,10 +14,12 @@ pub async fn recover_state_machine(
     sm: &EngStateMachineStore,
     short_term: Arc<dyn ShortTermMemory>,
     core_memory: Arc<dyn CoreMemoryStore>,
+    consolidated: Arc<dyn ConsolidatedMemoryStore>,
 ) -> anyhow::Result<()> {
     // 1. Always flush first so stale state from a prior run cannot bleed through.
     short_term.restore_all(vec![]).await?;
     core_memory.restore_all(vec![]).await?;
+    consolidated.restore_all(vec![]).await?;
 
     // 2. Load the persisted snapshot, if present.
     let Some((meta, bytes)) = sm.load_snapshot_for_recovery()? else {
@@ -30,6 +33,7 @@ pub async fn recover_state_machine(
     short_term.restore_all(st_sessions).await?;
     let cm_sessions = payload.core_memory.into_iter().map(|s| (s.session_id, s.facts)).collect();
     core_memory.restore_all(cm_sessions).await?;
+    consolidated.restore_all(payload.consolidated).await?;
     let graph = KnowledgeGraph::from_snapshot(payload.knowledge_graph);
     sm.restore_applied_for_recovery(meta, graph).await;
 
@@ -43,6 +47,7 @@ mod tests {
     use tokio::sync::{mpsc, RwLock};
     use redb::Database;
 
+    use crate::consolidation::store::{ConsolidatedMemoryStore, InMemoryConsolidatedStore};
     use crate::core::{CoreMemoryStore, InMemoryCoreMemoryStore, InMemoryStore, InMemoryVectorStore, ShortTermMemory};
     use crate::knowledge::graph::KnowledgeGraph;
     use crate::raft::recovery::recover_state_machine;
@@ -57,8 +62,9 @@ mod tests {
         let (ktx, _krx) = mpsc::channel(10);
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
         let gg = Arc::new(RwLock::new(crate::knowledge::global::GlobalGraph::new()));
+        let consolidated: Arc<dyn ConsolidatedMemoryStore> = Arc::new(InMemoryConsolidatedStore::default());
         let metrics = Arc::new(crate::metrics::AppMetrics::new().unwrap());
-        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db, gg, metrics);
+        let sm = EngStateMachineStore::new(st.clone(), cm.clone(), vs, etx, kg.clone(), ktx, db, gg, consolidated, metrics);
         (sm, st, cm, kg)
     }
 
@@ -76,7 +82,8 @@ mod tests {
             timestamp: None, embedding_status: None,
         }).await.unwrap();
 
-        recover_state_machine(&sm, st.clone() as Arc<dyn ShortTermMemory>, cm_as_dyn(&cm)).await.unwrap();
+        let cons: Arc<dyn ConsolidatedMemoryStore> = Arc::new(InMemoryConsolidatedStore::default());
+        recover_state_machine(&sm, st.clone() as Arc<dyn ShortTermMemory>, cm_as_dyn(&cm), cons).await.unwrap();
         assert!(st.get_recent("stale", 10).await.unwrap().is_empty());
     }
 
@@ -93,7 +100,8 @@ mod tests {
 
         // Fresh state machine over the same db; recovery should restore the fact.
         let (sm, st, cm, _kg2) = build(db.clone());
-        recover_state_machine(&sm, st as Arc<dyn ShortTermMemory>, cm.clone() as Arc<dyn CoreMemoryStore>).await.unwrap();
+        let cons: Arc<dyn ConsolidatedMemoryStore> = Arc::new(InMemoryConsolidatedStore::default());
+        recover_state_machine(&sm, st as Arc<dyn ShortTermMemory>, cm.clone() as Arc<dyn CoreMemoryStore>, cons).await.unwrap();
         assert_eq!(cm.get_facts("s1").await.unwrap(), vec!["remember me".to_string()]);
     }
 }

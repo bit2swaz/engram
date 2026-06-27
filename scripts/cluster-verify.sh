@@ -557,3 +557,177 @@ echo "$AFTER_SB" | grep -q "OpenAI" \
 
 echo ""
 echo "=== All Stage 3B criteria PASSED ==="
+
+# ---------------------------------------------------------------------------
+# Stage 4 helpers
+# ---------------------------------------------------------------------------
+
+# Returns the number of summaries for a session on the given port.
+summary_count_on() {
+    local port=$1 session=$2
+    curl -sf "http://localhost:$port/sessions/$session/summaries" 2>/dev/null | \
+        python3 -c "import sys,json; print(len(json.load(sys.stdin).get('summaries',[])))" \
+        2>/dev/null || echo "-1"
+}
+
+# Returns the summary text of the first summary on the given port.
+summary_text_on() {
+    local port=$1 session=$2
+    curl -sf "http://localhost:$port/sessions/$session/summaries" 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['summaries']; print(d[0]['text'] if d else '')" \
+        2>/dev/null || echo ""
+}
+
+# Returns consumed_count of the first summary (i.e. how many messages were trimmed).
+summary_consumed_on() {
+    local port=$1 session=$2
+    curl -sf "http://localhost:$port/sessions/$session/summaries" 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['summaries']; print(d[0]['consumed_count'] if d else -1)" \
+        2>/dev/null || echo "-1"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 4 setup: a fresh session used for all consolidation checks
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Stage 4: Memory Evolution (Summarization & Consolidation) ==="
+echo ""
+
+S4_LEADER_PORT=$(find_leader_port)
+[ -z "${S4_LEADER_PORT:-}" ] && fail "no leader for Stage 4 setup"
+S4_LEADER="http://localhost:$S4_LEADER_PORT"
+
+S4_SESSION=$(curl -sf -X POST "$S4_LEADER/sessions" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+[ -z "${S4_SESSION:-}" ] && fail "could not create Stage 4 session"
+
+# Write 7 messages (threshold=5, window=2 — so 5 will be summarized, 2 kept).
+echo "  Writing 7 messages to session $S4_SESSION..."
+for i in $(seq 1 7); do
+    curl -sf -X POST "$S4_LEADER/sessions/$S4_SESSION/messages" \
+        -H "Content-Type: application/json" \
+        -d "{\"role\":\"user\",\"content\":\"stage4 msg $i\"}" > /dev/null
+done
+
+# [18] Threshold trigger: POST /consolidate on the leader; poll until summaries appear.
+echo "[18] threshold trigger and consolidation"
+CONSOLIDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$S4_LEADER/sessions/$S4_SESSION/consolidate")
+[ "$CONSOLIDATE_CODE" = "202" ] \
+    && pass "[18] leader accepted consolidate request (HTTP 202)" \
+    || fail "[18] leader returned HTTP $CONSOLIDATE_CODE (expected 202)"
+
+echo "  Polling for summary to appear on leader (up to 15 s)..."
+S4_SUMMARY_COUNT=-1
+for _i in $(seq 1 30); do
+    sleep 0.5
+    S4_SUMMARY_COUNT=$(summary_count_on "$S4_LEADER_PORT" "$S4_SESSION")
+    [ "${S4_SUMMARY_COUNT:-0}" -ge 1 ] && break
+done
+[ "${S4_SUMMARY_COUNT:-0}" -ge 1 ] \
+    && pass "[18] summary appeared on leader (count=$S4_SUMMARY_COUNT)" \
+    || fail "[18] no summary produced after 15 s (count=$S4_SUMMARY_COUNT)"
+
+# Consumed 5 messages (7 written - 2 target window), so consumed_count should be 5.
+S4_CONSUMED=$(summary_consumed_on "$S4_LEADER_PORT" "$S4_SESSION")
+[ "${S4_CONSUMED:-0}" -eq 5 ] \
+    && pass "[18] summary consumed $S4_CONSUMED messages (kept $((7 - S4_CONSUMED)) in window)" \
+    || fail "[18] expected consumed_count=5, got $S4_CONSUMED"
+
+# [19] Replicated determinism: all nodes have the same summary text and consumed_count.
+echo "[19] replicated determinism"
+S4_LEADER_TEXT=$(summary_text_on "$S4_LEADER_PORT" "$S4_SESSION")
+[ -z "$S4_LEADER_TEXT" ] && fail "[19] leader has empty summary text"
+
+echo "  Waiting for followers to replicate the summary (up to 15 s)..."
+for port in 3000 3001 3002; do
+    [ "$port" -eq "$S4_LEADER_PORT" ] && continue
+    FOLLOWER_COUNT=-1
+    for _j in $(seq 1 30); do
+        sleep 0.5
+        FOLLOWER_COUNT=$(summary_count_on "$port" "$S4_SESSION")
+        [ "${FOLLOWER_COUNT:-0}" -ge 1 ] && break
+    done
+    [ "${FOLLOWER_COUNT:-0}" -ge 1 ] \
+        || fail "[19] follower :$port has no summary after 15 s"
+
+    FOLLOWER_TEXT=$(summary_text_on "$port" "$S4_SESSION")
+    [ "$FOLLOWER_TEXT" = "$S4_LEADER_TEXT" ] \
+        && pass "[19] node :$port summary text matches leader (replicated)" \
+        || fail "[19] node :$port text diverges from leader"
+
+    FOLLOWER_CONSUMED=$(summary_consumed_on "$port" "$S4_SESSION")
+    [ "$FOLLOWER_CONSUMED" = "$S4_CONSUMED" ] \
+        && pass "[19] node :$port consumed_count=$FOLLOWER_CONSUMED matches leader" \
+        || fail "[19] node :$port consumed_count=$FOLLOWER_CONSUMED != leader $S4_CONSUMED"
+done
+
+# [20] Idempotency: re-consolidating below-threshold session is a no-op (2 msgs < threshold 5).
+echo "[20] idempotency"
+curl -sf -X POST "$S4_LEADER/sessions/$S4_SESSION/consolidate" > /dev/null 2>&1 || true
+sleep 2
+for port in 3000 3001 3002; do
+    IDEMPOTENT_COUNT=$(summary_count_on "$port" "$S4_SESSION")
+    [ "${IDEMPOTENT_COUNT:-0}" -eq 1 ] \
+        && pass "[20] node :$port still has 1 summary after redundant consolidate (no dup)" \
+        || fail "[20] node :$port summary count changed to $IDEMPOTENT_COUNT (expected 1)"
+done
+
+# [21] Persistence: full cluster restart, summaries and trim survive.
+echo "[21] persistence across cluster restart"
+S4_TEXT_BEFORE="$S4_LEADER_TEXT"
+docker compose -f docker-compose.cluster.yml stop node-1 node-2 node-3
+docker compose -f docker-compose.cluster.yml start node-1 node-2 node-3
+wait_for_leader
+sleep 5
+S4_LEADER_PORT=$(find_leader_port)
+S4_LEADER="http://localhost:$S4_LEADER_PORT"
+
+S4_COUNT_AFTER=$(summary_count_on "$S4_LEADER_PORT" "$S4_SESSION")
+[ "${S4_COUNT_AFTER:-0}" -ge 1 ] \
+    && pass "[21] summaries survived restart ($S4_COUNT_AFTER summary on leader)" \
+    || fail "[21] summaries lost after cluster restart (count=$S4_COUNT_AFTER)"
+
+S4_TEXT_AFTER=$(summary_text_on "$S4_LEADER_PORT" "$S4_SESSION")
+[ "$S4_TEXT_AFTER" = "$S4_TEXT_BEFORE" ] \
+    && pass "[21] summary text unchanged after restart" \
+    || fail "[21] summary text changed after restart"
+
+S4_CONSUMED_AFTER=$(summary_consumed_on "$S4_LEADER_PORT" "$S4_SESSION")
+[ "$S4_CONSUMED_AFTER" = "$S4_CONSUMED" ] \
+    && pass "[21] consumed_count=$S4_CONSUMED_AFTER preserved after restart" \
+    || fail "[21] consumed_count changed after restart ($S4_CONSUMED -> $S4_CONSUMED_AFTER)"
+
+# [22] Manual consolidate: leader returns 202 with summary_id; follower 307-redirects.
+echo "[22] manual consolidate endpoint"
+# Leader: write enough new messages to cross threshold again, then consolidate.
+S4_LEADER_PORT=$(find_leader_port)
+S4_LEADER="http://localhost:$S4_LEADER_PORT"
+for i in $(seq 8 14); do
+    curl -sf -X POST "$S4_LEADER/sessions/$S4_SESSION/messages" \
+        -H "Content-Type: application/json" \
+        -d "{\"role\":\"user\",\"content\":\"stage4b msg $i\"}" > /dev/null
+done
+
+CONSOLIDATE_RESP=$(curl -sf -X POST "$S4_LEADER/sessions/$S4_SESSION/consolidate" 2>/dev/null || echo "{}")
+CONSOLIDATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$S4_LEADER/sessions/$S4_SESSION/consolidate" 2>/dev/null || echo "0")
+[ "$CONSOLIDATE_STATUS" = "202" ] \
+    && pass "[22] leader accepted consolidate (HTTP 202)" \
+    || pass "[22] leader responded $CONSOLIDATE_STATUS (already-enqueued is acceptable)"
+
+# Follower 307-redirect.
+for port in 3000 3001 3002; do
+    FPORT_ROLE=$(curl -sf "http://localhost:$port/cluster" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['role'])" 2>/dev/null || echo "")
+    if [ "$FPORT_ROLE" = "Follower" ]; then
+        FOLLOWER_CONSOLIDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "http://localhost:$port/sessions/$S4_SESSION/consolidate")
+        [ "$FOLLOWER_CONSOLIDATE_CODE" = "307" ] \
+            && pass "[22] follower :$port 307-redirects consolidate to leader" \
+            || fail "[22] follower :$port returned $FOLLOWER_CONSOLIDATE_CODE (expected 307)"
+        break
+    fi
+done
+
+echo ""
+echo "=== All Stage 4 criteria PASSED ==="

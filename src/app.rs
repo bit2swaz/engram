@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use crate::assembler::ContextAssembler;
 use crate::config::Config;
+use crate::config::SummarizerType;
+use crate::consolidation::scheduler::{consolidation_job_channel, spawn_consolidation_workers};
+use crate::knowledge::summarizer::{MockSummarizer, OpenAISummarizer};
 use crate::core::{
     CoreMemoryStore, EmbedError, EmbeddingProvider, MemoryError, OpenAITokenCounter, ShortTermMemory,
     StoreError, TokenCounter, VectorStore,
@@ -17,7 +20,9 @@ use crate::knowledge::graph::KnowledgeGraph;
 use crate::knowledge::worker::{knowledge_job_channel, spawn_knowledge_workers};
 use crate::metrics::AppMetrics;
 use crate::server::AppState;
-use crate::stores::{LanceDBStore, RedisCoreMemoryStore, RedisShortTermMemory};
+use crate::stores::{
+    LanceDBStore, RedisConsolidatedStore, RedisCoreMemoryStore, RedisShortTermMemory,
+};
 use crate::worker::{EmbeddingJob, embedding_job_channel, spawn_embedding_workers};
 
 #[derive(Debug, Error)]
@@ -43,6 +48,7 @@ pub async fn build_raft_node(
     knowledge_graph: Arc<tokio::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
     knowledge_tx: tokio::sync::mpsc::Sender<crate::knowledge::types::KnowledgeJob>,
     global_graph: Arc<tokio::sync::RwLock<crate::knowledge::global::GlobalGraph>>,
+    consolidated: Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore>,
     metrics: Arc<AppMetrics>,
 ) -> anyhow::Result<Arc<crate::raft::types::RaftHandle>> {
     use crate::raft::{
@@ -72,11 +78,12 @@ pub async fn build_raft_node(
         knowledge_tx,
         db,
         global_graph,
+        consolidated.clone(),
         metrics,
     );
 
     // RECOVERY: flush Redis + restore snapshot BEFORE openraft replays the log.
-    recover_state_machine(&state_machine, short_term, core_memory).await?;
+    recover_state_machine(&state_machine, short_term, core_memory, consolidated).await?;
 
     let raft_config = Arc::new(
         openraft::Config {
@@ -127,8 +134,11 @@ mod stage3a_tests {
             crate::knowledge::global::GlobalGraph::new(),
         ));
 
+        let consolidated = std::sync::Arc::new(
+            crate::consolidation::store::InMemoryConsolidatedStore::default(),
+        ) as std::sync::Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore>;
         let metrics = std::sync::Arc::new(crate::metrics::AppMetrics::new().unwrap());
-        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx, gg, metrics)
+        let raft = super::build_raft_node(&cfg, short_term, core_memory, vector_store, etx, kg, ktx, gg, consolidated, metrics)
             .await
             .unwrap();
         assert!(raft.is_initialized().await.is_ok() || true);
@@ -169,6 +179,9 @@ mod stage3a_tests {
             .unwrap();
 
         let st_clone = short_term.clone();
+        let consolidated = std::sync::Arc::new(
+            crate::consolidation::store::InMemoryConsolidatedStore::default(),
+        ) as std::sync::Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore>;
         let metrics = std::sync::Arc::new(crate::metrics::AppMetrics::new().unwrap());
         let _raft = super::build_raft_node(
             &cfg,
@@ -179,6 +192,7 @@ mod stage3a_tests {
             kg,
             ktx,
             gg,
+            consolidated,
             metrics,
         )
         .await
@@ -280,6 +294,22 @@ pub async fn build_app_state_with_embedding_provider(
             },
         };
 
+    let consolidated: Arc<dyn crate::consolidation::store::ConsolidatedMemoryStore> =
+        Arc::new(RedisConsolidatedStore::connect(&config.redis_url).await?);
+    let (consolidation_tx, consolidation_rx) =
+        consolidation_job_channel(config.consolidation_channel_size);
+
+    let summarizer: Arc<dyn crate::knowledge::summarizer::Summarizer> = match config.summarizer {
+        SummarizerType::Mock => Arc::new(MockSummarizer),
+        SummarizerType::OpenAI => match &config.openai_base_url {
+            Some(base_url) => Arc::new(OpenAISummarizer::new_with_base_url(
+                config.openai_api_key.clone(),
+                base_url.clone(),
+            )),
+            None => Arc::new(OpenAISummarizer::new(config.openai_api_key.clone())),
+        },
+    };
+
     let (raft, node_id, peer_http_addrs, raft_addr, raft_advertise_addr, cluster_peers) = if config.node_id.is_some() {
         let raft = build_raft_node(
             config,
@@ -290,6 +320,7 @@ pub async fn build_app_state_with_embedding_provider(
             knowledge_graph.clone(),
             knowledge_job_sender.clone(),
             global_graph.clone(),
+            consolidated.clone(),
             metrics.clone(),
         )
         .await
@@ -318,6 +349,19 @@ pub async fn build_app_state_with_embedding_provider(
         config.knowledge_max_workers,
     );
 
+    let _consolidation_worker_handles = spawn_consolidation_workers(
+        summarizer,
+        raft.clone(),
+        config.node_id.unwrap_or(0),
+        short_term_memory.clone(),
+        consolidated.clone(),
+        metrics.clone(),
+        config.consolidation_threshold,
+        config.consolidation_target_window,
+        consolidation_rx,
+        config.consolidation_max_workers,
+    );
+
     Ok(Arc::new(AppState {
         short_term_memory,
         vector_store,
@@ -337,5 +381,7 @@ pub async fn build_app_state_with_embedding_provider(
         knowledge_graph,
         knowledge_job_sender,
         global_graph,
+        consolidated,
+        consolidation_tx,
     }))
 }

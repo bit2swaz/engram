@@ -133,6 +133,7 @@ async fn e2e_flow_uses_real_stores_and_background_worker() {
         knowledge_extractor: engram::config::KnowledgeExtractorType::OpenAI,
         raft_db_path: std::path::PathBuf::from("./data/raft/engram.redb"),
         snapshot_log_threshold: 1000,
+        ..Config::default()
     };
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(
         OpenAIEmbedder::new_with_base_url("test-key", mock_server.uri()).unwrap(),
