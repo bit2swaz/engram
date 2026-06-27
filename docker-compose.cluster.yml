@@ -29,6 +29,9 @@ services:
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
+      SUMMARIZER: "mock"
+      CONSOLIDATION_THRESHOLD: "5"
+      CONSOLIDATION_TARGET_WINDOW: "2"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3000:3000"
@@ -54,6 +57,9 @@ services:
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
+      SUMMARIZER: "mock"
+      CONSOLIDATION_THRESHOLD: "5"
+      CONSOLIDATION_TARGET_WINDOW: "2"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3001:3000"
@@ -79,6 +85,9 @@ services:
       ENGRAM_BIND_ADDR: "0.0.0.0:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       KNOWLEDGE_EXTRACTOR: "${KNOWLEDGE_EXTRACTOR:-mock}"
+      SUMMARIZER: "mock"
+      CONSOLIDATION_THRESHOLD: "5"
+      CONSOLIDATION_TARGET_WINDOW: "2"
       RUST_LOG: "info,openraft=debug"
     ports:
       - "3002:3000"
