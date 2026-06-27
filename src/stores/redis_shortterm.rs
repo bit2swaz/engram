@@ -109,7 +109,8 @@ impl ShortTermMemory for RedisShortTermMemory {
         }
 
         let mut connection = self.connection.clone();
-        let start = -(count as isize);
+        // LRANGE start = -(count): clamp to 0 (fetch all) if count overflows isize.
+        let start: isize = if count > isize::MAX as usize { 0 } else { -(count as isize) };
         let raw_messages: Vec<String> = connection
             .lrange(Self::session_key(session_id), start, -1)
             .await
